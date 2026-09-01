@@ -9,10 +9,11 @@ together for the whole runtime.**
 | 🎬 **Sources** | Local files (`mp4/mkv/mov/webm/avi/ts/…`) or URLs (YouTube etc., resolved via yt-dlp). |
 | 🖼 **Windows** | Two mpv windows, auto-arranged side by side (re-arrange anytime). |
 | 🎚 **Three seek bars** | **Master** moves both together. **Movie** and **Reaction** bars move one side only — drag one to align the two, and it stays locked. |
+| 🎞 **Frame-step** | ⏴/⏵ next to each timeline's play button (or `[` / `]`) step THAT video one frame at a time while paused — align the two pictures at 30 fps precision. |
 | 🖱 **Drag & drop** | Drop one or two video files straight onto the window to fill the source slots. |
 | 🔊 **Audio** | Independent volume slider + mute per video, plus a master volume scaling both. |
 | 🎵 **Tracks** | Per-video **audio** and **subtitle** pickers (built from each file's own track list; Off disables). |
-| 🎛 **Transport** | ±10 s jumps, restart, close, speed 0.25×–2.5×, screenshots of both videos. |
+| 🎛 **Transport** | ±10 s jumps, restart, close, screenshots of both videos; **speed** editable (type 1.35 and Enter) with ±0.05 nudge buttons. |
 | 💾 **Persistence** | Paths, volumes, speed saved between sessions. |
 
 ## Quick start
@@ -22,7 +23,9 @@ together for the whole runtime.**
 3. Hit **Start** — both videos load **paused** and open side by side.
 4. Press **▶ Play** (transport or Master row, or `Space`) when ready.
 5. Drag the **Movie** or **Reaction** bar until the moments line up — that
-   video moves on its own; the other stays put.
+   video moves on its own; the other stays put. For frame-perfect
+   alignment: pause, then use the **⏴/⏵** step buttons to move one video
+   one frame at a time.
 6. Let it run — SyncPlayer gently re-syncs any drift, so they stay locked.
 7. Balance the two **volume sliders**, then enjoy.
 
@@ -35,6 +38,7 @@ together for the whole runtime.**
 |---|---|
 | `Space` | Play / pause both |
 | `←` / `→` | Seek both ±5 s *(nudge the PiP pane instead while integrated PiP is active)* |
+| `[` / `]` | Frame-step the last-touched video back / forward (paused) |
 | `↑` / `↓` | Nudge the PiP pane (integrated PiP) |
 | `Esc` | Exit integrated PiP (video returns to its own window) |
 | Click a video window | Pause / resume both (click-to-pause) |
@@ -62,6 +66,10 @@ together for the whole runtime.**
   ONE video alone (e.g. watch the movie before the reaction is ready) while
   the other stays frozen. The correction loop respects it and won't chase a
   paused video.
+- **Frame-perfect alignment**: the ⏴/⏵ buttons (and `[`/`]`) step one video
+  exactly one frame while it is paused — the offset is re-anchored after
+  every step, so Lock sync captures the new alignment. mpv was verified to
+  step `+/-1/30 s` per press on these clips.
 - **⧉ Picture-in-Picture (window)**: per-video *PiP* button makes that video
   window borderless and always on top (mpv's own `ontop`) while keeping its
   resize edges — drag an edge to resize, drag the video to move.
@@ -90,10 +98,10 @@ together for the whole runtime.**
 ```
 syncplayer.py        # the whole app (panel + two mpv drivers + sync loop)
 selftest.py          # 41-check headless verification (python selftest.py)
-gui_test.py          # 118-check END-TO-END test: drives the real GUI + real
+gui_test.py          # 134-check END-TO-END test: drives the real GUI + real
                      # mpv processes (python gui_test.py) — bars track, per-
                      # video seeks, drift correction, volume read-back from
-                     # mpv, speed, pause, Sync Lock, PiP, tracks, shutdown
+                     # mpv, speed, pause, Sync Lock, PiP, frame-step, tracks
 make_testclips.sh    # regenerates the demo clips (needs ffmpeg)
 make_icon.py         # regenerates icon.png / icon.ico
 dist/SyncPlayer.exe  # PyInstaller onefile build

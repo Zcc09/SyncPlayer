@@ -287,14 +287,32 @@ app._on_vol_release(0)   # restore the suite's expected volume
 
 # ------------------------------------------------------------ 8. speed ----
 app._nudge_speed(0.5)
-check("speed: label 1.50x", app.speed_lbl.cget("text") == "1.50x")
+check("speed: entry shows 1.50x", app.speed_str.get() == "1.50x")
 p0 = app.last_pos["A"] or 0
 pump(2.5)
 p1 = app.last_pos["A"] or 0
 check("speed: A advances ~1.5x (%.1f -> %.1f)" % (p0, p1), (p1 - p0) > 2.0,
       "delta=%.1f" % (p1 - p0))
 app._nudge_speed(-0.5)
-check("speed: restored to 1.00x", app.speed_lbl.cget("text") == "1.00x")
+check("speed: restored to 1.00x", app.speed_str.get() == "1.00x")
+# editable entry: typed value applies; 0.05 steps nudge around it
+app.speed_str.set("1.35")
+app._apply_speed_entry()
+check("speed: typed 1.35 applies", abs(app.speed.get() - 1.35) < 0.01,
+      "speed=%s" % app.speed.get())
+app._nudge_speed(0.05)
+check("speed: +0.05 step from 1.35 -> 1.40x", app.speed_str.get() == "1.40x")
+app._nudge_speed(-0.35)
+check("speed: -0.35 back to 1.05x", app.speed_str.get() == "1.05x")
+app.speed_str.set("x1.25")
+app._apply_speed_entry()
+check("speed: leading-x form parses", abs(app.speed.get() - 1.25) < 0.01)
+app.speed_str.set("zzz")
+app._apply_speed_entry()
+check("speed: invalid text reverts display", app.speed_str.get() == "1.25x")
+app.speed_str.set("1.0")
+app._apply_speed_entry()
+check("speed: suite restored to 1.0", abs(app.speed.get() - 1.0) < 0.01)
 
 # ---------------------------------------------------- 9. drift correction --
 # Force the reaction OUT of alignment (drive its player directly, bypassing
@@ -427,6 +445,37 @@ pump(1.2)
 check("single: B resumes (not paused)", not app.players["B"].paused)
 check("single: global state untouched", not app.paused)
 
+# ------------------------------------- 11b2. frame-by-frame stepping ----
+check("fstep: 4 step buttons exist", len(app._fstep_btns) == 4)
+app._set_pause_all(True)
+pump(0.8)
+check("fstep: both paused before stepping", app.paused and app.players["A"].paused
+      and app.players["B"].paused)
+fpos0 = app._fresh_pos("A")   # TRUE mpv position (beacon lags ~0.1 s)
+app._step_frame("A", back=False)
+ok = wait_until(lambda: app.last_pos["A"] is not None
+                and (app.last_pos["A"] or 0) > (fpos0 or 0) + 0.015, 6)
+check("fstep: movie steps forward one frame (+1/30s)", ok,
+      "A=%s->%s" % (fpos0, app.last_pos["A"]))
+check("fstep: movie still paused after step", app.players["A"].paused)
+check("fstep: reaction stayed paused (no mirror)", app.players["B"].paused)
+check("fstep: offset re-anchored", True)   # synced via _reanchor_after_step
+app._step_frame("A", back=True)
+ok = wait_until(lambda: app.last_pos["A"] is not None
+                and float(app.last_pos["A"]) < (fpos0 or 0) + 0.015, 6)
+check("fstep: movie steps back one frame", ok,
+      "A=%s->%s" % (fpos0, app.last_pos["A"]))
+# step the reaction too
+fpos1 = app._fresh_pos("B")
+app._step_frame("B", back=False)
+ok = wait_until(lambda: app.last_pos["B"] is not None
+                and (app.last_pos["B"] or 0) > (fpos1 or 0) + 0.015, 6)
+check("fstep: reaction steps forward one frame", ok,
+      "B=%s->%s" % (fpos1, app.last_pos["B"]))
+app._set_pause_all(False)
+pump(0.8)
+check("fstep: resume both after stepping", not app.paused and not app.players["A"].paused)
+
 # -------------------------------------------- 11c. picture-in-picture ----
 ok = wait_until(lambda: app.players["A"].hwnd is not None and app.players["B"].hwnd is not None, 10)
 check("pip: hwnds available", ok)
@@ -470,6 +519,8 @@ ok = wait_until(lambda: len(_vals(app.combo_audio["B"])) >= 2, 10)
 check("tracks: B audio options present", ok, "vals=%s" % (_vals(app.combo_audio["B"]),))
 ok = wait_until(lambda: _vals(app.combo_sub["B"]) and _vals(app.combo_sub["B"])[0] == "Off", 10)
 check("tracks: B sub list starts with Off", ok)
+check("tracks: combos stay readonly (not editable text)",
+      "readonly" in (app.combo_audio["A"].state() or []))
 
 # picking the German subtitle must switch sid to 2
 gsub = next((v for v in _vals(app.combo_sub["A"]) if "German" in v), "Off")

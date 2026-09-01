@@ -676,6 +676,14 @@ class MpvDriver:
         else:
             self.cmd({"command": ["set_property", "aid", int(n)]})
 
+    def frame_step(self, back=False):
+        """Step one video by exactly one frame, then pause again. Verified
+        on mpv 0.41: works while PAUSED and moves time-pos by exactly one
+        frame duration (+/-0.0333 s at 30 fps). Stamps the seek timestamp so
+        the drift corrector leaves this video alone."""
+        self.last_seek_ts = time.monotonic()
+        self.cmd({"command": ["frame-back-step" if back else "frame-step"]})
+
     # -- commands -----------------------------------------------------------
     def cmd(self, obj):
         """Queue a JSON IPC command; a writer thread performs the write, so
@@ -825,6 +833,10 @@ class SyncApp:
         self._seek_grace_until = 0.0               # no drift-correction until here
         self._last_corr = {"A": 0.0, "B": 0.0}     # last correction time per video
         self._pause_cmd_ts = 0.0               # last explicit pause-command time
+        self._frame_step_ts = 0.0             # last frame-step command time
+        self._last_active = "A"               # last-touched video (frame-step keys)
+        self._fstep_btns = []                 # per-video frame-step buttons
+        self._step_pending = {"A": None, "B": None}   # frame-step retry state
         self._prog_set = False          # True while poll code is .set()-ing bars
         self._vol_cmd_ts = 0.0            # last volume-command send time (drag throttle)
         self.sync_locked = False        # Sync Lock: Master bar alone drives both
@@ -853,6 +865,7 @@ class SyncApp:
         self.vol_b = tk.DoubleVar(value=100.0)
         self.vol_m = tk.DoubleVar(value=100.0)
         self.speed = tk.DoubleVar(value=1.0)
+        self.speed_str = tk.StringVar(value="1.00x")   # editable speed entry
         self.paused = True
         self.saved_vol_a = 100.0
         self.saved_vol_b = 100.0
@@ -866,12 +879,11 @@ class SyncApp:
 
     # ---------------------------------------------------------------- UI --
     def _build_ui(self):
-        self.root.title("%s — dual-video sync player (two mpv windows)" % APP_NAME)
-        # The panel is a fixed-size control surface, sized to its content at the
-        # end of this method. The videos play in their own mpv windows, which
-        # resize smoothly. Drag-resizing this software-rendered panel forces a
-        # full Tk re-layout+redraw every pixel (~270 ms/step on a 4K/175%
-        # display) → choppy. Locking the size removes that entirely.
+        # The panel is a fixed-size control surface, sized to its content at
+        # the end of this method. The videos play in their own mpv windows,
+        # which resize smoothly. Drag-resizing this software-rendered panel
+        # forces a full Tk re-layout every pixel (230 ms/step on 4K/175%)
+        # so the size is locked after the widgets are built.
 
         style = ttk.Style(self.root)
         try:
@@ -905,16 +917,20 @@ class SyncApp:
         style.configure("TLabelframe.Label", background=bg, foreground=fg)
         style.configure("TEntry", fieldbackground=card, foreground=fg)
 
+        # ---- header --------------------------------------------------------
         top = ttk.Frame(self.root, padding=(12, 10, 12, 2))
         top.pack(fill="x")
         ttk.Label(top, text="SyncPlayer", style="Head.TLabel").pack(side="left")
         ttk.Label(top, text="two videos · two windows · auto-sync",
                   style="Dim.TLabel").pack(side="left", padx=(10, 0), pady=(4, 0))
+        self.btn_help = ttk.Button(top, text="❓ Help", width=7, command=self._show_help)
+        self.btn_help.pack(side="right")
+        Tooltip(self.btn_help, "Open the full guide: sync workflow, PiP modes, tracks, shortcuts.")
 
         body = ttk.Frame(self.root, padding=(12, 4, 12, 8))
         body.pack(fill="both", expand=True)
 
-        # ---- sources ------------------------------------------------------
+        # ---- sources -------------------------------------------------------
         src = ttk.LabelFrame(body, text=" Sources ", padding=8)
         src.pack(fill="x", pady=(0, 8))
 
@@ -933,37 +949,8 @@ class SyncApp:
         ttk.Button(row, text="URL…", width=7, command=lambda: self._url(1)).pack(side="left", padx=(4, 0))
         ttk.Button(row, text="⇄ Swap", width=7, command=self._swap).pack(side="left", padx=(4, 0))
 
-        # ---- sync explainer + window management ---------------------------
-        mid = ttk.Frame(body)
-        mid.pack(fill="x", pady=(0, 8))
-
-        sync = ttk.Frame(mid)
-        sync.pack(side="left", fill="both", expand=True)
-        self.btn_help = ttk.Button(sync, text="Help / How sync works",
-                                   command=self._show_help)
-        self.btn_help.pack(anchor="se", side="bottom")
-        Tooltip(self.btn_help, "Open the full guide: sync workflow, PiP modes, tracks, shortcuts.")
-
-        win = ttk.LabelFrame(mid, text=" Windows ", padding=8)
-        win.pack(side="left", fill="y", padx=(10, 0))
-        ttk.Label(win, text="Each video plays in its own\nmpv window:", style="Dim.TLabel").pack(anchor="w")
-        b = ttk.Button(win, text="⇦ ⇨ Arrange side by side", command=self._arrange_windows)
-        b.pack(anchor="w", pady=(6, 0))
-        Tooltip(b, "Put the two video windows next to each other on the screen.")
-        self._ctrls.append(b)
-        self.btn_pip_a = ttk.Button(win, text="⧉ PiP Movie",
-                                  command=lambda: self._toggle_pip("A"))
-        self.btn_pip_a.pack(anchor="w", pady=(4, 0))
-        Tooltip(self.btn_pip_a, "Picture-in-picture: Movie becomes borderless, always on top, still resizable (drag its edges).")
-        self._ctrls.append(self.btn_pip_a)
-        self.btn_pip_b = ttk.Button(win, text="⧉ PiP Reaction",
-                                  command=lambda: self._toggle_pip("B"))
-        self.btn_pip_b.pack(anchor="w", pady=(4, 0))
-        Tooltip(self.btn_pip_b, "Picture-in-picture: Reaction becomes borderless, always on top, still resizable (drag its edges).")
-        self._ctrls.append(self.btn_pip_b)
-
-        # ---- transport + timeline ------------------------------------------
-        trans = ttk.Frame(body)
+        # ---- transport ------------------------------------------------------
+        trans = ttk.LabelFrame(body, text=" Transport ", padding=(8, 6))
         trans.pack(fill="x", pady=(0, 8))
 
         self.btn_play = ttk.Button(trans, text="Start", style="Accent.TButton",
@@ -975,17 +962,16 @@ class SyncApp:
         self.btn_pause_all.pack(side="left", padx=(5, 0))
         Tooltip(self.btn_pause_all, "Play or pause BOTH videos together (also on the Master row).")
         self._ctrls.append(self.btn_pause_all)
-
         for txt, cmd, w, tip in (("⏮ Restart", lambda: self._seek(0), 9,
                                   "Jump both videos back to the start"),
                                  ("⏪ 10s", lambda: self._jump(-10), 7,
                                   "Both videos back 10 s (← = 5 s)"),
-                                 ("10s ⏩", lambda: self._jump(10), 7,
+                                 ("10s ▶", lambda: self._jump(10), 7,
                                   "Both videos forward 10 s (→ = 5 s)"),
-                                 ("Close", self._stop, 7,
-                                  "Close both video windows"),
                                  ("📷 Shot", self._shot, 8,
-                                  "Save screenshots of both videos")):
+                                  "Save screenshots of both videos"),
+                                 ("Close", self._stop, 7,
+                                  "Close both video windows")):
             b = ttk.Button(trans, text=txt, width=w, command=cmd)
             b.pack(side="left", padx=(5, 0))
             Tooltip(b, tip)
@@ -994,17 +980,22 @@ class SyncApp:
         sp = ttk.Frame(trans)
         sp.pack(side="right")
         ttk.Label(sp, text="Speed").pack(side="left")
-        Tooltip(sp, "Playback speed of both videos (they stay synced).")
-        for txt, d, tip in (("−", -0.1, "Slower"), ("+", 0.1, "Faster")):
+        stxt = ttk.Entry(sp, textvariable=self.speed_str, width=7, justify="center")
+        Tooltip(stxt, "Playback speed of BOTH videos - type e.g. 1.35 and press Enter (range 0.25 - 2.5).")
+        stxt.bind("<Return>", lambda e: self._apply_speed_entry())
+        stxt.bind("<FocusOut>", lambda e: self._apply_speed_entry())
+        stxt.pack(side="left", padx=(6, 0))
+        self.speed_entry = stxt
+        self._ctrls.append(stxt)
+        for txt, d, tip in (("−", -0.05, "Slower by 0.05"), ("+", 0.05, "Faster by 0.05")):
             b = ttk.Button(sp, text=txt, width=3, command=lambda d=d: self._nudge_speed(d))
             b.pack(side="left", padx=(4, 0))
             Tooltip(b, tip)
             self._ctrls.append(b)
-        self.speed_lbl = ttk.Label(sp, text="1.00x", width=6)
-        self.speed_lbl.pack(side="left")
 
+        # ---- timelines ------------------------------------------------------
         tl = ttk.LabelFrame(body, text=" Timelines ", padding=(8, 4))
-        tl.pack(fill="x", pady=(0, 4))
+        tl.pack(fill="x", pady=(0, 8))
 
         def make_tl(parent, label, tip, tag=None):
             row = ttk.Frame(parent)
@@ -1012,13 +1003,22 @@ class SyncApp:
             ttk.Label(row, text=label, width=9, style="Dim.TLabel").pack(side="left")
             slider = ttk.Scale(row, from_=0, to=600)
             slider.pack(side="left", fill="x", expand=True, padx=(4, 8))
-            nbtn = None
             if tag:
-                nbtn = ttk.Button(row, text="▶", width=3,
-                                  command=lambda t=tag: self._toggle_play_one(t))
-                nbtn.pack(side="left", padx=(0, 4))
-                Tooltip(nbtn, "Play/pause THIS video only - the other one keeps going (handy before you lock the sync).")
-                self._ctrls.append(nbtn)
+                fb = ttk.Button(row, text="⏴", width=3,
+                                command=lambda t=tag: self._step_frame(t, back=True))
+                fb.pack(side="left", padx=(0, 2))
+                Tooltip(fb, "Step THIS video back one frame (pause first; also the [ key).")
+                ff = ttk.Button(row, text="⏵", width=3,
+                                command=lambda t=tag: self._step_frame(t, back=False))
+                ff.pack(side="left", padx=(0, 4))
+                Tooltip(ff, "Step THIS video forward one frame (pause first; also the ] key).")
+                self._fstep_btns.extend([fb, ff])
+                self._ctrls.extend([fb, ff])
+            nbtn = ttk.Button(row, text="▶", width=3,
+                              command=lambda t=tag: self._toggle_play_one(t))
+            nbtn.pack(side="left", padx=(0, 4))
+            Tooltip(nbtn, "Play/pause THIS video only - the other one keeps going (handy before you lock the sync).")
+            self._ctrls.append(nbtn)
             lbl = ttk.Label(row, text="00:00 / --:--", width=14, anchor="e")
             lbl.pack(side="right")
             self._ctrls.append(slider)
@@ -1027,18 +1027,18 @@ class SyncApp:
 
         self.seek_a, self.lbl_a, self.btn_play_a = make_tl(tl, "Movie:", "Drag to seek the movie ONLY. This is how you align it to the reaction.", "A")
         self.seek_b, self.lbl_b, self.btn_play_b = make_tl(tl, "Reaction:", "Drag to seek the reaction ONLY. This is how you align it to the movie.", "B")
-        # Master row: label + Sync-Lock toggle, then the master bar
+        # Master row: label + Sync-Lock toggle + play button, then the bar
         mrow = ttk.Frame(tl)
         mrow.pack(fill="x", pady=2)
         mlab = ttk.Frame(mrow)
         mlab.pack(side="left")
         ttk.Label(mlab, text="Master:", width=9, style="Dim.TLabel").pack(side="left")
         self.btn_lock = ttk.Button(mlab, text="🔒 Lock sync", width=11,
-                                    command=self._toggle_lock)
+                                   command=self._toggle_lock)
         self.btn_lock.pack(side="left", padx=(2, 0))
         Tooltip(self.btn_lock, "Lock the alignment: per-video bars switch off, the Master bar drives BOTH videos, and drift correction gets stricter.")
         self._ctrls.append(self.btn_lock)
-        self.btn_play_m = ttk.Button(mrow, text="▶", width=3,
+        self.btn_play_m = ttk.Button(mlab, text="▶", width=3,
                                      command=self._toggle_pause_m)
         self.btn_play_m.pack(side="left", padx=(4, 0))
         Tooltip(self.btn_play_m, "Play or pause BOTH videos together (master play button).")
@@ -1048,7 +1048,7 @@ class SyncApp:
         self.lbl_m = ttk.Label(mrow, text="00:00 / --:--", width=14, anchor="e")
         self.lbl_m.pack(side="right")
         self._ctrls.append(self.seek_m)
-        Tooltip(self.seek_m, "Locked out until you engage Lock Sync \u2014 then this bar drives BOTH videos together, keeping their alignment.")
+        Tooltip(self.seek_m, "Locked out until you engage Lock Sync \u2014 then this bar drives BOTH videos together, keeping their alignment. Its play button toggles both videos at any time.")
         self.seek_m.state(["disabled"])   # invisible to input until Sync Lock
 
         self.seek_a.config(command=self._on_seek_a_drag)
@@ -1088,6 +1088,34 @@ class SyncApp:
             Tooltip(cs, "Subtitle track of the %s video (Off disables subtitles)." % label)
             self.combo_sub[tag] = cs
             self._ctrls.append(cs)
+
+        # ---- windows & PiP -------------------------------------------------
+        win = ttk.LabelFrame(body, text=" Windows & PiP ", padding=8)
+        win.pack(fill="x", pady=(0, 8))
+        b = ttk.Button(win, text="⇦⇨ Arrange", width=12, command=self._arrange_windows)
+        b.pack(side="left")
+        Tooltip(b, "Put the two video windows next to each other on the screen.")
+        self._ctrls.append(b)
+        self.btn_pip_a = ttk.Button(win, text="⧉ PiP Movie", width=12,
+                                    command=lambda: self._toggle_pip("A"))
+        self.btn_pip_a.pack(side="left", padx=(6, 0))
+        Tooltip(self.btn_pip_a, "Picture-in-picture: Movie becomes borderless, always on top, still resizable (drag its edges).")
+        self._ctrls.append(self.btn_pip_a)
+        self.btn_pip_b = ttk.Button(win, text="⧉ PiP Reaction", width=12,
+                                    command=lambda: self._toggle_pip("B"))
+        self.btn_pip_b.pack(side="left", padx=(4, 0))
+        Tooltip(self.btn_pip_b, "Picture-in-picture: Reaction becomes borderless, always on top, still resizable (drag its edges).")
+        self._ctrls.append(self.btn_pip_b)
+        self.btn_pip_mode_a = ttk.Button(win, text="▦ Movie in Reaction", width=17,
+                                         command=lambda: self._toggle_pip_int("A"))
+        self.btn_pip_mode_a.pack(side="left", padx=(6, 0))
+        Tooltip(self.btn_pip_mode_a, "Integrated PiP: embed the Movie INSIDE the Reaction window, draggable over it (needs Sync Lock).")
+        self._ctrls.append(self.btn_pip_mode_a)
+        self.btn_pip_mode_b = ttk.Button(win, text="▦ Reaction in Movie", width=17,
+                                         command=lambda: self._toggle_pip_int("B"))
+        self.btn_pip_mode_b.pack(side="left", padx=(4, 0))
+        Tooltip(self.btn_pip_mode_b, "Integrated PiP: embed the Reaction INSIDE the Movie window, draggable over it (needs Sync Lock).")
+        self._ctrls.append(self.btn_pip_mode_b)
 
         # ---- volumes -------------------------------------------------------
         vol = ttk.Frame(body)
@@ -1131,10 +1159,10 @@ class SyncApp:
         self._ctrls.append(s2)
 
         # ---- status --------------------------------------------------------
-        self.status_lbl = ttk.Label(body, text="Ready. Pick two files (or URLs), then press ▶ Play.",
+        self.status_lbl = ttk.Label(body, text="Ready. Pick two files (or URLs), then press Start.",
                                     style="Dim.TLabel", wraplength=1100, justify="left")
         self.status_lbl.pack(fill="x", pady=(2, 0))
-        self.state_lbl = ttk.Label(body, text="Shortcuts: Space ⏯ · ←/→ ±5 s seek (both videos)",
+        self.state_lbl = ttk.Label(body, text="Shortcuts: Space ⏯ · ←/→ ±5 s seek · [ ] frame step (last video) · Esc undocks PiP",
                                    style="Dim.TLabel")
         self.state_lbl.pack(fill="x")
 
@@ -1143,13 +1171,13 @@ class SyncApp:
         self.root.bind("<Right>", lambda e: None if self._pip_nudge(5, 0) else self._jump(5))
         self.root.bind("<Up>", lambda e: self._pip_nudge(0, -5))
         self.root.bind("<Down>", lambda e: self._pip_nudge(0, 5))
+        self.root.bind("<bracketleft>", lambda e: self._step_frame(self._last_active, back=True))
+        self.root.bind("<bracketright>", lambda e: self._step_frame(self._last_active, back=False))
         self.root.bind("<Escape>", lambda e: self._undock_pip_int() if self.pip_int else None)
         self.root.bind("<Button-1>", self._on_global_press)
         self.root.bind("<ButtonRelease-1>", self._on_root_release)
 
-        # Size the window to exactly fit its content, then lock it. Sizing
-        # *after* the widgets exist guarantees every control is visible; a
-        # hard-coded geometry clipped the bottom on high-DPI.
+        # Size the window to exactly fit its content, then lock it.
         self.root.update_idletasks()
         width = max(900, self.root.winfo_reqwidth())
         height = max(640, self.root.winfo_reqheight())
@@ -1266,6 +1294,21 @@ class SyncApp:
             self.btn_play.config(state="normal")   # Start always available
         except Exception:
             pass
+        # the transport sweep resets combos to editable (state=normal);
+        # restore their readonly behaviour, and keep the frame-step buttons
+        # following the running state
+        if playing:
+            for tag in ("A", "B"):
+                for cb in (self.combo_audio.get(tag), self.combo_sub.get(tag)):
+                    try:
+                        cb.config(state="readonly")
+                    except Exception:
+                        pass
+        for b in getattr(self, "_fstep_btns", []):
+            try:
+                b.config(state=state)
+            except Exception:
+                pass
         # the master bar only ever works under Sync Lock: re-assert it
         # after the generic enable/disable sweep above
         if playing and not self.sync_locked:
@@ -1417,6 +1460,8 @@ class SyncApp:
             return  # EOF auto-pause: do not mirror, do not unpause
         if ts - self._pause_cmd_ts < 0.35:
             return  # our own command's echo (mpv flaps false+true) or stale
+        if time.monotonic() - self._frame_step_ts < 1.0:
+            return  # flutter around a frame step: never mirror, never unpause
         if value and p and p.at_end:
             return  # EOF auto-pause: do not mirror
         if value != self.paused:
@@ -1599,6 +1644,7 @@ class SyncApp:
 
     # -- seek bars ----------------------------------------------------------
     def _toggle_play_one(self, tag):
+        self._last_active = tag
         """Play/pause ONLY this video - the other one keeps playing. This
         lets the user watch a single video before committing to the sync
         (Lock). We stamp the command time so the SYNCPAUSE echo of OUR OWN
@@ -1612,6 +1658,91 @@ class SyncApp:
         name = "Movie" if tag == "A" else "Reaction"
         self.status_lbl.config(text="%s %s - the other video is untouched. (Lock sync takes over both.)"
                                % (name, "paused" if pause else "playing"))
+
+    # -- frame-by-frame stepping ---------------------------------------------
+    def _step_frame(self, tag, back=False):
+        """Step ONE video by one frame (works while paused; mpv steps
+        exactly one frame and pauses again - verified). Re-anchors the
+        offset from a fresh IPC read afterwards: the beacon throttles at
+        0.099 s and would miss a 0.033 s step."""
+        if not self.started:
+            self.status_lbl.config(text="Start playback first so the video window exists.")
+            return
+        if self.sync_locked:
+            self.status_lbl.config(
+                text="Unlock sync first - frame stepping belongs to alignment (or use the Master bar).")
+            return
+        p = self.players.get(tag)
+        if not (p and p.running and p.hwnd):
+            self.status_lbl.config(text="Video not ready yet.")
+            return
+        if not back and (p.at_end or p._eof_hold):
+            self.status_lbl.config(
+                text="This video is at its end - only one frame back is possible.")
+            return
+        self._frame_step_ts = time.monotonic()
+        self._pause_cmd_ts = time.monotonic()   # mpv flutters pause around a step
+        self._last_active = tag
+        # reference = TRUE mpv position (the panel's last_pos lags by up to
+        # ~0.1 s, so comparing against it would misjudge a 1/30 s step)
+        pre = self._fresh_pos(tag)
+        self._step_pending[tag] = (back, pre if pre is not None
+                                   else self.last_pos.get(tag))
+        p.frame_step(back)
+        name = "Movie" if tag == "A" else "Reaction"
+        self.status_lbl.config(
+            text="%s: one frame %s (frame-perfect alignment - use per-video play to compare)."
+                 % (name, "back" if back else "forward"))
+        self._step_pending[tag] = (back, self.last_pos.get(tag))
+        self.root.after(150, lambda: self._reanchor_after_step(tag, 0))
+
+    def _reanchor_after_step(self, tag, tries=0):
+        """After a frame step the position moved by one frame; refresh the
+        panel bookkeeping from the drivers over IPC and re-anchor the offset.
+        Retries: the step may still be landing (frame-back-step decodes
+        backward), so keep re-reading until the position changes."""
+        if not self.started:
+            return
+        pending = self._step_pending.get(tag)
+        if pending:
+            back, pre = pending
+            self._step_pending[tag] = None
+            ok = False
+            for _ in range(8):
+                ra = self._fresh_pos("A")
+                rb = self._fresh_pos("B")
+                if ra is not None and rb is not None:
+                    self.sync_off = rb - ra
+                cur = self.last_pos.get(tag)
+                if cur is None or pre is None:
+                    return   # nothing to compare: give up cleanly
+                if (back and cur < pre - 0.005) or (not back and cur > pre + 0.005):
+                    ok = True
+                    break
+                time.sleep(0.15)   # step still in flight: read again
+            if not ok:
+                ra = self._fresh_pos("A")
+                rb = self._fresh_pos("B")
+                if ra is not None and rb is not None:
+                    self.sync_off = rb - ra
+        self._commit_seek(tag, self.last_pos.get(tag) or 0.0)
+
+    def _fresh_pos(self, t):
+        """Synchronous one-shot position read over IPC (accurate to the
+        frame; used after frame steps the beacon would miss)."""
+        p = self.players.get(t)
+        if not (p and p.running):
+            return None
+        err, pos = p.get_property("time-pos", timeout=2.0)
+        if err == "success" and pos is not None:
+            pos = float(pos)
+            dur = self.last_dur.get(t)
+            if dur and pos > dur:
+                pos = dur
+            self.last_pos[t] = pos
+            self._status_time[t] = time.monotonic()
+            return pos
+        return None
 
     def _toggle_pip(self, tag):
         """Picture-in-picture for THIS video: border removed and always on
@@ -1845,12 +1976,14 @@ class SyncApp:
         # only sticks on real user input.
         if self._prog_set or self.sync_locked:
             return
+        self._last_active = "A"
         self.dragging_seek_a = True
         self._seek_a_val = float(v)
 
     def _on_seek_b_drag(self, v):
         if self._prog_set or self.sync_locked:
             return
+        self._last_active = "B"
         self.dragging_seek_b = True
         self._seek_b_val = float(v)
 
@@ -1981,8 +2114,35 @@ class SyncApp:
     def _nudge_speed(self, d):
         s = round(max(0.25, min(2.5, self.speed.get() + d)), 2)
         self.speed.set(s)
-        self.speed_lbl.config(text="%.2fx" % s)
+        self._sync_speed_str()
         self._apply_speed()
+
+    def _sync_speed_str(self):
+        try:
+            self.speed_str.set("%.2fx" % round(float(self.speed.get()), 2))
+        except Exception:
+            self.speed_str.set("1.00x")
+
+    def _apply_speed_entry(self):
+        """Entry accepted: parses e.g. '1.35', 'x1.35', '1.35x';
+        clamps to [0.25, 2.5]; applies on Return or FocusOut."""
+        raw = self.speed_str.get().strip().lower()
+        if raw.endswith("x"):
+            raw = raw[:-1].strip()
+        if raw.startswith("x"):
+            raw = raw[1:].strip()
+        try:
+            s = round(max(0.25, min(2.5, float(raw))), 2)
+        except Exception:
+            s = 0.0   # invalid text: revert display
+        if s <= 0.0:
+            self._sync_speed_str()
+            self.status_lbl.config(text="Speed not changed - type a number like 1.35.")
+            return
+        self.speed.set(s)
+        self._sync_speed_str()
+        self._apply_speed()
+        self.status_lbl.config(text="Speed set to %.2fx (both videos)." % s)
 
     def _apply_speed(self):
         for t in ("A", "B"):
@@ -2144,6 +2304,7 @@ class SyncApp:
         react_at_end = pb.at_end or (b_dur and rb is not None and rb >= b_dur - 0.5)
         if (pa and pb and pa.running and pb.running and playing
                 and now - pb.last_seek_ts > 1.2     # grace for ANY seek path
+                and now - self._frame_step_ts > 1.2  # grace after frame steps
                 and now >= self._seek_grace_until
                 and now - self._last_corr["B"] > cooldown
                 and not (self.dragging_seek_a or self.dragging_seek_b
