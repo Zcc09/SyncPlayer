@@ -1,0 +1,2300 @@
+#!/usr/bin/env python3
+"""
+SyncPlayer — dual-video sync player built on mpv (TWO independent players).
+
+Each video plays in its OWN mpv process and window with its OWN timeline,
+so seeking one video NEVER touches the other — no filter graphs, no
+rebuilds, nothing to glitch or crash. The panel acts as a master clock:
+
+  * Master bar    -> moves BOTH videos together
+  * Movie bar     -> moves ONLY the movie (this is how you align)
+  * Reaction bar  -> moves ONLY the reaction (this is how you align)
+  * auto re-sync  -> while playing, the reaction is gently pulled back
+    to its aligned spot whenever it drifts (about a 0.45 s threshold)
+
+Features
+  - Two independent video windows, auto-arranged side by side
+  - Per-video volume + master volume + mutes, speed 0.25x - 2.5x
+  - Master seek, +-n-second jumps, restart, screenshots of both videos
+  - Local files or URLs (YouTube etc., resolved via yt-dlp)
+  - Drag & drop files onto the panel; config auto-saved
+
+Usage:
+  python syncplayer.py                         # open the panel
+  python syncplayer.py movie.mkv react.mp4     # prefill and start
+  python syncplayer.py movie.mkv "https://youtu.be/..."
+
+Requires: mpv on PATH (or MPV_PATH env / common install dirs).
+"""
+
+import ctypes
+import ctypes.wintypes  # noqa: F401 (ctypes.wintypes.DWORD etc. used in window helpers)
+import io
+import json
+import os
+import queue
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import tkinter as tk
+try:
+    from tkinterdnd2 import TkinterDnD, DND_FILES
+    _HAS_DND = True
+except Exception:
+    _HAS_DND = False
+from tkinter import ttk, filedialog, messagebox
+
+APP_NAME = "SyncPlayer"
+if getattr(sys, "frozen", False):
+    # packaged exe: keep data out of the exe's folder (e.g. Desktop)
+    BASE = os.path.dirname(sys.executable)
+    _appdata = os.environ.get("APPDATA") or BASE
+    CONFIG_PATH = os.path.join(_appdata, "SyncPlayer", "syncplayer_config.json")
+    SHOT_DIR = os.path.join(os.path.expanduser("~"), "Pictures", "SyncPlayer")
+else:
+    BASE = os.path.dirname(os.path.abspath(__file__))
+    CONFIG_PATH = os.path.join(BASE, "syncplayer_config.json")
+    SHOT_DIR = os.path.join(BASE, "screenshots")
+os.makedirs(SHOT_DIR, exist_ok=True)
+
+STATUS_PREFIX = "SYNCSTATUS|"
+STATUS_APPEND = "|${sub-id}|${aid}"   # appended to the term status line
+YOUTUBE_HOSTS = ("youtube.com", "youtu.be", "music.youtube.com")
+
+LUA_SCRIPT = """
+-- frame-accurate position beacon: mpv 0.41's ${time-pos} in the status
+-- line is OSD-cached (~1 Hz, seconds stale) while percent-pos is integer;
+-- neither drives the seek bars. observe_property fires on every real
+-- position change, so we throttle to ~10 Hz and print fresh positions.
+local last_pos = -9
+mp.observe_property("time-pos", "number", function(name, pos)
+    if pos == nil then return end
+    if math.abs(pos - last_pos) >= 0.099 then
+        last_pos = pos
+        print(string.format("SYNCPOS|%.3f", pos))
+    end
+end)
+mp.observe_property("eof-reached", "bool", function(name, v)
+    print("SYNCEOF|" .. tostring(v))
+end)
+mp.observe_property("pause", "bool", function(name, value)
+    if mp.get_property_bool("eof-reached") then
+        print("SYNCPAUSE|eof")
+    else
+        print("SYNCPAUSE|" .. tostring(value))
+    end
+end)
+-- integrated PiP: report left-button drag state so the app can follow the
+-- pane while the user drags it (mpv window-dragging moves the window).
+local dragging = false
+mp.observe_property("mouse-pos", "native", function()
+    if mp.get_property_bool("mouse-btn1-down", false) then
+        if not dragging then
+            dragging = true
+            print("SYNCPIPDRAG|start")
+        end
+    else
+        if dragging then
+            dragging = false
+            print("SYNCPIPDRAG|end")
+        end
+    end
+end)
+mp.register_script_message("pip-undock", function()
+    print("SYNCPIPDRAG|undock")
+end)
+"""
+
+# App icon (256x256 PNG, base64) — used for the window/taskbar icon.
+ICON_B64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAQAAAAEACAYAAABccqhmAAAGFUlEQVR42u3du41USxhG0QkCYRED"
+    "LsLDwCcZfDLAxkCaGHBxcUmAULBAGCNh8OjuOY+q2uuXdgJ19C1dcWHm7s4555xzzjnnnHPOOeec"
+    "c26pe/L02Q/pIYswbAkUBi8BweAlIBi+BAKjl2Bg+BIIDF8CgfFLEDB8CQTGL0HA8CUQGL8EAeOX"
+    "IOCjSlEIfEgpioAPKEUR8OGkKAI+mBRFwIeSwgj4SFIUAB9IiiLgw0hRBHwQKYyAjyFFAfAhpCgC"
+    "PoAURsDjS1EAPLwURcCDS2EEPLYUBcBDS2EEPLIUBcADS2EEPK4EAEk1ADysFEbAo0pRADyoFEbA"
+    "Y0oAkAQASRkAPKQURsAjSgCQBABJGQA8oBRGwONJAFi6V+++LtGLD/eH9vzT2yUCQAAAI4dDGYck"
+    "AEYPAxgEATB8EIAgCoDxQwACQQAMHwQgiAJg/BCAQBQA44cABHYCwPiNHwJhBIzf+CGwDgLLAGD8"
+    "EIBAFADjhwAEAAAAAACgBoDxQwACUQCMHwIQAAAAAACAGgBvPn5fotefv+iKXn57v0QAAAAAAAAA"
+    "ABg1AABg/IIAAAAgAAAAAAIAAAAgAAAAAAIAAAAgAAAAAAAAQBcA4xcEAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAswLw6wAAAACEAVgZAQAAAAAXALAqBAAAAACuAGA1CAAAAADcAMAqEAAAAAB4"
+    "BACzIwAAAADgkQDMDAEAAACAjQCYEQIAAAAAGwMwEwQAAAAAdgJgBgQAAAAA7AjA6BAAAAAAOACA"
+    "USEAAAAAcCAAo0EAAAAA4AQARkEAAAAAwEkAjAABAAAAgJMBOBMCAAAAAIMAcAYEAAAAAAYD4EgE"
+    "AAAAAAwIwFEQAAAAABgYgL0hAAAAADABAHtBAAAAAGAiALZGAAAAAMBkAGwJAQAAAIBJAdgCAgAA"
+    "AACTA/AYCAAAAAAsAsAtCAAAAABYCIBrIQAAAACwIACXQgAAAABgYQD+BwEAAACAAAB/QwAAAABA"
+    "BIA/QQAAAAAgBsDvEAAAAACIAvBwAAAAAPwXAAAAAAB/BgAAAADA/wUAAAAA4O8BAAAAAPA3AQEA"
+    "AAD4twAAAAAA/GtAAAAAAH4eAAAAAAA/EQgAAACAnwkIAAAAYJrhAwAAAPB7AQAAAAD4zUAAAAAA"
+    "/G5AAAAAAH47MAAAAIATAThq/AAAAAAGAuDI4QMAAAAYBIAzhg8AAADgZADOHD4AAACAEwEYYfwA"
+    "AAAADgZglOEDAAAAOBCA0YYPAAAA4AAARh0+AAAAgJ0BGH38AAAAAHYAYIbhAwAAANgYgJmGDwAA"
+    "AGAjAGYcPgAAAIANAJh5/AAAAABuBGD24QMAAAC4AYBVhg8AAADgCgBWGz4AAACACwFYdfwAAAAA"
+    "4gEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAGBIACAg4wcAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAFgSAAgYv/EDAAAAAAAAAAAAAOQAgIDxGz8AAAAAAFQBgIDxG38cAAgYv/EDAAAAAEAVAAgY"
+    "v/HHAYCA8Rt/HAAIGL/x7wwABCBg/OHxzwAABIzf+OMAQMD4jT8OAAgM3/ABAAHjN/46ACAwfMMH"
+    "AAyMPj16AMDByEMjB4AkAEjaCAAISOHxA0ACgIeUACApBwAEpPD4ASABwINKAJCUAwACUnj8AJDi"
+    "AEBACo8fABIAPLBUBQACUnj8AJDiAEBACo8fAFIcAAhI4fFDQIqPHwBSHAAISOHxQ0CKjx8AUhwA"
+    "CEjh8UNAio8fAlJ8/ACQ4gBAQAqPHwJSfPwQkOLjh4AUHz8EpPj4QSDFhw8ByfghINXHDwIpPnwI"
+    "SMYPAhm+g4CM34FAhu9AIMN3MJDROxDI8B0QZPAOCDJ4BwoZtnPOOeecc84555xzzjnn3D/vJ1bG"
+    "v0h6MjYNAAAAAElFTkSuQmCC"
+)
+
+# ---------------------------------------------------------------------------
+# mpv discovery
+# ---------------------------------------------------------------------------
+
+_mpv_cache = None
+_ffprobe_cache = None
+
+
+def find_mpv():
+    global _mpv_cache
+    if _mpv_cache:
+        return _mpv_cache
+    env = os.environ.get("MPV_PATH")
+    if env and os.path.isfile(env):
+        _mpv_cache = env
+        return env
+    found = shutil.which("mpv")
+    if found:
+        # prefer the real exe over mpv.com (the console-hiding shim breaks pipes)
+        if found.lower().endswith(".com"):
+            exe = os.path.join(os.path.dirname(found), "mpv.exe")
+            if os.path.isfile(exe):
+                found = exe
+        _mpv_cache = found
+        return found
+    for c in (r"C:\Program Files\MPV Player\mpv.exe",
+              r"C:\Tools\mpv\mpv.exe",
+              os.path.expanduser(r"~\AppData\Local\Programs\mpv\mpv.exe"),
+              os.path.expanduser(r"~\scoop\apps\mpv\current\mpv.exe"),
+              r"C:\Program Files\mpv\mpv.exe"):
+        if os.path.isfile(c):
+            _mpv_cache = c
+            return c
+    _mpv_cache = "mpv"
+    return _mpv_cache
+
+
+def find_probe():
+    global _ffprobe_cache
+    if _ffprobe_cache is None:
+        _ffprobe_cache = shutil.which("ffprobe") or ""
+    return _ffprobe_cache or None
+
+
+def probe_media(path, timeout=20):
+    """Best-effort probe: returns (duration_s or None, (w, h) or None)."""
+    probe = find_probe()
+    if not probe or not path or path.startswith(("http://", "https://")):
+        return None, None
+    try:
+        out = subprocess.run(
+            [probe, "-v", "error",
+             "-show_entries", "format=duration",
+             "-show_entries", "stream=codec_type,width,height",
+             "-of", "json", path],
+            capture_output=True, text=True, timeout=timeout,
+            creationflags=subprocess.CREATE_NO_WINDOW)
+        d = json.loads(out.stdout or "{}")
+        dur = None
+        try:
+            dur = float(d["format"]["duration"])
+        except Exception:
+            pass
+        size = None
+        for s in d.get("streams", []):
+            if s.get("codec_type") == "video" and s.get("width"):
+                size = (int(s["width"]), int(s["height"]))
+                break
+        return dur, size
+    except Exception:
+        return None, None
+
+
+def probe_duration(path, timeout=20):
+    return probe_media(path, timeout)[0]
+
+
+def is_youtube(url):
+    try:
+        u = url.lower()
+        return "youtube.com" in u or "youtu.be" in u
+    except Exception:
+        return False
+
+
+def resolve_url(url):
+    """Non-YouTube URLs: resolve a direct stream URL via yt-dlp (best-effort)."""
+    ytdl = shutil.which("yt-dlp")
+    if not ytdl:
+        return url
+    try:
+        out = subprocess.run(
+            [ytdl, "-f", "best[height<=1080]/best", "--no-warnings",
+             "--get-url", "--no-playlist", url],
+            capture_output=True, text=True, timeout=120)
+        line = out.stdout.strip().splitlines()
+        if out.returncode == 0 and line:
+            return line[-1]
+    except Exception:
+        pass
+    return url
+
+
+# ---------------------------------------------------------------------------
+# sync math (pure functions — unit-tested in selftest.py)
+# ---------------------------------------------------------------------------
+
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+def reaction_target(movie_pos, sync_off):
+    """Where the reaction SHOULD be, given the movie's live position and the
+    aligned offset (reaction offset relative to the movie, may be negative)."""
+    if movie_pos is None:
+        return None
+    return movie_pos + sync_off
+
+
+def drift(react_pos, movie_pos, sync_off):
+    """How far the reaction has wandered from its aligned spot (seconds)."""
+    if react_pos is None or movie_pos is None:
+        return 0.0
+    return react_pos - (movie_pos + sync_off)
+
+
+def needs_correction(react_pos, movie_pos, sync_off, threshold=0.45,
+                     playing=True, dragging=False, movie_at_end=False,
+                     react_at_end=False):
+    """True when the reaction should be gently re-seeked back into alignment."""
+    if not playing or dragging or movie_at_end or react_at_end:
+        return False
+    if react_pos is None or movie_pos is None:
+        return False
+    return abs(drift(react_pos, movie_pos, sync_off)) > threshold
+
+
+# ---------------------------------------------------------------------------
+# Win32 helpers (window placement; reliable at any DPI scaling)
+# ---------------------------------------------------------------------------
+
+_SWP_NOZORDER_NOACTIVATE = 0x0004 | 0x0010
+
+# ---- mpv IPC pipe plumbing ------------------------------------------------
+# Overlapped I/O: the CRT poisons a pipe handle that has been read, and a
+# synchronous write blocks forever once mpv's reply buffer (a few KB) is
+# full - which a drag-spammed volume/seek burst does in a second. Writes
+# go through a dedicated writer thread and replies are drained by a
+# reader thread, so the GUI thread can never block on the pipe.
+_GENERIC_READ = 0x80000000
+_GENERIC_WRITE = 0x40000000
+_OPEN_EXISTING = 3
+_FILE_FLAG_OVERLAPPED = 0x40000000
+_ERROR_IO_PENDING = 997
+_ERROR_BROKEN_PIPE = 109
+_ERROR_OPERATION_ABORTED = 995
+_ERROR_INVALID_HANDLE = 6
+_WAIT_TIMEOUT = 258
+
+
+class _OVERLAPPED(ctypes.Structure):
+    _fields_ = [("Internal", ctypes.c_void_p),
+                ("InternalHigh", ctypes.c_void_p),
+                ("Offset", ctypes.wintypes.DWORD),
+                ("OffsetHigh", ctypes.wintypes.DWORD),
+                ("hEvent", ctypes.c_void_p)]
+
+
+_k32 = ctypes.windll.kernel32
+_k32.CreateFileW.restype = ctypes.c_void_p
+_k32.CreateFileW.argtypes = [ctypes.c_wchar_p, ctypes.wintypes.DWORD,
+                             ctypes.wintypes.DWORD, ctypes.c_void_p,
+                             ctypes.wintypes.DWORD, ctypes.wintypes.DWORD,
+                             ctypes.c_void_p]
+_k32.ReadFile.restype = ctypes.wintypes.BOOL
+_k32.ReadFile.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.wintypes.DWORD,
+                          ctypes.POINTER(ctypes.wintypes.DWORD), ctypes.c_void_p]
+_k32.WriteFile.restype = ctypes.wintypes.BOOL
+_k32.WriteFile.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.wintypes.DWORD,
+                           ctypes.POINTER(ctypes.wintypes.DWORD), ctypes.c_void_p]
+_k32.GetOverlappedResult.restype = ctypes.wintypes.BOOL
+_k32.GetOverlappedResult.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                     ctypes.POINTER(ctypes.wintypes.DWORD),
+                                     ctypes.wintypes.BOOL]
+_k32.CloseHandle.argtypes = [ctypes.c_void_p]
+_k32.CancelIoEx.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+
+
+def screen_size():
+    try:
+        u = ctypes.windll.user32
+        return u.GetSystemMetrics(0), u.GetSystemMetrics(1)
+    except Exception:
+        return 1920, 1080
+
+
+def find_mpv_window(pid, title_sub, tries=120, delay=0.25):
+    """Find the visible top-level 'mpv' window of a process (by PID + title).
+    Returns the HWND or None. The 'mpv smtc' helper window is skipped by
+    class-name matching."""
+    user32 = ctypes.windll.user32
+    found = [0]
+    for _ in range(tries):
+        found[0] = 0
+        cb = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+
+        def _cb(h, _l):
+            pid2 = ctypes.wintypes.DWORD()
+            user32.GetWindowThreadProcessId(h, ctypes.byref(pid2))
+            if pid2.value == pid and user32.IsWindowVisible(h):
+                cls = ctypes.create_unicode_buffer(64)
+                user32.GetClassNameW(h, cls, 64)
+                if cls.value == "mpv":
+                    buf = ctypes.create_unicode_buffer(256)
+                    user32.GetWindowTextW(h, buf, 256)
+                    if title_sub in buf.value:
+                        found[0] = h
+            return True
+
+        user32.EnumWindows(cb(_cb), 0)
+        if found[0]:
+            return found[0]
+        time.sleep(delay)
+    return None
+
+
+def place_window(hwnd, x, y, w, h):
+    try:
+        ctypes.windll.user32.SetWindowPos(hwnd, 0, x, y, max(160, w), max(120, h),
+                                          _SWP_NOZORDER_NOACTIVATE)
+        return True
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# mpv driver (one process + one window per video)
+# ---------------------------------------------------------------------------
+
+class MpvDriver:
+    def __init__(self, src, tag, on_pause=None, on_exit=None,
+                 start_paused=False):
+        self.tag = tag
+        self.on_pause = on_pause
+        self.on_exit = on_exit
+        self.proc = None
+        self.q = queue.Queue()
+        self.lock = threading.Lock()
+        self.stopped = threading.Event()
+        self._h = None               # overlapped pipe handle
+        self._cmdq = queue.Queue()   # IPC commands, drained by a writer thread
+        self._next_rid = 1           # outgoing get_property request ids
+        self.rq = queue.Queue()      # replies: (request_id, error, data)
+        self.sub_id = None           # current subtitle track id (status line)
+        self.audio_id = None         # current audio track id (status line)
+        self.paused = bool(start_paused)
+        self.at_end = False
+        self._eof_hold = False           # parked in the keep-open EOF hold
+        self.hwnd = None
+        self.last_seek_ts = 0.0         # any seek path stamps this
+
+        # Windows named pipe for JSON IPC (open() works directly on \\\\.\\pipe\\...)
+        pipe_name = "syncplayer-%d-%d-%s" % (os.getpid(), threading.get_ident(), tag)
+
+        # custom input map to allow clicking the video to pause
+        self.input_conf = os.path.join(SHOT_DIR, "input.conf")
+        try:
+            with open(self.input_conf, "w") as f:
+                f.write("MBTN_LEFT cycle pause\nSPACE cycle pause\n")
+        except Exception:
+            pass
+
+        self.lua_script = os.path.join(SHOT_DIR, "syncplayer_events.lua")
+        try:
+            with open(self.lua_script, "w") as f:
+                f.write(LUA_SCRIPT)
+        except Exception:
+            pass
+
+        title = "SyncPlayer — Movie" if tag == "A" else "SyncPlayer — Reaction"
+        args = [find_mpv(),
+                "--no-config",
+                "--input-ipc-server=%s" % pipe_name,
+                "--input-conf=%s" % self.input_conf,
+                "--script=%s" % self.lua_script,
+                "--input-terminal=no",
+                "--terminal=yes",
+                "--term-osd=force",
+                "--no-term-osd-bar",
+                "--term-status-msg=" + STATUS_PREFIX +
+                "${time-pos}|${duration}|${percent-pos}|${pause}|${volume}|${playback-time}|${eof-reached}"
+                + STATUS_APPEND,
+                "--osc=no",
+                "--keep-open=yes",
+                "--hwdec=auto",
+                "--fs=no",
+                "--ytdl=yes",
+                "--force-window=yes",
+                "--title=%s" % title,
+                "--pause=yes" if start_paused else "--pause=no",
+                src,
+                ]
+        self.proc = subprocess.Popen(
+            args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, encoding="utf-8",
+            errors="replace", bufsize=1,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        threading.Thread(target=self._connect_pipe, args=(pipe_name,), daemon=True).start()
+        threading.Thread(target=self._stdout_reader, daemon=True).start()
+
+    # -- pipe ---------------------------------------------------------------
+    # Overlapped connect: open the pipe with FILE_FLAG_OVERLAPPED, then spawn
+    # a writer thread (serializes IPC writes; blocks only itself) and a drain
+    # thread (consumes mpv's replies so its reply buffer never fills).
+    def _connect_pipe(self, name, tries=60, delay=0.25):
+        path = r"\\.\pipe\%s" % name
+        for _ in range(tries):
+            if self.stopped.is_set():
+                return
+            h = _k32.CreateFileW(path,
+                                 _GENERIC_READ | _GENERIC_WRITE, 0, None,
+                                 _OPEN_EXISTING, _FILE_FLAG_OVERLAPPED, None)
+            if h and h != ctypes.c_void_p(-1).value:
+                self._h = h
+                threading.Thread(target=self._drain_replies, daemon=True).start()
+                threading.Thread(target=self._writer_loop, daemon=True).start()
+                return
+            time.sleep(delay)
+
+    def _drain_replies(self):
+        """Consume and discard mpv reply packets so its server-side buffer
+        never fills and mpv keeps reading our commands - a full buffer
+        wedges the whole sync loop. Reply LINES carrying a request_id are
+        routed to rq so get_property() can match replies to its calls."""
+        buf = ctypes.create_string_buffer(8192)
+        evt = _k32.CreateEventW(None, False, False, None)
+        ov = _OVERLAPPED()
+        ov.hEvent = evt
+        n = ctypes.wintypes.DWORD(0)
+        h = self._h
+        acc = b""
+
+        def emit(chunk):
+            nonlocal acc
+            acc += chunk
+            while b"\n" in acc:
+                line, rest = acc.split(b"\n", 1)
+                acc = rest
+                try:
+                    m = json.loads(line.decode("utf-8", "replace"))
+                    if "request_id" in m and "error" in m:
+                        self.rq.put((m["request_id"], m.get("error"),
+                                     m.get("data")))
+                except Exception:
+                    pass
+
+        while not self.stopped.is_set() and h:
+            if _k32.ReadFile(h, ctypes.byref(buf), len(buf), ctypes.byref(n),
+                             ctypes.byref(ov)):
+                emit(buf.raw[:n.value])
+                continue
+            err = _k32.GetLastError()
+            if err == _ERROR_IO_PENDING:
+                # Block on the event: NEVER re-issue ReadFile while the
+                # OVERLAPPED is still pending (undefined behavior, heap
+                # corruption). quit() cancels the I/O to wake us.
+                _k32.WaitForSingleObject(evt, 0xFFFFFFFF)
+                done = ctypes.wintypes.DWORD(0)
+                if not _k32.GetOverlappedResult(h, ctypes.byref(ov),
+                                                ctypes.byref(done), False):
+                    err = _k32.GetLastError()
+                    if err in (_ERROR_BROKEN_PIPE, _ERROR_OPERATION_ABORTED,
+                               _ERROR_INVALID_HANDLE):
+                        break
+                else:
+                    emit(buf.raw[:done.value])
+            elif err in (_ERROR_BROKEN_PIPE, _ERROR_OPERATION_ABORTED,
+                          _ERROR_INVALID_HANDLE):
+                break
+        if evt:
+            _k32.CloseHandle(evt)
+
+    def _writer_loop(self):
+        """Serial writer: pops queued commands and writes them. A blocked
+        write stalls THIS thread only - never the GUI."""
+        while not self.stopped.is_set() and self._h:
+            try:
+                obj = self._cmdq.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            data = json.dumps(obj, ensure_ascii=False).encode("utf-8") + b"\n"
+            wbuf = ctypes.create_string_buffer(data)
+            written = ctypes.wintypes.DWORD(0)
+            try:
+                if not _k32.WriteFile(self._h, ctypes.byref(wbuf), len(data),
+                                     ctypes.byref(written), None):
+                    time.sleep(0.05)      # pipe busy/broken: back off, drop
+            except Exception:
+                pass
+
+    # -- status reader ------------------------------------------------------
+    def _stdout_reader(self):
+        try:
+            for line in self.proc.stdout:
+                if line.startswith(STATUS_PREFIX):
+                    self._parse_status(line[len(STATUS_PREFIX):].strip())
+                elif "SYNCPOS|" in line:
+                    try:
+                        pos = float(line.rsplit("SYNCPOS|", 1)[1].strip())
+                        self.q.put(("pos", pos))
+                    except Exception:
+                        pass
+                elif "SYNCPIPDRAG|start" in line:
+                    self.q.put(("pipdrag", "start"))
+                elif "SYNCPIPDRAG|end" in line:
+                    self.q.put(("pipdrag", "end"))
+                elif "SYNCPIPDRAG|undock" in line:
+                    self.q.put(("pipdrag", "undock"))
+                elif "SYNCEOF|true" in line:
+                    self.at_end = True
+                    self._eof_hold = True
+                elif "SYNCEOF|false" in line:
+                    self.at_end = False
+                    self._eof_hold = False
+                elif "SYNCPAUSE|eof" in line:
+                    self.paused = True
+                    self.at_end = True
+                    self._eof_hold = True
+                    self.q.put(("pause", ("eof", time.monotonic())))
+                elif "SYNCPAUSE|true" in line:
+                    self.paused = True
+                    self.q.put(("pause", (True, time.monotonic())))
+                elif "SYNCPAUSE|false" in line:
+                    self.paused = False
+                    self._eof_hold = False
+                    self.q.put(("pause", (False, time.monotonic())))
+        except Exception:
+            pass
+        finally:
+            if not self.stopped.is_set():
+                self.q.put(("exit", None))
+                # NOTE: never call self.on_exit() here — it would run on this
+                # worker thread and tkinter calls from non-main threads are
+                # unsafe (RuntimeError). The app handles ("exit", None) on the
+                # main thread via the queue.
+
+    @staticmethod
+    def _to_seconds(x):
+        """Parse '123.45' or '01:23:45.678' (mpv HH:MM:SS.mmm format) to float."""
+        x = (x or "").strip()
+        if not x or x in ("nan", "-nan"):
+            return None
+        sign = -1.0 if x.startswith("-") else 1.0
+        x = x.lstrip("-")
+        try:
+            if ":" in x:
+                parts = [float(p) for p in x.split(":")]
+                tail = parts[-3:]
+                if len(tail) == 2:
+                    sec = tail[0] * 60 + tail[1]
+                elif len(tail) == 3:
+                    sec = tail[0] * 3600 + tail[1] * 60 + tail[2]
+                else:
+                    sec = tail[-1]
+                return sign * sec
+            return sign * float(x)
+        except Exception:
+            return None
+
+    def _parse_status(self, s):
+        parts = s.split("|")
+        try:
+            rec = {
+                "time_pos": MpvDriver._to_seconds(parts[0] if len(parts) > 0 else ""),
+                "duration": MpvDriver._to_seconds(parts[1] if len(parts) > 1 else ""),
+                "percent": float(parts[2]) if len(parts) > 2 and parts[2] not in ("", "nan", "-nan") else None,
+                "pause": parts[3].strip() == "yes" if len(parts) > 3 else False,
+                "volume": float(parts[4]) if len(parts) > 4 and parts[4] not in ("", "nan", "-nan") else None,
+                "playback_time": MpvDriver._to_seconds(parts[5] if len(parts) > 5 else ""),
+                "eof": parts[6].strip() == "yes" if len(parts) > 6 else False,
+            }
+            if len(parts) > 7:
+                self.sub_id = self._to_int_or_none(parts[7])
+            if len(parts) > 8:
+                self.audio_id = self._to_int_or_none(parts[8])
+            self.q.put(("status", rec))
+        except Exception:
+            pass
+
+    @staticmethod
+    def _to_int_or_none(x):
+        x = (x or "").strip()
+        try:
+            return int(x)
+        except Exception:
+            return None
+
+    def get_property(self, prop, timeout=3.0):
+        """Synchronous property read over the IPC pipe: queue the command
+        with a unique request_id, then wait for the drain thread to route
+        the matching reply line into rq. Returns (error, data)."""
+        if not (self._h and self.running):
+            return None, None
+        rid = self._next_rid
+        self._next_rid += 1
+        self._cmdq.put({"command": ["get_property", prop],
+                        "request_id": rid})
+        dl = time.monotonic() + timeout
+        while time.monotonic() < dl:
+            try:
+                rid2, err, data = self.rq.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if rid2 == rid:
+                return err, data
+            if err == "property-unavailable":
+                return err, data         # id-less reply: no match possible
+        return None, None
+
+    def track_list(self):
+        err, tl = self.get_property("track-list")
+        return tl if isinstance(tl, list) else []
+
+    def set_sub(self, n):
+        if n is None:
+            self.cmd({"command": ["set_property", "sid", "no"]})
+        else:
+            self.cmd({"command": ["set_property", "sid", int(n)]})
+
+    def set_audio(self, n):
+        if n is None:
+            self.cmd({"command": ["set_property", "aid", "no"]})
+        else:
+            self.cmd({"command": ["set_property", "aid", int(n)]})
+
+    # -- commands -----------------------------------------------------------
+    def cmd(self, obj):
+        """Queue a JSON IPC command; a writer thread performs the write, so
+        the GUI can never block on the pipe (commands sent before the pipe
+        connects are simply drained once it is up)."""
+        try:
+            self._cmdq.put(obj)
+        except Exception:
+            pass
+
+    def set_volume(self, n):
+        # NOTE: mpv 0.41's IPC "set" command silently ignores `volume` —
+        # verified empirically; "set_property" is the working form.
+        self.cmd({"command": ["set_property", "volume", max(0, min(150, int(round(n))))]})
+
+    def set_speed(self, r):
+        self.cmd({"command": ["set_property", "speed", max(0.1, min(4.0, r))]})
+
+    def set_pause(self, pause):
+        # mpv 0.41 rejects JSON booleans for pause ("invalid parameter") -
+        # use the "yes"/"no" strings. mpv stops printing the term status line
+        # while paused, so we track the state locally (single writer).
+        self.paused = bool(pause)
+        # NOTE: do NOT clear at_end here - resume events from the Lua
+        # (SYNCEOF|false / SYNCPAUSE|false) own that state; clearing it on
+        # unpause unlocked the drift corrector straight into a manual seek.
+        self.cmd({"command": ["set", "pause", "yes" if pause else "no"]})
+
+    def toggle_pause(self):
+        self.paused = not self.paused
+        self.cmd({"command": ["cycle", "pause"]})
+
+    def seek(self, pos, absolute=True):
+        # Seeking out of the --keep-open EOF hold leaves mpv PAUSED (verified
+        # empirically; resuming BEFORE the seek races the keep-open state and
+        # the seek never lands). Land the seek first, then resume: mpv
+        # processes pipe commands in order, so playback starts at `pos`.
+        self.last_seek_ts = time.monotonic()
+        hold = self.at_end or self._eof_hold   # parked in the EOF hold?
+        self.at_end = False   # seeking leaves the end; eof-reached reset is racy
+        if hold:
+            if absolute:
+                self.cmd({"command": ["seek", max(0.0, pos), "absolute+exact"]})
+            else:
+                self.cmd({"command": ["seek", pos, "relative+exact"]})
+            self.set_pause(False)
+            return
+        if absolute:
+            self.cmd({"command": ["seek", max(0.0, pos), "absolute+exact"]})
+        else:
+            self.cmd({"command": ["seek", pos, "relative+exact"]})
+
+    def screenshot(self, path):
+        self.cmd({"command": ["screenshot-to-file", path, "video"]})
+
+    def quit(self):
+        self.stopped.set()
+        try:
+            self.cmd({"command": ["quit"]})
+            if self._h:
+                time.sleep(0.1)   # let the writer deliver "quit"
+                _k32.CancelIoEx(self._h, None)
+                _k32.CloseHandle(self._h)
+                self._h = None
+        except Exception:
+            pass
+        self.pipe = None
+
+    @property
+    def running(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def kill(self):
+        try:
+            if self.proc:
+                self.proc.kill()
+        except Exception:
+            pass
+# ---------------------------------------------------------------------------
+# GUI helpers
+# ---------------------------------------------------------------------------
+
+class Tooltip:
+    """Simple hover tooltip for a widget (500 ms delay)."""
+
+    def __init__(self, widget, text):
+        self.widget = widget
+        self.text = text
+        self.tip = None
+        self._after = None
+        widget.bind("<Enter>", self._schedule)
+        widget.bind("<Leave>", self._hide)
+        widget.bind("<ButtonPress>", self._hide)
+
+    def _schedule(self, _event=None):
+        self._cancel()
+        self._after = self.widget.after(500, self._show)
+
+    def _cancel(self):
+        if self._after is not None:
+            try:
+                self.widget.after_cancel(self._after)
+            except Exception:
+                pass
+            self._after = None
+
+    def _show(self, _event=None):
+        self._after = None
+        if self.tip is not None:
+            return
+        x = self.widget.winfo_rootx() + 16
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 8
+        self.tip = tk.Toplevel(self.widget)
+        self.tip.wm_overrideredirect(True)
+        self.tip.wm_geometry("+%d+%d" % (x, y))
+        tk.Label(self.tip, text=self.text, justify="left",
+                 bg="#2a2f3a", fg="#e8e8ea", padx=10, pady=6,
+                 font=("Segoe UI", 9)).pack()
+
+    def _hide(self, _event=None):
+        self._cancel()
+        if self.tip is not None:
+            self.tip.destroy()
+            self.tip = None
+
+
+class SyncApp:
+    def __init__(self, root):
+        self.root = root
+        self.players = {"A": None, "B": None}
+        self.started = False
+        self.paused = True
+        self.sync_off = 0.0          # reaction's offset vs the movie (can be ±)
+        self.last_pos = {"A": None, "B": None}
+        self.last_dur = {"A": None, "B": None}
+        self.dragging_seek_a = False
+        self.dragging_seek_b = False
+        self.dragging_seek_m = False
+        self._seek_a_val = None
+        self._seek_b_val = None
+        self._seek_m_val = None
+        self.dragging_vol = [False, False]
+        self.dragging_master = False
+        self._ctrls = []
+        self._status_time = {"A": 0.0, "B": 0.0}   # monotonic clock per stream
+        self._beacon_ts = {"A": 0.0, "B": 0.0}       # last fresh Lua position per video
+        self._seek_grace_until = 0.0               # no drift-correction until here
+        self._last_corr = {"A": 0.0, "B": 0.0}     # last correction time per video
+        self._pause_cmd_ts = 0.0               # last explicit pause-command time
+        self._prog_set = False          # True while poll code is .set()-ing bars
+        self._vol_cmd_ts = 0.0            # last volume-command send time (drag throttle)
+        self.sync_locked = False        # Sync Lock: Master bar alone drives both
+        self._to_cache = {}            # last scale "to" per bar (A/B/M)
+        self._lbl_cache = {}           # last label text per bar
+        self._lbl_status_cache = ""    # last status text
+        self.pip = {"A": False, "B": False}   # picture-in-picture state
+        self._pip_saved = {"A": 0, "B": 0}     # original window styles
+        self.pip_int = False          # integrated PiP (embedded pane) state
+        self._pip_int_tag = None      # which video is the embedded pane
+        self._pip_int_pos = [0.60, 0.60]   # pane top-left, fraction of host
+        self._pip_int_size = [0.32, 0.32]  # pane size, fraction of host
+        self._pip_int_drag = False    # user is dragging the pane
+        self._pip_move_run = False    # SetWindowPos re-layout in flight
+        self._pip_int_hwnd = None     # the embedded mpv window handle
+        self._icon_img = None
+        try:
+            self._icon_img = tk.PhotoImage(data=ICON_B64)
+            root.iconphoto(True, self._icon_img)
+        except Exception:
+            pass
+
+        self.movie_path = tk.StringVar()
+        self.react_path = tk.StringVar()
+        self.vol_a = tk.DoubleVar(value=100.0)
+        self.vol_b = tk.DoubleVar(value=100.0)
+        self.vol_m = tk.DoubleVar(value=100.0)
+        self.speed = tk.DoubleVar(value=1.0)
+        self.paused = True
+        self.saved_vol_a = 100.0
+        self.saved_vol_b = 100.0
+
+        self._load_config()
+        self._build_ui()
+        self._apply_startup_cli()
+
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.after(33, self._poll)      # ~30 Hz: smooth bars
+
+    # ---------------------------------------------------------------- UI --
+    def _build_ui(self):
+        self.root.title("%s — dual-video sync player (two mpv windows)" % APP_NAME)
+        # The panel is a fixed-size control surface, sized to its content at the
+        # end of this method. The videos play in their own mpv windows, which
+        # resize smoothly. Drag-resizing this software-rendered panel forces a
+        # full Tk re-layout+redraw every pixel (~270 ms/step on a 4K/175%
+        # display) → choppy. Locking the size removes that entirely.
+
+        style = ttk.Style(self.root)
+        try:
+            style.theme_use("clam")
+        except Exception:
+            pass
+        bg = "#16181d"
+        fg = "#e8e8ea"
+        card = "#1f232b"
+        accent = "#4f9cf9"
+        for w in (self.root,):
+            w.configure(bg=bg)
+        style.configure(".", background=bg, foreground=fg, fieldbackground=card)
+        style.configure("TFrame", background=bg)
+        style.configure("Card.TFrame", background=card)
+        style.configure("TLabel", background=bg, foreground=fg)
+        style.configure("Card.TLabel", background=card, foreground=fg)
+        style.configure("Dim.TLabel", background=bg, foreground="#8a8f9a")
+        style.configure("Head.TLabel", background=bg, foreground=accent, font=("Segoe UI", 13, "bold"))
+        style.configure("TButton", background="#2a2f3a", foreground=fg, bordercolor="#3a4150",
+                        focusthickness=0, padding=(8, 4))
+        style.map("TButton", background=[("active", "#38404e"), ("disabled", "#20242c")],
+                  foreground=[("disabled", "#5a5f6a")])
+        style.configure("Accent.TButton", background="#2c5a9e", foreground=fg)
+        style.map("Accent.TButton", background=[("active", "#3a6fc0")])
+        style.configure("TScale", background=bg, troughcolor="#2a2f3a")
+        style.configure("Horizontal.TScale", background=bg)
+        style.configure("TRadiobutton", background=bg, foreground=fg)
+        style.configure("TCheckbutton", background=bg, foreground=fg)
+        style.configure("TLabelframe", background=bg, foreground=fg, bordercolor="#3a4150")
+        style.configure("TLabelframe.Label", background=bg, foreground=fg)
+        style.configure("TEntry", fieldbackground=card, foreground=fg)
+
+        top = ttk.Frame(self.root, padding=(12, 10, 12, 2))
+        top.pack(fill="x")
+        ttk.Label(top, text="SyncPlayer", style="Head.TLabel").pack(side="left")
+        ttk.Label(top, text="two videos · two windows · auto-sync",
+                  style="Dim.TLabel").pack(side="left", padx=(10, 0), pady=(4, 0))
+
+        body = ttk.Frame(self.root, padding=(12, 4, 12, 8))
+        body.pack(fill="both", expand=True)
+
+        # ---- sources ------------------------------------------------------
+        src = ttk.LabelFrame(body, text=" Sources ", padding=8)
+        src.pack(fill="x", pady=(0, 8))
+
+        row = ttk.Frame(src)
+        row.pack(fill="x", pady=1)
+        ttk.Label(row, text="Movie / source A", width=16).pack(side="left")
+        ttk.Entry(row, textvariable=self.movie_path).pack(side="left", fill="x", expand=True)
+        ttk.Button(row, text="Browse…", width=9, command=lambda: self._browse(0)).pack(side="left", padx=(6, 0))
+        ttk.Button(row, text="URL…", width=7, command=lambda: self._url(0)).pack(side="left", padx=(4, 0))
+
+        row = ttk.Frame(src)
+        row.pack(fill="x", pady=1)
+        ttk.Label(row, text="Reaction / source B", width=16).pack(side="left")
+        ttk.Entry(row, textvariable=self.react_path).pack(side="left", fill="x", expand=True)
+        ttk.Button(row, text="Browse…", width=9, command=lambda: self._browse(1)).pack(side="left", padx=(6, 0))
+        ttk.Button(row, text="URL…", width=7, command=lambda: self._url(1)).pack(side="left", padx=(4, 0))
+        ttk.Button(row, text="⇄ Swap", width=7, command=self._swap).pack(side="left", padx=(4, 0))
+
+        # ---- sync explainer + window management ---------------------------
+        mid = ttk.Frame(body)
+        mid.pack(fill="x", pady=(0, 8))
+
+        sync = ttk.Frame(mid)
+        sync.pack(side="left", fill="both", expand=True)
+        self.btn_help = ttk.Button(sync, text="Help / How sync works",
+                                   command=self._show_help)
+        self.btn_help.pack(anchor="se", side="bottom")
+        Tooltip(self.btn_help, "Open the full guide: sync workflow, PiP modes, tracks, shortcuts.")
+
+        win = ttk.LabelFrame(mid, text=" Windows ", padding=8)
+        win.pack(side="left", fill="y", padx=(10, 0))
+        ttk.Label(win, text="Each video plays in its own\nmpv window:", style="Dim.TLabel").pack(anchor="w")
+        b = ttk.Button(win, text="⇦ ⇨ Arrange side by side", command=self._arrange_windows)
+        b.pack(anchor="w", pady=(6, 0))
+        Tooltip(b, "Put the two video windows next to each other on the screen.")
+        self._ctrls.append(b)
+        self.btn_pip_a = ttk.Button(win, text="⧉ PiP Movie",
+                                  command=lambda: self._toggle_pip("A"))
+        self.btn_pip_a.pack(anchor="w", pady=(4, 0))
+        Tooltip(self.btn_pip_a, "Picture-in-picture: Movie becomes borderless, always on top, still resizable (drag its edges).")
+        self._ctrls.append(self.btn_pip_a)
+        self.btn_pip_b = ttk.Button(win, text="⧉ PiP Reaction",
+                                  command=lambda: self._toggle_pip("B"))
+        self.btn_pip_b.pack(anchor="w", pady=(4, 0))
+        Tooltip(self.btn_pip_b, "Picture-in-picture: Reaction becomes borderless, always on top, still resizable (drag its edges).")
+        self._ctrls.append(self.btn_pip_b)
+
+        # ---- transport + timeline ------------------------------------------
+        trans = ttk.Frame(body)
+        trans.pack(fill="x", pady=(0, 8))
+
+        self.btn_play = ttk.Button(trans, text="Start", style="Accent.TButton",
+                                   width=10, command=self._start)
+        self.btn_play.pack(side="left")
+        Tooltip(self.btn_play, "Load both videos PAUSED (windows appear side by side). Press Play or Space when ready.")
+        self.btn_pause_all = ttk.Button(trans, text="▶  Play", width=8,
+                                        command=self._toggle_pause_m)
+        self.btn_pause_all.pack(side="left", padx=(5, 0))
+        Tooltip(self.btn_pause_all, "Play or pause BOTH videos together (also on the Master row).")
+        self._ctrls.append(self.btn_pause_all)
+
+        for txt, cmd, w, tip in (("⏮ Restart", lambda: self._seek(0), 9,
+                                  "Jump both videos back to the start"),
+                                 ("⏪ 10s", lambda: self._jump(-10), 7,
+                                  "Both videos back 10 s (← = 5 s)"),
+                                 ("10s ⏩", lambda: self._jump(10), 7,
+                                  "Both videos forward 10 s (→ = 5 s)"),
+                                 ("Close", self._stop, 7,
+                                  "Close both video windows"),
+                                 ("📷 Shot", self._shot, 8,
+                                  "Save screenshots of both videos")):
+            b = ttk.Button(trans, text=txt, width=w, command=cmd)
+            b.pack(side="left", padx=(5, 0))
+            Tooltip(b, tip)
+            self._ctrls.append(b)
+
+        sp = ttk.Frame(trans)
+        sp.pack(side="right")
+        ttk.Label(sp, text="Speed").pack(side="left")
+        Tooltip(sp, "Playback speed of both videos (they stay synced).")
+        for txt, d, tip in (("−", -0.1, "Slower"), ("+", 0.1, "Faster")):
+            b = ttk.Button(sp, text=txt, width=3, command=lambda d=d: self._nudge_speed(d))
+            b.pack(side="left", padx=(4, 0))
+            Tooltip(b, tip)
+            self._ctrls.append(b)
+        self.speed_lbl = ttk.Label(sp, text="1.00x", width=6)
+        self.speed_lbl.pack(side="left")
+
+        tl = ttk.LabelFrame(body, text=" Timelines ", padding=(8, 4))
+        tl.pack(fill="x", pady=(0, 4))
+
+        def make_tl(parent, label, tip, tag=None):
+            row = ttk.Frame(parent)
+            row.pack(fill="x", pady=2)
+            ttk.Label(row, text=label, width=9, style="Dim.TLabel").pack(side="left")
+            slider = ttk.Scale(row, from_=0, to=600)
+            slider.pack(side="left", fill="x", expand=True, padx=(4, 8))
+            nbtn = None
+            if tag:
+                nbtn = ttk.Button(row, text="▶", width=3,
+                                  command=lambda t=tag: self._toggle_play_one(t))
+                nbtn.pack(side="left", padx=(0, 4))
+                Tooltip(nbtn, "Play/pause THIS video only - the other one keeps going (handy before you lock the sync).")
+                self._ctrls.append(nbtn)
+            lbl = ttk.Label(row, text="00:00 / --:--", width=14, anchor="e")
+            lbl.pack(side="right")
+            self._ctrls.append(slider)
+            Tooltip(slider, tip)
+            return slider, lbl, nbtn
+
+        self.seek_a, self.lbl_a, self.btn_play_a = make_tl(tl, "Movie:", "Drag to seek the movie ONLY. This is how you align it to the reaction.", "A")
+        self.seek_b, self.lbl_b, self.btn_play_b = make_tl(tl, "Reaction:", "Drag to seek the reaction ONLY. This is how you align it to the movie.", "B")
+        # Master row: label + Sync-Lock toggle, then the master bar
+        mrow = ttk.Frame(tl)
+        mrow.pack(fill="x", pady=2)
+        mlab = ttk.Frame(mrow)
+        mlab.pack(side="left")
+        ttk.Label(mlab, text="Master:", width=9, style="Dim.TLabel").pack(side="left")
+        self.btn_lock = ttk.Button(mlab, text="🔒 Lock sync", width=11,
+                                    command=self._toggle_lock)
+        self.btn_lock.pack(side="left", padx=(2, 0))
+        Tooltip(self.btn_lock, "Lock the alignment: per-video bars switch off, the Master bar drives BOTH videos, and drift correction gets stricter.")
+        self._ctrls.append(self.btn_lock)
+        self.btn_play_m = ttk.Button(mrow, text="▶", width=3,
+                                     command=self._toggle_pause_m)
+        self.btn_play_m.pack(side="left", padx=(4, 0))
+        Tooltip(self.btn_play_m, "Play or pause BOTH videos together (master play button).")
+        self._ctrls.append(self.btn_play_m)
+        self.seek_m = ttk.Scale(mrow, from_=0, to=600)
+        self.seek_m.pack(side="left", fill="x", expand=True, padx=(4, 8))
+        self.lbl_m = ttk.Label(mrow, text="00:00 / --:--", width=14, anchor="e")
+        self.lbl_m.pack(side="right")
+        self._ctrls.append(self.seek_m)
+        Tooltip(self.seek_m, "Locked out until you engage Lock Sync \u2014 then this bar drives BOTH videos together, keeping their alignment.")
+        self.seek_m.state(["disabled"])   # invisible to input until Sync Lock
+
+        self.seek_a.config(command=self._on_seek_a_drag)
+        self.seek_b.config(command=self._on_seek_b_drag)
+        self.seek_m.config(command=self._on_seek_m_drag)
+
+        self.seek_a.bind("<Button-1>", lambda e: self._handle_click(e, self.seek_a, "dragging_seek_a", "_seek_a_val", self._on_seek_a_release))
+        self.seek_b.bind("<Button-1>", lambda e: self._handle_click(e, self.seek_b, "dragging_seek_b", "_seek_b_val", self._on_seek_b_release))
+        self.seek_m.bind("<Button-1>", lambda e: self._handle_click(e, self.seek_m, "dragging_seek_m", "_seek_m_val", self._on_seek_m_release))
+        # Releases over the WIDGET (a release over an mpv video window would
+        # otherwise leave the dragging_* flags stuck and freeze that bar).
+        self._bind_release(self.seek_a, "dragging_seek_a", self._on_seek_a_release)
+        self._bind_release(self.seek_b, "dragging_seek_b", self._on_seek_b_release)
+        self._bind_release(self.seek_m, "dragging_seek_m", self._on_seek_m_release)
+
+        # ---- tracks (audio + subtitle pickers per video) -------------------
+        tr = ttk.Frame(body)
+        tr.pack(fill="x", pady=(0, 8))
+        self.combo_audio = {}
+        self.combo_sub = {}
+        self._track_opts = {"A": [], "B": []}
+        for col, (label, tag) in enumerate((("Movie", "A"), ("Reaction", "B"))):
+            f = ttk.LabelFrame(tr, text=" %s tracks " % label, padding=6)
+            f.grid(row=0, column=col, sticky="ew", padx=(0, 8) if col == 0 else (0, 0))
+            tr.columnconfigure(col, weight=1)
+            ttk.Label(f, text="Audio:").pack(side="left")
+            ca = ttk.Combobox(f, state="readonly", width=16)
+            ca.pack(side="left", padx=(4, 10))
+            ca.bind("<<ComboboxSelected>>", lambda e, t=tag: self._on_track_sel(t, "a"))
+            Tooltip(ca, "Audio track of the %s video (from the file's audio streams)." % label)
+            self.combo_audio[tag] = ca
+            self._ctrls.append(ca)
+            ttk.Label(f, text="Subtitles:").pack(side="left")
+            cs = ttk.Combobox(f, state="readonly", width=16)
+            cs.pack(side="left", padx=(4, 0))
+            cs.bind("<<ComboboxSelected>>", lambda e, t=tag: self._on_track_sel(t, "s"))
+            Tooltip(cs, "Subtitle track of the %s video (Off disables subtitles)." % label)
+            self.combo_sub[tag] = cs
+            self._ctrls.append(cs)
+
+        # ---- volumes -------------------------------------------------------
+        vol = ttk.Frame(body)
+        vol.pack(fill="x", pady=(0, 8))
+
+        self.vol_sliders = []
+        rows = [("Movie volume", self.vol_a, 0, "A"), ("Reaction volume", self.vol_b, 1, "B")]
+        for i, (label, var, idx, tag) in enumerate(rows):
+            f = ttk.LabelFrame(vol, text=" %s " % label, padding=6)
+            f.grid(row=0, column=i, sticky="ew", padx=(0, 8))
+            vol.columnconfigure(i, weight=1)
+            s = ttk.Scale(f, from_=0, to=100, variable=var,
+                          command=lambda v, j=idx: self._on_vol_drag(j))
+            s.pack(fill="x")
+            s.bind("<ButtonRelease-1>", lambda e, j=idx: self._on_vol_release(j))
+            Tooltip(s, "Volume of this video only — the other one is untouched.")
+            self.vol_sliders.append(s)
+            self._ctrls.append(s)
+            r2 = ttk.Frame(f)
+            r2.pack(fill="x", pady=(2, 0))
+            self.vol_lbls = getattr(self, "vol_lbls", [])
+            lbl = ttk.Label(r2, text="100 %", width=8)
+            lbl.pack(side="left")
+            b = ttk.Button(r2, text="Mute", width=6,
+                           command=lambda j=idx: self._mute(j))
+            b.pack(side="right")
+            Tooltip(b, "Mute / unmute this video")
+            self._ctrls.append(b)
+            self.vol_lbls.append(lbl)
+
+        fm = ttk.LabelFrame(vol, text=" Master volume ", padding=6)
+        fm.grid(row=0, column=2, sticky="ew")
+        vol.columnconfigure(2, weight=1)
+        s2 = ttk.Scale(fm, from_=0, to=100, variable=self.vol_m,
+                       command=lambda v: self._on_master_drag())
+        s2.pack(fill="x")
+        s2.bind("<ButtonRelease-1>", lambda e: setattr(self, "dragging_master", False))
+        Tooltip(s2, "Overall volume: scales BOTH videos together.")
+        self.master_lbl = ttk.Label(fm, text="100 %", width=8)
+        self.master_lbl.pack(anchor="w", pady=(2, 0))
+        self._ctrls.append(s2)
+
+        # ---- status --------------------------------------------------------
+        self.status_lbl = ttk.Label(body, text="Ready. Pick two files (or URLs), then press ▶ Play.",
+                                    style="Dim.TLabel", wraplength=1100, justify="left")
+        self.status_lbl.pack(fill="x", pady=(2, 0))
+        self.state_lbl = ttk.Label(body, text="Shortcuts: Space ⏯ · ←/→ ±5 s seek (both videos)",
+                                   style="Dim.TLabel")
+        self.state_lbl.pack(fill="x")
+
+        self.root.bind("<space>", lambda e: self._toggle_play())
+        self.root.bind("<Left>", lambda e: None if self._pip_nudge(-5, 0) else self._jump(-5))
+        self.root.bind("<Right>", lambda e: None if self._pip_nudge(5, 0) else self._jump(5))
+        self.root.bind("<Up>", lambda e: self._pip_nudge(0, -5))
+        self.root.bind("<Down>", lambda e: self._pip_nudge(0, 5))
+        self.root.bind("<Escape>", lambda e: self._undock_pip_int() if self.pip_int else None)
+        self.root.bind("<Button-1>", self._on_global_press)
+        self.root.bind("<ButtonRelease-1>", self._on_root_release)
+
+        # Size the window to exactly fit its content, then lock it. Sizing
+        # *after* the widgets exist guarantees every control is visible; a
+        # hard-coded geometry clipped the bottom on high-DPI.
+        self.root.update_idletasks()
+        width = max(900, self.root.winfo_reqwidth())
+        height = max(640, self.root.winfo_reqheight())
+        self.root.geometry("%dx%d" % (width, height))
+        self.root.resizable(False, False)
+# ------------------------------------------------------------- actions --
+    def _browse(self, idx):
+        p = filedialog.askopenfilename(
+            title="Pick a video" if idx == 0 else "Pick the reaction video",
+            filetypes=[("Video files", "*.mp4 *.mkv *.mov *.webm *.avi *.ts *.m2ts *.flv *.wmv *.m4v"),
+                       ("All files", "*.*")])
+        if p:
+            if idx == 0:
+                self.movie_path.set(p)
+            else:
+                self.react_path.set(p)
+
+    def _url(self, idx):
+        cur = self.movie_path.get() if idx == 0 else self.react_path.get()
+        win = tk.Toplevel(self.root)
+        win.title("Paste URL")
+        win.configure(bg="#16181d")
+        win.geometry("520x120")
+        win.transient(self.root)
+        ttk.Label(win, text="YouTube / any URL (resolved via yt-dlp):").pack(pady=(12, 4))
+        e = ttk.Entry(win, width=70)
+        e.insert(0, cur if cur.startswith("http") else "")
+        e.pack(padx=12)
+        e.focus_set()
+
+        def ok():
+            v = e.get().strip()
+            if v:
+                if idx == 0:
+                    self.movie_path.set(v)
+                else:
+                    self.react_path.set(v)
+            win.destroy()
+
+        def ok_enter(event):
+            ok()
+        e.bind("<Return>", ok_enter)
+        ttk.Button(win, text="Use this URL", command=ok).pack(pady=8)
+
+    def _swap(self):
+        a, b = self.movie_path.get(), self.react_path.get()
+        self.movie_path.set(b)
+        self.react_path.set(a)
+        if self.started:
+            self._start()
+
+    def _on_drop(self, event):
+        """One or more files dropped onto the window -> fill the source slots.
+
+        tkinterdnd2 sends a space-separated list; each path is wrapped in
+        {braces} (or quotes) when it contains spaces — parse all forms.
+        """
+        try:
+            raw = event.data or ""
+            paths = []
+            i2, n = 0, len(raw)
+            while i2 < n:
+                c = raw[i2]
+                if c in " 	":
+                    i2 += 1
+                    continue
+                if c == "{":
+                    j2 = raw.find("}", i2 + 1)
+                    if j2 == -1:
+                        j2 = n
+                    paths.append(raw[i2 + 1:j2])
+                    i2 = j2 + 1
+                elif c == '"':
+                    j2 = raw.find('"', i2 + 1)
+                    if j2 == -1:
+                        j2 = n
+                    paths.append(raw[i2 + 1:j2])
+                    i2 = j2 + 1
+                else:
+                    j2 = raw.find(" ", i2)
+                    if j2 == -1:
+                        j2 = n
+                    seg2 = raw[i2:j2]
+                    if seg2:
+                        paths.append(seg2)
+                    i2 = j2 + 1
+            paths = [p.strip() for p in paths if p.strip()]
+            if not paths:
+                return
+            # fill empty slots first, in order A then B
+            loaded = 0
+            if not self.movie_path.get().strip():
+                self.movie_path.set(paths.pop(0))
+                loaded += 1
+            if not self.react_path.get().strip():
+                if paths:
+                    self.react_path.set(paths.pop(0))
+                    loaded += 1
+            both = bool(self.movie_path.get().strip() and self.react_path.get().strip())
+            self.status_lbl.config(
+                text="Loaded %d file(s)%s" % (loaded, " — press ▶ Play to start." if both else ""))
+        except Exception:
+            pass
+
+
+    def _set_running_ui(self, playing):
+        state = "normal" if playing else "disabled"
+        for w in self._ctrls:
+            try:
+                w.config(state=state)
+            except Exception:
+                pass
+        try:
+            self.btn_play.config(state="normal")   # Start always available
+        except Exception:
+            pass
+        # the master bar only ever works under Sync Lock: re-assert it
+        # after the generic enable/disable sweep above
+        if playing and not self.sync_locked:
+            self.seek_m.state(["disabled"])
+
+    def _start(self):
+        a = self.movie_path.get().strip()
+        b = self.react_path.get().strip()
+        if not a:
+            messagebox.showwarning(APP_NAME, "Pick a movie / source A first.")
+            return
+        if not b:
+            messagebox.showwarning(APP_NAME, "Pick a reaction / source B too (both videos are needed).")
+            return
+        for t in ("A", "B"):
+            p = self.players.get(t)
+            if p:
+                p.quit()
+                time.sleep(0.15)
+        self.btn_play.config(state="disabled")
+        self.status_lbl.config(text="Starting…")
+        self.root.update_idletasks()
+
+        # Decide how each source is fed to mpv.
+        ra = a
+        rb = b
+        if a.startswith("http") and not is_youtube(a):
+            ra = resolve_url(a)
+        if b.startswith("http") and not is_youtube(b):
+            rb = resolve_url(b)
+        # YouTube URLs are passed straight to mpv (--ytdl=yes).
+
+        self.players["A"] = MpvDriver(ra, "A", on_pause=self._on_player_pause,
+                                      on_exit=self._on_exit,
+                                      start_paused=True)
+        self.players["B"] = MpvDriver(rb, "B", on_pause=self._on_player_pause,
+        on_exit=self._on_exit, start_paused=True)
+        self.started = True
+        self.paused = True   # loaded PAUSED: Play/Space starts both videos
+        self.sync_off = 0.0
+        self.last_pos = {"A": None, "B": None}
+        self.last_dur = {"A": None, "B": None}
+        self._status_time = {"A": 0.0, "B": 0.0}
+        self._beacon_ts = {"A": 0.0, "B": 0.0}
+        self._seek_grace_until = 0.0
+        self._last_corr = {"A": 0.0, "B": 0.0}
+        self._set_running_ui(True)
+        self.btn_pause_all.config(state="normal", text="▶  Play")
+        self.btn_play_m.config(state="normal", text="▶")
+        self.status_lbl.config(
+            text="Loaded PAUSED. Press Play (or Space) when ready.")
+        self.root.after(1500, self._refresh_tracks)
+        self.root.after(4000, self._refresh_tracks)
+        self.root.after(2500, self._fetch_meta)
+        self._apply_volumes()
+        self._apply_speed()
+        # arrange the two mpv windows side by side once they appear
+        threading.Thread(target=self._arrange_thread, daemon=True).start()
+
+    def _arrange_thread(self):
+        """Find both mpv windows, then place them side by side (half screen each)."""
+        try:
+            wa, ha = screen_size()
+            half = wa // 2
+            gap = 4
+            titles = {"A": "SyncPlayer — Movie", "B": "SyncPlayer — Reaction"}
+            handles = {"A": None, "B": None}
+            for _ in range(160):  # up to ~40 s (URLs take a while)
+                done = True
+                for t in ("A", "B"):
+                    p = self.players.get(t)
+                    if not p or not p.running:
+                        continue
+                    if handles[t] is None:
+                        handles[t] = find_mpv_window(p.proc.pid, titles[t])
+                    if handles[t] is None:
+                        done = False
+                if done:
+                    break
+                if not self.started:
+                    return
+                time.sleep(0.25)
+            if handles["A"]:
+                place_window(handles["A"], 0, 0, half - gap, ha - 100)
+            if handles["B"]:
+                place_window(handles["B"], half + gap, 0, half - gap, ha - 100)
+            for t in ("A", "B"):
+                p = self.players.get(t)
+                if p and handles[t]:
+                    p.hwnd = handles[t]
+        except Exception:
+            pass
+
+    def _arrange_windows(self):
+        threading.Thread(target=self._arrange_thread, daemon=True).start()
+
+    def _stop(self):
+        if self.pip_int:
+            try:
+                self._undock_pip_int()
+            except Exception:
+                pass
+        for t in ("A", "B"):
+            p = self.players.get(t)
+            if p:
+                p.quit()
+        self.players = {"A": None, "B": None}
+        self.started = False
+        self.paused = True
+        self._set_running_ui(False)
+        self.btn_play.config(text="Start")
+        self.btn_play_m.config(text="▶")
+        self.btn_pause_all.config(text="▶  Play")
+        self.status_lbl.config(text="Closed. Press Start to load again.")
+        for lbl in (self.lbl_a, self.lbl_b, self.lbl_m):
+            lbl.config(text="00:00 / --:--")
+
+    # -- transport ----------------------------------------------------------
+    def _toggle_play(self):
+        # Space handler: a pure play/pause of BOTH videos. Loading is the
+        # Start button only; if nothing is loaded there is nothing to toggle.
+        if not self.started:
+            return
+        self._set_pause_all(not self.paused)
+
+    def _set_pause_all(self, pause):
+        self._pause_cmd_ts = time.monotonic()
+        self.paused = bool(pause)
+        for t in ("A", "B"):
+            p = self.players.get(t)
+            if p and p.running:
+                p.set_pause(pause)
+        self.btn_play_m.config(text="▶" if pause else "⏸")
+        self.btn_pause_all.config(text="▶  Play" if pause else "⏸  Pause")
+
+    def _on_player_pause(self, tag, packed):
+        """A pause event arrived from one player.
+
+        Click-to-pause (via the video window) mirrors to BOTH, so they never
+        fight and the sync stays locked. BUT an END-OF-FILE auto-pause (mpv
+        --keep-open pauses on the last frame) only pauses THAT video — the
+        other one must keep playing, or the movie would freeze whenever the
+        (usually shorter) reaction ends."""
+        value, ts = packed
+        p = self.players.get(tag)
+        if value == "eof":
+            if p:
+                p.at_end = True
+            return  # EOF auto-pause: do not mirror, do not unpause
+        if ts - self._pause_cmd_ts < 0.35:
+            return  # our own command's echo (mpv flaps false+true) or stale
+        if value and p and p.at_end:
+            return  # EOF auto-pause: do not mirror
+        if value != self.paused:
+            self.root.after(0, lambda: self._set_pause_all(value))
+
+    def _on_exit(self):
+        self.root.after(0, lambda: self.status_lbl.config(text="A video window was closed."))
+
+    def _seek(self, pos):
+        """Restart: both videos to `pos` with their alignment intact."""
+        if not self.started:
+            return
+        for t in ("A", "B"):
+            p = self.players.get(t)
+            if p and p.running:
+                p.seek(max(0.0, pos))
+                self._commit_seek(t, pos)
+        if pos == 0:
+            self.sync_off = 0.0          # restart resets the alignment
+            for t in ("A", "B"):         # and resumes playback from the top
+                p = self.players.get(t)
+                if p:
+                    p.at_end = False
+            self._set_pause_all(False)
+
+    def _jump(self, delta):
+        """Jump both videos by delta seconds (keeps their alignment)."""
+        if not self.started:
+            return
+        for t in ("A", "B"):
+            p = self.players.get(t)
+            if p and p.running:
+                p.seek(delta, absolute=False)
+        # local bookkeeping so bars don't jump mid-flight
+        for t in ("A", "B"):
+            if self.last_pos[t] is not None:
+                self._commit_seek(t, max(0.0, self.last_pos[t] + delta))
+
+    # -- help / tracks / master play ----------------------------------------
+    def _show_help(self):
+        help_w = getattr(self, "_help_win", None)
+        try:
+            if help_w is not None and help_w.winfo_exists():
+                help_w.deiconify()
+                help_w.lift()
+                return
+        except Exception:
+            pass
+        w = tk.Toplevel(self.root)
+        self._help_win = w
+        w.title("SyncPlayer Help")
+        w.configure(bg="#16181d")
+        w.resizable(False, False)
+        txt = (
+            "HOW SYNC WORKS" + chr(10) +
+            "1.  Start loads both videos PAUSED, each in its own window." + chr(10) +
+            "2.  Play (or Space, or the master play button) starts BOTH." + chr(10) +
+            "3.  Drag the Movie or Reaction bar until the moments line" + chr(10) +
+            "    up - that video moves on its own." + chr(10) +
+            "4.  Lock sync captures the alignment: per-video bars switch" + chr(10) +
+            "    off, the Master bar drives BOTH videos, drift is" + chr(10) +
+            "    auto-corrected (tighter while locked)." + chr(10) +
+            "" + chr(10) +
+            "TIPS" + chr(10) +
+            "- Drag a video file onto this window to fill a slot." + chr(10) +
+            "- The play button on each row plays that ONE video alone." + chr(10) +
+            "- Click a video window to pause/resume both." + chr(10) +
+            "- PiP Movie/Reaction: borderless, always-on-top, resizable." + chr(10) +
+            "- Integrated PiP: PIP MODE Movie/Reaction embeds that video" + chr(10) +
+            "  inside the other window. Drag the pane with the mouse," + chr(10) +
+            "  arrow keys nudge it, Escape or PIP MODE again returns the" + chr(10) +
+            "  video to its own window. Needs Sync Lock (both videos stay" + chr(10) +
+            "  aligned inside one window)." + chr(10) +
+            "- Tracks: choose audio and subtitles per video in the" + chr(10) +
+            "  Tracks panel (Off turns subtitles off)." + chr(10) +
+            "- Shortcuts: Space play/pause both, Left/Right seek 5 s" + chr(10) +
+            "  both, arrow keys nudge the PiP pane while dragging.")
+        lbl = tk.Label(w, text=txt, bg="#16181d", fg="#e8e8ea",
+                       justify="left", font=("Segoe UI", 10))
+        lbl.pack(padx=14, pady=(12, 6))
+        tk.Button(w, text="Close", command=w.destroy,
+                  bg="#2a2f3a", fg="#e8e8ea", relief="flat").pack(pady=(0, 12))
+
+    def _fetch_meta(self, attempt=0):
+        """While loaded-paused, mpv prints no status line and the position
+        beacon is silent (no property changes), so pull duration/position
+        over the IPC once the pipes are up: bars and labels get real ranges
+        before the first Play. Re-arms while paused and data is missing."""
+        if not self.started or not self.paused:
+            return
+        missing = False
+        for t in ("A", "B"):
+            p = self.players.get(t)
+            if not (p and p.running):
+                continue
+            if self.last_dur.get(t) is None:
+                missing = True
+
+                def _grab(drv=p, tag=t):
+                    err, dur = drv.get_property("duration", timeout=2.0)
+                    if err == "success" and dur:
+                        self.last_dur[tag] = dur
+                    err2, pos = drv.get_property("time-pos", timeout=2.0)
+                    if err2 == "success" and pos is not None:
+                        self.last_pos[tag] = pos
+                        self._status_time[tag] = time.monotonic()
+                threading.Thread(target=_grab, daemon=True).start()
+        if missing and attempt < 6:
+            self.root.after(2500,
+                            lambda a=attempt + 1: self._fetch_meta(a))
+
+    def _refresh_tracks(self):
+        for tag in ("A", "B"):
+            p = self.players.get(tag)
+            ca = self.combo_audio[tag]
+            cs = self.combo_sub[tag]
+            if not (p and p.running):
+                continue
+            tl = p.track_list()
+            audio = [t for t in tl if t.get("type") == "audio"]
+            subs = [t for t in tl if t.get("type") == "sub"]
+            aopts = []
+            amap = {}
+            for t in audio:
+                lbl = self._track_label(t)
+                aopts.append(lbl)
+                amap[lbl] = t.get("id")
+            aopts.append("Off")
+            amap["Off"] = None
+            sopts = ["Off"]
+            smap = {"Off": None}
+            for t in subs:
+                lbl = self._track_label(t)
+                sopts.append(lbl)
+                smap[lbl] = t.get("id")
+            cur_a = p.audio_id
+            cur_s = p.sub_id
+            ca["values"] = aopts
+            cs["values"] = sopts
+            ca.set(next((o for o in aopts if amap.get(o) == cur_a),
+                        aopts[0] if aopts else ""))
+            cs.set(next((o for o in sopts if smap.get(o) == cur_s), "Off"))
+            self._track_opts[tag] = {"audio": amap, "sub": smap}
+
+    @staticmethod
+    def _track_label(t):
+        bits = []
+        title = t.get("title")
+        lang = t.get("lang")
+        if title:
+            bits.append(str(title))
+        if lang:
+            bits.append("[%s]" % str(lang))
+        if not bits:
+            bits.append("Track %s" % t.get("id"))
+        if t.get("type") == "audio" and t.get("demux-channel-count"):
+            bits.append("(%s ch)" % t.get("demux-channel-count"))
+        return " ".join(bits)
+
+    def _on_track_sel(self, tag, kind):
+        p = self.players.get(tag)
+        if not (p and p.running):
+            return
+        opts = self._track_opts.get(tag) or {}
+        name = "Movie" if tag == "A" else "Reaction"
+        if kind == "a":
+            lbl = self.combo_audio[tag].get()
+            p.set_audio(opts.get("audio", {}).get(lbl))
+            self.status_lbl.config(text="Audio track set on %s." % name)
+        else:
+            lbl = self.combo_sub[tag].get()
+            p.set_sub(opts.get("sub", {}).get(lbl))
+            self.status_lbl.config(text="Subtitle track set on %s." % name)
+
+    def _toggle_pause_m(self):
+        if not self.started:
+            self._start()
+            return
+        self._set_pause_all(not self.paused)
+
+    # -- seek bars ----------------------------------------------------------
+    def _toggle_play_one(self, tag):
+        """Play/pause ONLY this video - the other one keeps playing. This
+        lets the user watch a single video before committing to the sync
+        (Lock). We stamp the command time so the SYNCPAUSE echo of OUR OWN
+        toggle is suppressed and never mirrors to the other video."""
+        p = self.players.get(tag)
+        if not (self.started and p and p.running):
+            return
+        pause = not p.paused
+        self._pause_cmd_ts = time.monotonic()
+        p.set_pause(pause)
+        name = "Movie" if tag == "A" else "Reaction"
+        self.status_lbl.config(text="%s %s - the other video is untouched. (Lock sync takes over both.)"
+                               % (name, "paused" if pause else "playing"))
+
+    def _toggle_pip(self, tag):
+        """Picture-in-picture for THIS video: border removed and always on
+        Topmost goes through mpv's OWN ontop property (cross-process
+        SetWindowPos/HWND_TOPMOST fails with ERROR_INVALID_WINDOW_HANDLE,
+        and mpv re-applies its own topmost state on window recreation).
+        The frame removal is app-side style surgery; WS_THICKFRAME is kept
+        so the edges still drag-resize, and the video area still drags to
+        move (mpv window-dragging)."""
+        p = self.players.get(tag)
+        if not (p and p.running):
+            self.status_lbl.config(text="Start playback first so the video window exists.")
+            return
+        if self.pip_int:
+            self.status_lbl.config(
+                text="Integrated PiP is active - exit PIP MODE first.")
+            return
+        u = ctypes.windll.user32
+        if not self.pip.get(tag):
+            p.cmd({"command": ["set_property", "ontop", "yes"]})
+            if p.hwnd:
+                style = (u.GetWindowLongPtrW(p.hwnd, -16) or 0) & 0xFFFFFFFF
+                if style:
+                    self._pip_saved[tag] = style
+                    new_style = (style | 0x80000000 | 0x00040000) & ~(0x00C00000 | 0x00080000 | 0x00020000 | 0x00010000)
+                    u.SetWindowLongPtrW(p.hwnd, -16, new_style if new_style < 0x80000000 else new_style - 0x100000000)
+                    u.SetWindowPos(p.hwnd, 0, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0004 | 0x0020)
+            self.pip[tag] = True
+            self.status_lbl.config(text="PiP on: this window is borderless, always on top; drag its edges to resize.")
+        else:
+            p.cmd({"command": ["set_property", "ontop", "no"]})
+            if p.hwnd and self._pip_saved.get(tag):
+                saved = self._pip_saved.get(tag) & 0xFFFFFFFF
+                u.SetWindowLongPtrW(p.hwnd, -16, saved if saved < 0x80000000 else saved - 0x100000000)
+                u.SetWindowPos(p.hwnd, 0, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0004 | 0x0020)
+            self.pip[tag] = False
+            self.status_lbl.config(text="PiP off - window back to normal.")
+
+    # -- integrated PiP -----------------------------------------------------
+    def _toggle_pip_int(self, tag):
+        """Integrated PiP: embed the `tag` video INSIDE the other mpv
+        window. The embedded window is stripped to a bare popup (no caption,
+        no thickframe), kept glued over the host by the 30 Hz poll, and can
+        be dragged with the mouse or nudged with the arrow keys. Escape or
+        toggling again undocks it. Requires Sync Lock so both videos stay
+        aligned inside the one window."""
+        p = self.players.get(tag)
+        if not (p and p.running):
+            self.status_lbl.config(text="Start playback first so the video window exists.")
+            return
+        if not self.sync_locked:
+            self.status_lbl.config(
+                text="Integrated PiP needs Sync Lock (Lock sync) first - both videos must stay aligned.")
+            return
+        if self.pip_int:
+            self._undock_pip_int()
+            return
+        u = ctypes.windll.user32
+        host_tag = "B" if tag == "A" else "A"
+        hp = self.players.get(host_tag)
+        if not (hp and hp.running and hp.hwnd and p.hwnd):
+            self.status_lbl.config(text="Video windows not ready yet.")
+            return
+        p.cmd({"command": ["set_property", "ontop", "yes"]})
+        style = (u.GetWindowLongPtrW(p.hwnd, -16) or 0) & 0xFFFFFFFF
+        if style:
+            self._pip_saved[tag] = style
+            bare = (0x80000000 | 0x00040000) & ~(0x00C00000 | 0x00080000 |
+                                                 0x00020000 | 0x00010000)
+            u.SetWindowLongPtrW(p.hwnd, -16,
+                                bare if bare < 0x80000000 else bare - 0x100000000)
+            u.SetWindowPos(p.hwnd, 0, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0004 | 0x0020)
+        self.pip_int = True
+        self._pip_int_tag = tag
+        self._pip_int_hwnd = p.hwnd
+        self._pip_update_pane(force=True)
+        self.status_lbl.config(
+            text="Integrated PiP: %s is embedded. Drag the pane, arrow keys nudge, Escape undocks." %
+                 ("Movie" if tag == "A" else "Reaction"))
+
+    def _undock_pip_int(self):
+        tag = self._pip_int_tag
+        p = self.players.get(tag) if tag else None
+        u = ctypes.windll.user32
+        if p and p.running and p.hwnd and self._pip_saved.get(tag):
+            saved = self._pip_saved.get(tag) & 0xFFFFFFFF
+            u.SetWindowLongPtrW(p.hwnd, -16,
+                                saved if saved < 0x80000000 else saved - 0x100000000)
+            u.SetWindowPos(p.hwnd, 0, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0004 | 0x0020)
+            p.cmd({"command": ["set_property", "ontop", "no"]})
+        self.pip_int = False
+        self._pip_int_tag = None
+        self._pip_int_hwnd = None
+        self._pip_int_drag = False
+        self.status_lbl.config(text="Integrated PiP off - video back in its own window.")
+
+    def _pip_update_pane(self, force=False):
+        """Keep the embedded pane glued to its slot over the host window.
+        Runs from the 30 Hz poll; during a drag the slot follows the mouse."""
+        if not (self.pip_int and self._pip_int_hwnd):
+            return
+        tag = self._pip_int_tag
+        host_tag = "B" if tag == "A" else "A"
+        host = self.players.get(host_tag)
+        pane = self.players.get(tag)
+        if not (host and host.running and host.hwnd and pane and pane.running):
+            return
+        u = ctypes.windll.user32
+        rect = ctypes.wintypes.RECT()
+        if not u.GetWindowRect(host.hwnd, ctypes.byref(rect)):
+            return
+        hw = rect.right - rect.left
+        hh = rect.bottom - rect.top
+        if hw <= 0 or hh <= 0:
+            return
+        if self._pip_int_drag:
+            # mpv is dragging the real window: record where it actually is
+            # (as host fractions) and stay out of its way.
+            pr = ctypes.wintypes.RECT()
+            if pane.hwnd and u.GetWindowRect(pane.hwnd, ctypes.byref(pr)):
+                self._pip_int_pos = [min(1.0, max(0.0, (pr.left - rect.left) / hw)),
+                                     min(1.0, max(0.0, (pr.top - rect.top) / hh))]
+            self._pip_int_hwnd = pane.hwnd   # follow any style recreation
+            return
+        fx = self._pip_int_pos[0] * hw
+        fy = self._pip_int_pos[1] * hh
+        fw = self._pip_int_size[0] * hw
+        fh = self._pip_int_size[1] * hh
+        if self._pip_move_run:
+            return
+        self._pip_move_run = True
+
+        def _place():
+            try:
+                hwnd = self._pip_int_hwnd
+                if hwnd:
+                    u.SetWindowPos(hwnd, 0, int(rect.left + fx), int(rect.top + fy),
+                                   max(60, int(fw)), max(34, int(fh)),
+                                   0x0004 | 0x0010)
+            finally:
+                self._pip_move_run = False
+        threading.Thread(target=_place, daemon=True).start()
+
+    def _pip_start_drag(self):
+        if not (self.pip_int and self._pip_int_hwnd):
+            return False
+        u = ctypes.windll.user32
+        rect = ctypes.wintypes.RECT()
+        pr = ctypes.wintypes.RECT()
+        host_tag = "B" if self._pip_int_tag == "A" else "A"
+        host = self.players.get(host_tag)
+        pane = self.players.get(self._pip_int_tag)
+        if not (host and host.hwnd and pane and pane.hwnd):
+            return False
+        if not (u.GetWindowRect(host.hwnd, ctypes.byref(rect)) and
+                u.GetWindowRect(pane.hwnd, ctypes.byref(pr))):
+            return False
+        # mpv window-dragging moves the real window; we only record the
+        # pane size (relative to the host) so the poll tracks host fractions.
+        self._pip_int_size = [(pr.right - pr.left) / max(1, rect.right - rect.left),
+                              (pr.bottom - pr.top) / max(1, rect.bottom - rect.top)]
+        self._pip_int_drag = True
+        self.status_lbl.config(
+            text="PiP pane dragging - release to drop, arrow keys nudge, Escape undocks.")
+        return True
+
+    def _pip_nudge(self, dx, dy):
+        if not self.pip_int:
+            return False
+        host_tag = "B" if self._pip_int_tag == "A" else "A"
+        host = self.players.get(host_tag)
+        if not (host and host.hwnd):
+            return False
+        u = ctypes.windll.user32
+        rect = ctypes.wintypes.RECT()
+        if not u.GetWindowRect(host.hwnd, ctypes.byref(rect)):
+            return False
+        hw = max(1, rect.right - rect.left)
+        hh = max(1, rect.bottom - rect.top)
+        self._pip_int_pos[0] = min(1.0, max(0.0, self._pip_int_pos[0] + dx / hw))
+        self._pip_int_pos[1] = min(1.0, max(0.0, self._pip_int_pos[1] + dy / hh))
+        self._pip_update_pane(force=True)
+        return True
+
+    def _pip_end_drag(self):
+        self._pip_int_drag = False
+
+    def _on_global_press(self, event):
+        # Presses on the Tk panel are ordinary UI handling; the embedded
+        # pane reports its own drags via SYNCPIPDRAG|start (mpv side).
+        pass
+
+    def _on_root_release(self, event):
+        self._pip_end_drag()
+        self._on_release(event)
+
+    def _toggle_lock(self):
+
+        """Sync Lock: freeze the current alignment, then drive both
+        videos from the Master bar alone. Per-video bars grey out and
+        drift correction tightens (0.45s -> 0.15s, cooldown 2s -> 1s)."""
+        self.sync_locked = not self.sync_locked
+        if self.sync_locked:
+            now = time.monotonic()
+            ra = self._est_pos("A", now)
+            rb = self._est_pos("B", now)
+            if ra is not None and rb is not None:
+                self.sync_off = rb - ra     # capture alignment as it is NOW
+            self.btn_lock.config(text="🔓 Unlock", style="Accent.TButton")
+            for sbar in (self.seek_a, self.seek_b):
+                sbar.state(["disabled"])
+            self.seek_m.state(["!disabled"])
+            self.btn_play_a.state(["disabled"])
+            self.btn_play_b.state(["disabled"])
+            self.status_lbl.config(
+                text="SYNC LOCKED \u2014 Master bar drives both videos. Unlock to re-align.")
+        else:
+            self.btn_lock.config(text="🔒 Lock sync", style="TButton")
+            for sbar in (self.seek_a, self.seek_b):
+                sbar.state(["!disabled"])
+            self.seek_m.state(["disabled"])
+            self.btn_play_a.state(["!disabled"])
+            self.btn_play_b.state(["!disabled"])
+            self.status_lbl.config(
+                text="Sync unlocked \u2014 Movie / Reaction bars adjust one video at a time.")
+
+    def _on_seek_a_drag(self, v):
+        # ttk.Scale fires the command callback even for PROGRAMMATIC .set()
+        # calls (verified empirically). The poll loop sets _prog_set while it
+        # updates the bars, so a dragged bar keeps its position and the flag
+        # only sticks on real user input.
+        if self._prog_set or self.sync_locked:
+            return
+        self.dragging_seek_a = True
+        self._seek_a_val = float(v)
+
+    def _on_seek_b_drag(self, v):
+        if self._prog_set or self.sync_locked:
+            return
+        self.dragging_seek_b = True
+        self._seek_b_val = float(v)
+
+    def _on_seek_m_drag(self, v):
+        if self._prog_set or not self.sync_locked:
+            return
+        self.dragging_seek_m = True
+        self._seek_m_val = float(v)
+
+    def _on_seek_a_release(self):
+        self.dragging_seek_a = False
+        if self.sync_locked:
+            return
+        if not (self.started and self.players["A"] and self.players["A"].running):
+            return
+        target = getattr(self, "_seek_a_val", None)
+        if target is None:
+            target = float(self.seek_a.get())
+        target = max(0.0, min(target, self.last_dur["A"] or target))
+        self.players["A"].seek(target)
+        # movie moved alone -> re-anchor the reaction's offset so it stays put
+        now = time.monotonic()
+        rb = self._est_pos("B", now)
+        if rb is not None:
+            self.sync_off = rb - target
+        self._commit_seek("A", target)
+        self._seek_a_val = None
+
+    def _on_seek_b_release(self):
+        self.dragging_seek_b = False
+        if self.sync_locked:
+            return
+        if not (self.started and self.players["B"] and self.players["B"].running):
+            return
+        target = getattr(self, "_seek_b_val", None)
+        if target is None:
+            target = float(self.seek_b.get())
+        target = max(0.0, min(target, self.last_dur["B"] or target))
+        self.players["B"].seek(target)
+        # reaction moved alone -> re-anchor its offset so the movie stays put
+        now = time.monotonic()
+        ra = self._est_pos("A", now)
+        if ra is not None:
+            self.sync_off = target - ra
+        self._commit_seek("B", target)
+        self._seek_b_val = None
+
+    def _on_seek_m_release(self):
+        self.dragging_seek_m = False
+        if not self.sync_locked:
+            self._seek_m_val = None
+            return
+        if not self.started:
+            return
+        target = getattr(self, "_seek_m_val", None)
+        if target is None:
+            target = float(self.seek_m.get())
+        for t, off_key in (("A", None), ("B", "B")):
+            p = self.players.get(t)
+            if not (p and p.running):
+                continue
+            pos = target
+            if off_key == "B":
+                pos = target + self.sync_off
+            p.seek(max(0.0, pos))
+            self._commit_seek(t, max(0.0, pos))
+        self._seek_m_val = None
+
+    def _handle_click(self, event, slider, drag_attr, val_attr, release_func):
+        try:
+            w = slider.winfo_width()
+            to = float(slider.cget("to"))
+            if w > 0 and to > 0:
+                pos = max(0.0, min(to, event.x / w * to))
+                slider.set(pos)
+                setattr(self, drag_attr, True)
+                setattr(self, val_attr, pos)
+                release_func()
+        except Exception:
+            pass
+
+    # -- volume -------------------------------------------------------------
+    def _apply_volumes(self):
+        """Master volume scales both; per-video sliders set their own share."""
+        m = self.vol_m.get() / 100.0
+        for t, var in (("A", self.vol_a), ("B", self.vol_b)):
+            p = self.players.get(t)
+            if p and p.running:
+                p.set_volume(max(0, min(150, var.get() * m)))
+
+    def _on_vol_drag(self, idx):
+        self.dragging_vol[idx] = True
+        var = self.vol_a if idx == 0 else self.vol_b
+        self.vol_lbls[idx].config(text="%d %%" % int(round(var.get())))
+        now = time.monotonic()
+        if now - self._vol_cmd_ts > 0.07:   # throttle the drag flood
+            self._vol_cmd_ts = now
+            self._apply_volumes()
+
+    def _on_vol_release(self, idx):
+        self.dragging_vol[idx] = False
+        var = self.vol_a if idx == 0 else self.vol_b
+        self.vol_lbls[idx].config(text="%d %%" % int(round(var.get())))
+        self._apply_volumes()
+
+    def _mute(self, idx):
+        var = self.vol_a if idx == 0 else self.vol_b
+        if var.get() > 0:
+            if idx == 0:
+                self.saved_vol_a = var.get()
+            else:
+                self.saved_vol_b = var.get()
+            var.set(0)
+        else:
+            var.set(self.saved_vol_a if idx == 0 else self.saved_vol_b)
+        self.vol_lbls[idx].config(text="%d %%" % int(round(var.get())))
+        self._apply_volumes()
+
+    def _on_master_drag(self):
+        self.dragging_master = True
+        self.master_lbl.config(text="%d %%" % int(round(self.vol_m.get())))
+        now = time.monotonic()
+        if now - self._vol_cmd_ts > 0.07:   # throttle the drag flood
+            self._vol_cmd_ts = now
+            self._apply_volumes()
+
+    # -- speed / misc -------------------------------------------------------
+    def _nudge_speed(self, d):
+        s = round(max(0.25, min(2.5, self.speed.get() + d)), 2)
+        self.speed.set(s)
+        self.speed_lbl.config(text="%.2fx" % s)
+        self._apply_speed()
+
+    def _apply_speed(self):
+        for t in ("A", "B"):
+            p = self.players.get(t)
+            if p and p.running:
+                p.set_speed(self.speed.get())
+
+    def _shot(self):
+        if not self.started:
+            return
+        os.makedirs(SHOT_DIR, exist_ok=True)
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        names = []
+        for t, lbl in (("A", "movie"), ("B", "reaction")):
+            p = self.players.get(t)
+            if p and p.running:
+                path = os.path.join(SHOT_DIR, "%s_%s_%s.png" % (stamp, lbl, t))
+                p.screenshot(path)
+                names.append(path)
+        if names:
+            self.status_lbl.config(text="Screenshots → %s" % ", ".join(names))
+        else:
+            self.status_lbl.config(text="Nothing playing — nothing to shoot.")
+
+    # -- polling ------------------------------------------------------------
+    def _on_release(self, event):
+        if self.dragging_seek_a:
+            self._on_seek_a_release()
+        if self.dragging_seek_b:
+            self._on_seek_b_release()
+        if self.dragging_seek_m:
+            self._on_seek_m_release()
+        for i in (0, 1):
+            if self.dragging_vol[i]:
+                self._on_vol_release(i)
+        if self.dragging_master:
+            self.dragging_master = False
+
+    def _set_bar(self, slider, key, pos, dur):
+        """Set a seek bar, skipping redundant range reconfigs so the 30 Hz
+        poll does not force a full widget redraw every tick."""
+        to = max(1, int(dur or 1))
+        if self._to_cache.get(key) != to:
+            slider.config(to=to)
+            self._to_cache[key] = to
+        slider.set(round(pos, 2))
+
+    def _bind_release(self, widget, drag_attr, release_func):
+        """Clear the drag flag on release over the widget itself. A release
+        outside the Tk window (e.g. over an mpv video window) would otherwise
+        leave dragging_* stuck True and freeze that bar."""
+        def _rel(_e):
+            if getattr(self, drag_attr):
+                setattr(self, drag_attr, False)
+                release_func()
+        widget.bind("<ButtonRelease-1>", _rel)
+
+    def _poll(self):
+
+        for t in ("A", "B"):
+            p = self.players.get(t)
+            if not p:
+                continue
+            while True:
+                try:
+                    kind, rec = p.q.get_nowait()
+                except queue.Empty:
+                    break
+                if kind == "pos":
+                    pos = rec
+                    dur = self.last_dur.get(t)
+                    if dur and pos > dur:
+                        pos = dur    # EOF-hold overshoot clamp
+                    self.last_pos[t] = pos
+                    self._status_time[t] = time.monotonic()
+                    self._beacon_ts[t] = time.monotonic()
+                elif kind == "status":
+                    now = time.monotonic()
+                    if now - self._beacon_ts[t] > 3.0:
+                        # beacon silent: fall back to the (stale) status position
+                        pos = rec["time_pos"]
+                        dur = self.last_dur.get(t)
+                        if pos is not None and dur and pos > dur:
+                            pos = dur
+                        self.last_pos[t] = pos
+                        self._status_time[t] = now
+                    if rec["duration"]:
+                        self.last_dur[t] = rec["duration"]
+                    if rec["eof"]:
+                        p.at_end = True      # corroboration only: SYNCEOF owns it
+                elif kind == "pause":
+                    self._on_player_pause(t, rec)
+                elif kind == "pipdrag":
+                    if rec == "start" and not self._pip_int_drag:
+                        self._pip_start_drag()
+                    elif rec == "end":
+                        self._pip_end_drag()
+                    elif rec == "undock" and self.pip_int:
+                        self._undock_pip_int()
+                elif kind == "exit":
+                    self._stop()
+        if self.started:
+            a = self.combo_audio["A"]
+            b = self.combo_audio["B"]
+            if (a and b and not a.cget("values") and not b.cget("values")):
+                self._refresh_tracks()
+        if self.pip_int:
+            try:
+                self._pip_update_pane()
+            except Exception:
+                pass
+        self._sync_tick()
+        self.root.after(33, self._poll)      # ~30 Hz: smooth bars
+
+    def _est_pos(self, tag, now):
+        """Best guess of a video's CURRENT position, on a common time base.
+
+        mpv statuses arrive ~1x/s and the two streams are NOT phase-locked.
+        Comparing two raw samples directly shows phantom drift up to ~1 s
+        (sample skew), which made the correction loop yank videos around.
+        We timestamp every sample and extrapolate each to 'now' with the
+        playback speed, so both are compared at the same instant.
+        """
+        pos = self.last_pos.get(tag)
+        if pos is None:
+            return None
+        dt = now - self._status_time.get(tag, now)
+        if dt < 0 or dt > 5.0:      # stale/no sample: trust the raw value
+            return pos
+        p = self.players.get(tag)
+        if self.paused or (p and p.at_end) or not (p and p.running):
+            return pos              # frozen: no extrapolation
+        est = pos + dt * self.speed.get()
+        dur = self.last_dur.get(tag)
+        return min(est, dur) if dur else est
+
+    def _commit_seek(self, tag, pos):
+        """After SENDING a seek, make the panel's bookkeeping agree at once,
+        so the drift loop never reasons about a stale pre-seek position."""
+        self.last_pos[tag] = max(0.0, pos)
+        self._status_time[tag] = time.monotonic()
+        self._seek_grace_until = time.monotonic() + 1.2  # let mpv land & report
+
+    def _sync_tick(self):
+        """Master-clock work: correct drift, then refresh bars/status."""
+        if not self.started:
+            return
+        now = time.monotonic()
+        ra = self._est_pos("A", now)
+        rb = self._est_pos("B", now)
+        pa, pb = self.players["A"], self.players["B"]
+        playing = not (self.paused or pa.paused or pb.paused)
+        # gentle drift correction: pull the reaction back to its aligned spot.
+        # Suppressed right after a manual seek (grace) and rate-limited so a
+        # correction can land and be observed before the next one.
+        cooldown = 1.0 if self.sync_locked else 2.0
+        thr = 0.15 if self.sync_locked else 0.45
+        b_dur = self.last_dur.get("B")
+        react_at_end = pb.at_end or (b_dur and rb is not None and rb >= b_dur - 0.5)
+        if (pa and pb and pa.running and pb.running and playing
+                and now - pb.last_seek_ts > 1.2     # grace for ANY seek path
+                and now >= self._seek_grace_until
+                and now - self._last_corr["B"] > cooldown
+                and not (self.dragging_seek_a or self.dragging_seek_b
+                         or self.dragging_seek_m)):
+            target = reaction_target(ra, self.sync_off)
+            if needs_correction(rb, ra, self.sync_off, threshold=thr,
+                                playing=True, dragging=False,
+                                movie_at_end=pa.at_end,
+                                react_at_end=react_at_end):
+                if b_dur and target is not None and target > b_dur - 0.05:
+                    # the aligned spot is past the reaction's own end: it
+                    # cannot be there. Parking at its end IS aligned.
+                    self._last_corr["B"] = now
+                else:
+                    pb.seek(target)
+                    self._commit_seek("B", target)
+                    self._last_corr["B"] = now
+
+        # ---- bars (skip whichever one the user is dragging) ----------------
+        # NOTE: ttk.Scale.set() synchronously fires the command callback, which
+        # sets dragging_seek_* — so every programmatic update is wrapped in the
+        # _prog_set guard, or the bars would freeze on the first poll tick.
+        m_dur = max(self.last_dur["A"] or 0, self.last_dur["B"] or 0)
+        self._prog_set = True
+        try:
+            if not self.dragging_seek_a and ra is not None:
+                self._set_bar(self.seek_a, "A", ra, self.last_dur["A"] or m_dur)
+            if not self.dragging_seek_b and rb is not None:
+                self._set_bar(self.seek_b, "B", rb, self.last_dur["B"] or m_dur)
+            # Master bar is a frozen placeholder until Sync Lock is engaged
+            if self.sync_locked and not self.dragging_seek_m:
+                mpos = ra if ra is not None else rb
+                if mpos is not None:
+                    self._set_bar(self.seek_m, "M", mpos, m_dur)
+        except tk.TclError:
+            pass
+        finally:
+            self._prog_set = False
+
+        # ---- labels (re-render only when the text changed) ------------------
+        ma = self._fmt(ra, self.last_dur["A"])
+        rb_fmt = self._fmt(rb, self.last_dur["B"])
+        mm = self._fmt(ra if ra is not None else rb, self.last_dur["A"] or self.last_dur["B"])
+        if self._lbl_cache.get("A") != ma:
+            self.lbl_a.config(text=ma)
+            self._lbl_cache["A"] = ma
+        if self._lbl_cache.get("B") != rb_fmt:
+            self.lbl_b.config(text=rb_fmt)
+            self._lbl_cache["B"] = rb_fmt
+        if self._lbl_cache.get("M") != mm:
+            self.lbl_m.config(text=mm)
+            self._lbl_cache["M"] = mm
+        for tag, btn in (("A", self.btn_play_a), ("B", self.btn_play_b)):
+            p = self.players.get(tag)
+            want = "⏸" if (p and p.running and not p.paused) else "▶"
+            if btn.cget("text") != want:
+                btn.config(text=want)
+
+        d = drift(rb, ra, self.sync_off) if (ra is not None and rb is not None) else 0.0
+        d_txt = "Δ %+.1fs" % d if abs(d) >= 0.05 else "Δ 0.0s"
+        lock_txt = " · SYNC LOCKED" if self.sync_locked else ""
+        if ra is not None:
+            txt = "Movie %s  ·  Reaction %s  ·  %s%s" % (ma, rb_fmt, d_txt, lock_txt)
+            if self._lbl_status_cache != txt:
+                self.status_lbl.config(text=txt)
+                self._lbl_status_cache = txt
+
+    @staticmethod
+    def _fmt(pos, dur):
+        if pos is None:
+            return "--:--"
+        s = "%02d:%02d" % (int(pos // 60), int(pos % 60))
+        if dur:
+            s += " / %02d:%02d" % (int(dur // 60), int(dur % 60))
+        return s
+
+    # -- config -------------------------------------------------------------
+    def _load_config(self):
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                c = json.load(f)
+            self.movie_path.set(c.get("movie", ""))
+            self.react_path.set(c.get("reaction", ""))
+            self.vol_a.set(float(c.get("vol_a", 100.0)))
+            self.vol_b.set(float(c.get("vol_b", 100.0)))
+            self.vol_m.set(float(c.get("vol_m", 100.0)))
+            self.speed.set(float(c.get("speed", 1.0)))
+        except Exception:
+            pass
+
+    def _save_config(self):
+        try:
+            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump({
+                    "movie": self.movie_path.get(),
+                    "reaction": self.react_path.get(),
+                    "vol_a": self.vol_a.get(),
+                    "vol_b": self.vol_b.get(),
+                    "vol_m": self.vol_m.get(),
+                    "speed": self.speed.get(),
+                }, f, indent=2)
+        except Exception:
+            pass
+
+    def _apply_startup_cli(self):
+        args = [a for a in sys.argv[1:] if not a.startswith("-")]
+        if len(args) == 2:
+            self.movie_path.set(args[0])
+            self.react_path.set(args[1])
+            self.root.after(300, self._start)
+
+    def _on_close(self):
+        try:
+            if self.pip_int:
+                self._undock_pip_int()
+        except Exception:
+            pass
+        self._save_config()
+        for t in ("A", "B"):
+            p = self.players.get(t)
+            if p:
+                p.quit()
+        self.root.destroy()
+
+
+def main():
+    try:  # keep the GUI sharp on HiDPI
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        pass
+    if _HAS_DND:
+        root = TkinterDnD.Tk()
+    else:
+        root = tk.Tk()
+    app = SyncApp(root)
+    if _HAS_DND:
+        root.drop_target_register(DND_FILES)
+        root.dnd_bind("<<Drop>>", app._on_drop)
+    if "--smoke" in sys.argv:  # packaged-exe sanity test: auto-close (cleanly)
+        root.after(6000, app._on_close)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        try:
+            with open(os.path.join(SHOT_DIR, "syncplayer_crash.txt"), "w") as f:
+                traceback.print_exc(file=f)
+        except Exception:
+            pass

@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# App runtime state (machine-local)
+syncplayer_config.json
+screenshots/
+
+# Backups / scratch
+*.bak
+*.bak2
+*.log
+_out*.txt
