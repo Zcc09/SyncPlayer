@@ -106,6 +106,45 @@ end)
 mp.register_script_message("pip-undock", function()
     print("SYNCPIPDRAG|undock")
 end)
+-- click-to-pause with double-click discrimination: a left click arms a
+-- deferred pause (450 ms); a double-click (MBTN_LEFT_DBL, handled below)
+-- cancels it, so double-clicking a video fullscreens it WITHOUT pausing
+-- and the two videos never desync (the old MBTN_LEFT cycle pause fired
+-- on the first press of a double-click and left one video paused).
+local sp_click_t = nil
+local sp_click_fs = false
+-- nameless bindings: input.conf owns the keys via `script-binding`
+mp.add_key_binding("", "syncplayer-click", function()
+    if sp_click_t then sp_click_t:kill() end
+    sp_click_fs = mp.get_property_bool("fullscreen")
+    sp_click_t = mp.add_timeout(0.45, function()
+        sp_click_t = nil
+        -- double-click safety net: if fullscreen changed since the press
+        -- (the DBL handler / property observer may lag under load), this
+        -- was a double-click -> do NOT pause
+        if mp.get_property_bool("fullscreen") ~= sp_click_fs then
+            return
+        end
+        mp.command("cycle pause")
+    end)
+end)
+-- Double-click handler (dispatched by input.conf via `script-binding`, so
+-- it owns the input EVENT - the fullscreen property apply can take ~0.5 s
+-- on high-DPI displays, which would race any property-based cancel): it
+-- cancels the pending deferred pause and cycles fullscreen.
+mp.add_key_binding("", "syncplayer-dbl", function()
+    if sp_click_t then sp_click_t:kill() end
+    sp_click_t = nil
+    mp.command("cycle fullscreen")
+end)
+-- belt and suspenders: if fullscreen changes through ANY other path,
+-- cancel the pending click-pause too
+mp.observe_property("fullscreen", "bool", function(name, v)
+    if v ~= nil and sp_click_t then
+        sp_click_t:kill()
+        sp_click_t = nil
+    end
+end)
 """
 
 # App icon (256x256 PNG, base64) — used for the window/taskbar icon.
@@ -443,11 +482,20 @@ class MpvDriver:
         # Windows named pipe for JSON IPC (open() works directly on \\\\.\\pipe\\...)
         pipe_name = "syncplayer-%d-%d-%s" % (os.getpid(), threading.get_ident(), tag)
 
-        # custom input map to allow clicking the video to pause
+        # custom input map: SPACE pauses; the mouse keys dispatch the Lua
+        # beacon's named bindings (input.conf is the TOP of mpv's binding
+        # chain - it wins over the built-in defaults AND Lua key bindings,
+        # so the double-click handling is fully deterministic here):
+        #   MBTN_LEFT       -> syncplayer-click: arm a 450 ms deferred pause
+        #   MBTN_LEFT_DBL   -> syncplayer-dbl: cancel the deferred pause and
+        #                      cycle fullscreen (fires on the INPUT EVENT,
+        #                      not on the slow high-DPI property apply)
         self.input_conf = os.path.join(SHOT_DIR, "input.conf")
         try:
             with open(self.input_conf, "w") as f:
-                f.write("MBTN_LEFT cycle pause\nSPACE cycle pause\n")
+                f.write("SPACE cycle pause\n")
+                f.write("MBTN_LEFT script-binding syncplayer-click\n")
+                f.write("MBTN_LEFT_DBL script-binding syncplayer-dbl\n")
         except Exception:
             pass
 
@@ -473,6 +521,8 @@ class MpvDriver:
                 + STATUS_APPEND,
                 "--osc=no",
                 "--keep-open=yes",
+                "--keepaspect=yes",
+                "--keepaspect-window=no",   # free-form window resize (no aspect snap)
                 "--hwdec=auto",
                 "--fs=no",
                 "--ytdl=yes",
@@ -893,6 +943,7 @@ class SyncApp:
         self._pip_int_hwnd = None     # the embedded mpv window handle
         self._pip_int_host = None     # tag of the HOST window (the main feed)
         self._pip_rect_saved = {"A": None, "B": None}  # pre-embed geometry
+        self._pip_crop_saved = {"A": None, "B": None}  # pre-crop window rects
         self._srcs = {"A": None, "B": None}   # resolved sources per player
         self._crop_cache = {}      # source path -> (w, h, x, y) or None
         self._crop_busy = set()    # sources with a detection run in flight
@@ -1196,6 +1247,17 @@ class SyncApp:
             Tooltip(b, tip)
             self._pip_xy_btns.append(b)
             self._ctrls.append(b)
+        # PiP size: scale the embedded pane bigger/smaller
+        ttk.Label(pip_pos, text="PiP size:", style="Dim.TLabel").pack(side="left", padx=(10, 0))
+        self._pip_sz_btns = []
+        for txt, d, tip in (("\u2212", -1, "Make the embedded PiP pane SMALLER"),
+                            ("+", 1, "Make the embedded PiP pane BIGGER")):
+            b = ttk.Button(pip_pos, text=txt, width=3,
+                           command=lambda d=d: self._pip_resize(d))
+            b.pack(side="left", padx=(1, 0))
+            Tooltip(b, tip)
+            self._pip_sz_btns.append(b)
+            self._ctrls.append(b)
 
         # ---- volumes -------------------------------------------------------
         vol = ttk.Frame(body)
@@ -1254,6 +1316,10 @@ class SyncApp:
         self.root.bind("<bracketleft>", lambda e: self._step_frame(self._last_active, back=True))
         self.root.bind("<bracketright>", lambda e: self._step_frame(self._last_active, back=False))
         self.root.bind("<Escape>", lambda e: self._undock_pip_int() if self.pip_int else None)
+        self.root.bind("<plus>", lambda e: None if self._pip_resize(1) else None)
+        self.root.bind("<minus>", lambda e: None if self._pip_resize(-1) else None)
+        self.root.bind("<KP_Add>", lambda e: None if self._pip_resize(1) else None)
+        self.root.bind("<KP_Subtract>", lambda e: None if self._pip_resize(-1) else None)
         self.root.bind("<Button-1>", self._on_global_press)
         self.root.bind("<ButtonRelease-1>", self._on_root_release)
 
@@ -1618,6 +1684,12 @@ class SyncApp:
             "  arrow keys nudge it, Escape or PIP MODE again returns the" + chr(10) +
             "  video to its own window. Needs Sync Lock (both videos stay" + chr(10) +
             "  aligned inside one window)." + chr(10) +
+            "- Double-click a video window to fullscreen it - both videos" + chr(10) +
+            "  keep playing (one click = pause/resume both)." + chr(10) +
+            "- PiP size: - / + buttons (or - / + keys) make the embedded" + chr(10) +
+            "  pane bigger or smaller." + chr(10) +
+            "- Windows can be resized freely (no aspect lock) - shape a" + chr(10) +
+            "  window to the movie's aspect ratio and the black bars go away." + chr(10) +
             "- Tracks: choose audio and subtitles per video in the" + chr(10) +
             "  Tracks panel (Off turns subtitles off)." + chr(10) +
             "- Shortcuts: Space play/pause both, Left/Right seek 5 s" + chr(10) +
@@ -1882,6 +1954,25 @@ class SyncApp:
                            "%dx%d+%d+%d" % (w, h, x, y)]})
         if self.pip_int and self._pip_int_tag == tag:
             self._set_pip_asp(asp)
+        elif self.pip.get(tag) and asp and p.hwnd:
+            # keepaspect-window=no: mpv no longer refits the window to the
+            # cropped aspect - do it here (remember the pre-crop rect first)
+            if not self._pip_crop_saved.get(tag):
+                self._pip_crop_saved[tag] = self._win_rect(p.hwnd)
+            self._fit_pip_window(tag, asp)
+
+    def _fit_pip_window(self, tag, asp):
+        """keepaspect-window=no: mpv no longer snaps the window to the
+        video's (cropped) aspect - the app refits it: keep width, set height."""
+        p = self.players.get(tag)
+        if not (p and p.running and p.hwnd) or not asp:
+            return
+        r = self._win_rect(p.hwnd)
+        if not r or r[2] <= 0:
+            return
+        h = max(34, int(r[2] / asp))
+        ctypes.windll.user32.SetWindowPos(p.hwnd, 0, r[0], r[1], r[2], h,
+                                          0x0004 | 0x0010)
 
     def _pip_crop_on(self, tag):
         """PiP engage hook: crop baked-in bars off this player (the
@@ -1901,6 +1992,14 @@ class SyncApp:
         p = self.players.get(tag)
         if p and p.running:
             p.cmd({"command": ["set_property", "video-crop", ""]})
+        saved = self._pip_crop_saved.get(tag)
+        if (saved and p and p.running and p.hwnd and self.pip.get(tag)
+                and not self.pip_int):
+            u = ctypes.windll.user32
+            u.SetWindowPos(p.hwnd, 0, saved[0], saved[1],
+                           max(60, saved[2]), max(34, saved[3]),
+                           0x0004 | 0x0010)
+            self._pip_crop_saved[tag] = None
         self._pip_int_asp = None
 
     def _set_pip_asp(self, asp):
@@ -1959,8 +2058,8 @@ class SyncApp:
                 saved = self._pip_saved.get(tag) & 0xFFFFFFFF
                 u.SetWindowLongPtrW(p.hwnd, -16, saved if saved < 0x80000000 else saved - 0x100000000)
                 u.SetWindowPos(p.hwnd, 0, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0004 | 0x0020)
-            self.pip[tag] = False
             self._pip_crop_off(tag)
+            self.pip[tag] = False
             self.status_lbl.config(text="PiP off - window back to normal.")
 
     # -- integrated PiP (true video-in-video overlay) -------------------------
@@ -2111,6 +2210,21 @@ class SyncApp:
             finally:
                 self._pip_move_run = False
         threading.Thread(target=_place, daemon=True).start()
+
+    def _pip_resize(self, direction):
+        """PiP size buttons (+/- keys): grow/shrink the embedded pane
+        (12% per press, clamped to 8%..95% of the host feed), keeping it
+        inside the host."""
+        if not self.pip_int:
+            return False
+        f = 1.12 if direction > 0 else (1.0 / 1.12)
+        s = self._pip_int_size
+        s[0] = min(0.95, max(0.08, s[0] * f))
+        s[1] = min(0.95, max(0.08, s[1] * f))
+        self._pip_int_pos[0] = min(1.0 - s[0], max(0.0, self._pip_int_pos[0]))
+        self._pip_int_pos[1] = min(1.0 - s[1], max(0.0, self._pip_int_pos[1]))
+        self._pip_update_pane(force=True)
+        return True
 
     def _pip_move(self, dx, dy):
         """Panel X/Y arrows: nudge the pane 4% of the host feed per press."""
@@ -2447,8 +2561,12 @@ class SyncApp:
                         self._status_time[t] = now
                     if rec["duration"]:
                         self.last_dur[t] = rec["duration"]
-                    if rec["eof"]:
-                        p.at_end = True      # corroboration only: SYNCEOF owns it
+                    # The status line's eof field is mpv's own eof-reached
+                    # (~1 Hz). Make it authoritative BOTH ways: a stale
+                    # "yes" must not latch at_end after a restart, or a real
+                    # click-pause would be misread as an EOF pause and never
+                    # mirror to the other video. SYNCEOF still corroborates.
+                    p.at_end = bool(rec["eof"])
                 elif kind == "pause":
                     self._on_player_pause(t, rec)
                 elif kind == "pipdrag":

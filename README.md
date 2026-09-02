@@ -84,9 +84,20 @@ together for the whole runtime.**
   borderless window nor the embedded pane shows bars. Cleared on exit.
   Bar-free sources are untouched; an out-of-date crop (e.g. the file was
   swapped for a smaller one) is refused and re-detected.
+- **↕ PiP size (− / + buttons or − / + keys)**: the integrated PiP pane
+  grows/shrinks 12 % per press (clamped 8–95 % of the host window) so a
+  reaction cam can be made big or small without leaving the panel.
+- **🖼 Free-form window resize**: the video windows no longer snap to the
+  video's aspect ratio (`keepaspect-window=no`) — drag any edge to give
+  the window exactly the shape you want, e.g. a 2.35:1 window for a
+  widescreen movie, with **no black bars**. The app re-fits the window
+  itself when the black-bar crop turns on/off.
 - **🎵 Tracks**: per-video pickers for **audio** and **subtitles**, built
   from the file's own streams (language + title shown; Off disables).
-- **Click-to-pause mirrors to both** windows, so they never fight each other.
+- **Click-to-pause mirrors to both** windows, so they never fight each
+  other; **double-clicking a video fullscreens it and never pauses** (the
+  deferred single-click pause is cancelled by the double-click), so both
+  videos stay in lock-step while the clicked one goes fullscreen.
 - **Lengths**: each video ends at its own end and freezes on its last frame
   (`--keep-open`); restart to re-run in sync.
 - **Config** lives in `%APPDATA%\SyncPlayer\`, screenshots in
@@ -105,11 +116,12 @@ together for the whole runtime.**
 ```
 syncplayer.py        # the whole app (panel + two mpv drivers + sync loop)
 selftest.py          # 41-check headless verification (python selftest.py)
-gui_test.py          # 153-check END-TO-END test: drives the real GUI + real
+gui_test.py          # 165-check END-TO-END test: drives the real GUI + real
                      # mpv processes (python gui_test.py) — bars track, per-
                      # video seeks, drift correction, volume read-back from
                      # mpv, speed, pause, Sync Lock, PiP, frame-step, tracks,
-                     # PiP black-bar crop & guard
+                     # PiP black-bar crop & guard, double-click fullscreen,
+                     # PiP size, free-form window resize
 make_testclips.sh    # regenerates the demo clips (needs ffmpeg)
 make_icon.py         # regenerates icon.png / icon.ico
 dist/SyncPlayer.exe  # PyInstaller onefile build

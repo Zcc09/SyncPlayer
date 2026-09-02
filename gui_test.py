@@ -689,6 +689,140 @@ pump(0.8)
 app._toggle_lock()
 check("crop: lock released after crop PiP tests", not app.sync_locked)
 
+# ------------ 11x. X-series: dbl-click desync, PiP size, free-form resize --
+# state at entry: A/B are at EOF (12 s clips, long suite) and the app has
+# paused both - restart to a genuinely PLAYING state so the click checks
+# measure the user flow, not the EOF pause.
+for _tag in ("A", "B"):
+    _p = app.players.get(_tag)
+    if _p and _p.running and _p.paused:
+        _p.cmd({"command": ["set_property", "pause", "no"]})
+app._seek(0)
+ok = wait_until(lambda: app.last_pos["A"] is not None
+                and app.last_pos["A"] < 1.5
+                and app.last_pos["B"] is not None
+                and app.last_pos["B"] < 1.5, 6)
+_e1, _ra = app.players["A"].get_property("time-pos", timeout=2.0)
+_e2, _rb = app.players["B"].get_property("time-pos", timeout=2.0)
+_e3, _ea = app.players["A"].get_property("eof-reached", timeout=2.0)
+_e4, _eb = app.players["B"].get_property("eof-reached", timeout=2.0)
+check("x: restart to a playing state", ok,
+      "A=%s B=%s paused=%s realA=%r realB=%r eofA=%r eofB=%r"
+      % (app.last_pos["A"], app.last_pos["B"], app.paused,
+         _ra, _rb, _ea, _eb))
+pump(0.5)
+
+xu = ctypes.windll.user32
+xw = ctypes.wintypes
+_xr = xw.RECT()
+
+
+def _paused(tag):
+    e, v = app.players[tag].get_property("pause", timeout=3.0)
+    return v
+
+
+def _plain_click(hwnd):
+    """One press/release pair at the centre of the mpv window."""
+    xu.GetClientRect(hwnd, ctypes.byref(_xr))
+    cx, cy = (_xr.right - _xr.left) // 2, (_xr.bottom - _xr.top) // 2
+    lp = (cy << 16) | (cx & 0xFFFF)
+    xu.PostMessageW(hwnd, 0x0201, 0x0001, lp)   # WM_LBUTTONDOWN
+    xu.PostMessageW(hwnd, 0x0202, 0, lp)        # WM_LBUTTONUP
+
+
+def _dbl_click(hwnd):
+    # mpv's win32 backend ignores WM_LBUTTONDBLCLK; two plain press pairs
+    # within ~0.3 s are what mpv input.c converts to MBTN_LEFT_DBL.
+    _plain_click(hwnd)
+    time.sleep(0.12)
+    _plain_click(hwnd)
+
+
+hwnd_a = app.players["A"].hwnd
+
+# free-form resize: keepaspect-window=no, window keeps a manual rect
+e, kaw = app.players["A"].get_property("keepaspect-window", timeout=3.0)
+check("x: keepaspect-window=no at spawn", e == "success" and kaw in (False, 0, "no"),
+      "kaw=%r" % (kaw,))
+xu.GetWindowRect(hwnd_a, ctypes.byref(_xr))
+w0, h0 = _xr.right - _xr.left, _xr.bottom - _xr.top
+xu.SetWindowPos(hwnd_a, 0, _xr.left, _xr.top, 400, 460, 0x0004 | 0x0010)
+pump(0.8)
+xu.GetWindowRect(hwnd_a, ctypes.byref(_xr))
+w1, h1 = _xr.right - _xr.left, _xr.bottom - _xr.top
+check("x: free-form resize sticks (400x460, no aspect snap)",
+      abs(w1 - 400) <= 3 and abs(h1 - 460) <= 3, "got %dx%d" % (w1, h1))
+xu.SetWindowPos(hwnd_a, 0, _xr.left, _xr.top, w0, h0, 0x0004 | 0x0010)
+pump(0.4)
+
+# double-click: fullscreen fires, pause NOT toggled (the desync fix)
+e, fs0 = app.players["A"].get_property("fullscreen", timeout=3.0)
+_dbl_click(hwnd_a)
+pump(1.0)
+e, fs1 = app.players["A"].get_property("fullscreen", timeout=3.0)
+check("x: double-click fullscreens", e == "success" and fs1 != fs0,
+      "fs %r -> %r" % (fs0, fs1))
+check("x: double-click does NOT toggle pause (no desync)",
+      _paused("A") is False and _paused("B") is False,
+      "A=%r B=%r" % (_paused("A"), _paused("B")))
+_dbl_click(hwnd_a)
+pump(1.0)
+e, fs2 = app.players["A"].get_property("fullscreen", timeout=3.0)
+check("x: double-click again exits fullscreen", e == "success" and fs2 == fs0,
+      "fs=%r" % (fs2,))
+
+# single click still pauses (the deferred timer fires)
+_plain_click(hwnd_a)
+pump(1.0)
+_pa, _pb = _paused("A"), _paused("B")
+_diag = ("A=%r B=%r at_endA=%r at_endB=%r"
+         % (_pa, _pb, app.players["A"].at_end, app.players["B"].at_end))
+check("x: single click pauses both (mirror)", _pa is True and _pb is True, _diag)
+app.players["A"].cmd({"command": ["set_property", "pause", "no"]})
+app.players["B"].cmd({"command": ["set_property", "pause", "no"]})
+pump(0.6)
+
+# PiP size: + / - buttons scale the embedded pane (needs Sync Lock)
+app._toggle_lock()
+pump(0.3)
+app._toggle_pip_int("A")
+pump(1.0)
+hwnd_p = app._pip_int_hwnd
+check("x: pip size - pane ready", bool(hwnd_p))
+
+
+def _pane_rect():
+    r = xw.RECT()
+    xu.GetWindowRect(hwnd_p, ctypes.byref(r))
+    return r.right - r.left, r.bottom - r.top
+
+
+pw0, ph0 = _pane_rect()
+app._pip_sz_btns[1].invoke()   # + : bigger
+pump(0.5)
+pw1, ph1 = _pane_rect()
+check("x: pip size + grows the pane (%dx%d -> %dx%d)" % (pw0, ph0, pw1, ph1),
+      pw1 > pw0 + 10 and ph1 > ph0 + 10)
+app._pip_sz_btns[0].invoke()   # - : smaller
+pump(0.5)
+pw2, ph2 = _pane_rect()
+check("x: pip size - shrinks the pane (%dx%d -> %dx%d)" % (pw1, ph1, pw2, ph2),
+      pw2 < pw1 - 10 and ph2 < ph1 - 10)
+for _ in range(40):
+    app._pip_resize(1)
+pump(0.5)
+pw3, ph3 = _pane_rect()
+hr = xw.RECT()
+xu.GetWindowRect(app.players["B"].hwnd, ctypes.byref(hr))
+hw, hh = hr.right - hr.left, hr.bottom - hr.top
+check("x: pip size clamps at 95%% of host (%.2f, %.2f)" % (pw3 / hw, ph3 / hh),
+      hw > 0 and hh > 0 and pw3 <= hw * 0.96 and ph3 <= hh * 0.96)
+app._toggle_pip_int("A")
+pump(0.5)
+app._toggle_lock()
+check("x: pip size - lock released after tests", not app.sync_locked)
+
 # ------------------------------------------------------ 12. screenshots --
 before = set(os.listdir(sp.SHOT_DIR)) if os.path.isdir(sp.SHOT_DIR) else set()
 app._shot()
