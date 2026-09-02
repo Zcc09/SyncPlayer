@@ -33,6 +33,7 @@ import io
 import json
 import os
 import queue
+import re
 import shutil
 import subprocess
 import sys
@@ -175,6 +176,44 @@ def find_mpv():
             return c
     _mpv_cache = "mpv"
     return _mpv_cache
+
+
+def detect_crop_rect(src, duration=None, timeout=30):
+    """One-shot black-bar detection for a LOCAL file with headless mpv
+    (no audio, no video window). Runs libavfilter's cropdetect over ~2.5 s
+    sampled a little into the file and parses the detected crop rect from
+    the verbose log. Returns (w, h, x, y) in source pixels, or None when no
+    bars are detected / the probe fails (URLs included - never applied)."""
+    if not src or src.startswith(("http://", "https://")) or not os.path.isfile(src):
+        return None
+    start = 1.0
+    if duration and duration > 8:
+        start = min(2.0, duration * 0.2)
+    try:
+        proc = subprocess.run(
+            [find_mpv(), "--no-config", "--input-terminal=no",
+             "--vo=null", "--no-audio", "--keep-open=no",
+             "--frames=75", "--start=%.2f" % start, "-v",
+             "--vf=lavfi-cropdetect=24:2:0", src],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, errors="replace", timeout=timeout,
+            creationflags=subprocess.CREATE_NO_WINDOW)
+        out = proc.stdout or ""
+    except Exception:
+        return None
+    rect = None
+    for m in re.finditer(r"crop=([0-9]+):([0-9]+):([0-9]+):([0-9]+)", out):
+        w, h, x, y = (int(m.group(i)) for i in range(1, 5))
+        if w > 0 and h > 0:
+            rect = (w, h, x, y)
+    if not rect or rect[0] < 16 or rect[1] < 16:
+        return None
+    m = re.search(r"Decoder format: ([0-9]+)x([0-9]+)", out)
+    if m:
+        sw, sh = int(m.group(1)), int(m.group(2))
+        if rect[0] >= sw - 2 and rect[1] >= sh - 2 and rect[2] == 0 and rect[3] == 0:
+            return None        # full frame: no bars
+    return rect
 
 
 def find_probe():
@@ -852,6 +891,12 @@ class SyncApp:
         self._pip_int_drag = False    # user is dragging the pane
         self._pip_move_run = False    # SetWindowPos re-layout in flight
         self._pip_int_hwnd = None     # the embedded mpv window handle
+        self._pip_int_host = None     # tag of the HOST window (the main feed)
+        self._pip_rect_saved = {"A": None, "B": None}  # pre-embed geometry
+        self._srcs = {"A": None, "B": None}   # resolved sources per player
+        self._crop_cache = {}      # source path -> (w, h, x, y) or None
+        self._crop_busy = set()    # sources with a detection run in flight
+        self._pip_int_asp = None   # embedded pane aspect override (cropped)
         self._icon_img = None
         try:
             self._icon_img = tk.PhotoImage(data=ICON_B64)
@@ -915,7 +960,27 @@ class SyncApp:
         style.configure("TCheckbutton", background=bg, foreground=fg)
         style.configure("TLabelframe", background=bg, foreground=fg, bordercolor="#3a4150")
         style.configure("TLabelframe.Label", background=bg, foreground=fg)
-        style.configure("TEntry", fieldbackground=card, foreground=fg)
+        style.configure("TEntry", fieldbackground=card, foreground=fg,
+                        insertcolor=fg, bordercolor="#3a4150")
+        style.configure("TCombobox", fieldbackground=card, background=bg,
+                        foreground=fg, arrowcolor=fg, bordercolor="#3a4150",
+                        lightcolor=card, darkcolor=card, insertcolor=fg)
+        style.map("TCombobox",
+                  fieldbackground=[("readonly", card), ("disabled", "#20242c")],
+                  foreground=[("disabled", "#5a5f6a")],
+                  selectbackground=[("readonly", card), ("disabled", "#20242c")],
+                  selectforeground=[("readonly", fg), ("disabled", "#5a5f6a")],
+                  arrowcolor=[("disabled", "#5a5f6a")])
+        # the popdown listbox of a ttk.Combobox is a plain Tk listbox that
+        # ignores the theme; without these options it is white-on-white.
+        self.root.option_add("*TCombobox*Listbox.background", card)
+        self.root.option_add("*TCombobox*Listbox.foreground", fg)
+        self.root.option_add("*TCombobox*Listbox.selectBackground", accent)
+        self.root.option_add("*TCombobox*Listbox.selectForeground", "#ffffff")
+        self.root.option_add("*TCombobox*Listbox.activestyle", "none")
+        self.root.option_add("*TCombobox*Listbox.bordercolor", "#2a2f3a")
+        self.root.option_add("*TCombobox*Listbox.highlightBackground", card)
+        self.root.option_add("*TCombobox*Listbox.highlightColor", "#2a2f3a")
 
         # ---- header --------------------------------------------------------
         top = ttk.Frame(self.root, padding=(12, 10, 12, 2))
@@ -1116,6 +1181,21 @@ class SyncApp:
         self.btn_pip_mode_b.pack(side="left", padx=(4, 0))
         Tooltip(self.btn_pip_mode_b, "Integrated PiP: embed the Reaction INSIDE the Movie window, draggable over it (needs Sync Lock).")
         self._ctrls.append(self.btn_pip_mode_b)
+        # X/Y arrows: move the embedded pane inside the host feed
+        pip_pos = ttk.Frame(win)
+        pip_pos.pack(side="left", padx=(12, 0))
+        ttk.Label(pip_pos, text="PiP move:", style="Dim.TLabel").pack(side="left")
+        self._pip_xy_btns = []
+        for txt, dx, dy, tip in (("◀", -1, 0, "Move the embedded PiP pane LEFT"),
+                                 ("▲", 0, -1, "Move the embedded PiP pane UP"),
+                                 ("▼", 0, 1, "Move the embedded PiP pane DOWN"),
+                                 ("▶", 1, 0, "Move the embedded PiP pane RIGHT")):
+            b = ttk.Button(pip_pos, text=txt, width=3,
+                           command=lambda dx=dx, dy=dy: self._pip_move(dx, dy))
+            b.pack(side="left", padx=(1, 0))
+            Tooltip(b, tip)
+            self._pip_xy_btns.append(b)
+            self._ctrls.append(b)
 
         # ---- volumes -------------------------------------------------------
         vol = ttk.Frame(body)
@@ -1365,6 +1445,9 @@ class SyncApp:
         self.root.after(2500, self._fetch_meta)
         self._apply_volumes()
         self._apply_speed()
+        self._srcs = {"A": ra, "B": rb}
+        for _t, _s in (("A", ra), ("B", rb)):
+            threading.Thread(target=self._crop_preheat, args=(_t, _s), daemon=True).start()
         # arrange the two mpv windows side by side once they appear
         threading.Thread(target=self._arrange_thread, daemon=True).start()
 
@@ -1744,6 +1827,103 @@ class SyncApp:
             return pos
         return None
 
+    # -- PiP black-bar removal -------------------------------------------
+    def _crop_preheat(self, tag, src):
+        """Background detection of baked-in letterbox/pillarbox bars for a
+        source. Caches the rect per path; applies it live if PiP is on."""
+        if src in self._crop_cache or src in self._crop_busy:
+            return
+        if not src or src.startswith(("http://", "https://")):
+            self._crop_cache[src or ""] = None
+            return
+        self._crop_busy.add(src)
+        try:
+            rect = detect_crop_rect(src, self.last_dur.get(tag))
+        except Exception:
+            rect = None
+        self._crop_cache[src] = rect
+        self._crop_busy.discard(src)
+        if rect and (self.pip.get(tag) or
+                     (self.pip_int and self._pip_int_tag == tag)):
+            self._pip_crop_apply(tag, rect)
+
+    def _pip_crop_apply(self, tag, rect):
+        """Apply a detected bar-crop to a PiP player and (embedded mode)
+        re-fit the pane to the cropped video's display aspect."""
+        p = self.players.get(tag)
+        if not (p and p.running):
+            return
+        w, h, x, y = rect
+        asp = None
+        vp = None
+        try:
+            e, vp = p.get_property("video-params", timeout=2.5)
+            if e == "success" and isinstance(vp, dict):
+                par = vp.get("par") or 1.0
+                asp = (float(w) * float(par)) / float(h)
+        except Exception:
+            pass
+        # Guard: mpv silently ignores an out-of-bounds video-crop
+        # (property stays empty) - e.g. a cached detection left over
+        # after the file was swapped for a smaller one. Drop the bad
+        # entry and fit the pane to the video's own aspect instead.
+        if isinstance(vp, dict):
+            vw = max(float(vp.get("dw") or 0), float(vp.get("w") or 0))
+            vh = max(float(vp.get("dh") or 0), float(vp.get("h") or 0))
+            if vw > 0 and vh > 0 and (w + x > vw + 3 or h + y > vh + 3):
+                src = self._srcs.get(tag)
+                if src and self._crop_cache.get(src) == rect:
+                    self._crop_cache.pop(src, None)
+                if self.pip_int and self._pip_int_tag == tag:
+                    threading.Thread(target=self._pip_asp_from_video,
+                                     args=(tag,), daemon=True).start()
+                return
+        p.cmd({"command": ["set_property", "video-crop",
+                           "%dx%d+%d+%d" % (w, h, x, y)]})
+        if self.pip_int and self._pip_int_tag == tag:
+            self._set_pip_asp(asp)
+
+    def _pip_crop_on(self, tag):
+        """PiP engage hook: crop baked-in bars off this player (the
+        detection is cached from Start; a cache miss starts the probe)."""
+        src = self._srcs.get(tag)
+        if src and src not in self._crop_cache and src not in self._crop_busy:
+            threading.Thread(target=self._crop_preheat,
+                             args=(tag, src), daemon=True).start()
+        rect = self._crop_cache.get(src) if src else None
+        if rect:
+            self._pip_crop_apply(tag, rect)
+        elif self.pip_int and self._pip_int_tag == tag:
+            threading.Thread(target=self._pip_asp_from_video,
+                             args=(tag,), daemon=True).start()
+
+    def _pip_crop_off(self, tag):
+        p = self.players.get(tag)
+        if p and p.running:
+            p.cmd({"command": ["set_property", "video-crop", ""]})
+        self._pip_int_asp = None
+
+    def _set_pip_asp(self, asp):
+        self._pip_int_asp = asp
+        self._pip_update_pane(force=True)
+
+    def _pip_asp_from_video(self, tag):
+        """No detected bars: still fit the embedded pane to the video's
+        own aspect so a 4:3 / 21:9 source does not letterbox in the pane."""
+        p = self.players.get(tag)
+        if not (p and p.running):
+            return
+        try:
+            e1, vp = p.get_property("video-params", timeout=2.0)
+        except Exception:
+            e1 = "error"
+            vp = None
+        if e1 == "success" and isinstance(vp, dict):
+            w = float(vp.get("dw") or vp.get("w") or 0)
+            h = float(vp.get("dh") or vp.get("h") or 0)
+            if w > 0 and h > 0:
+                self._set_pip_asp(w / h)
+
     def _toggle_pip(self, tag):
         """Picture-in-picture for THIS video: border removed and always on
         Topmost goes through mpv's OWN ontop property (cross-process
@@ -1771,6 +1951,7 @@ class SyncApp:
                     u.SetWindowLongPtrW(p.hwnd, -16, new_style if new_style < 0x80000000 else new_style - 0x100000000)
                     u.SetWindowPos(p.hwnd, 0, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0004 | 0x0020)
             self.pip[tag] = True
+            self._pip_crop_on(tag)
             self.status_lbl.config(text="PiP on: this window is borderless, always on top; drag its edges to resize.")
         else:
             p.cmd({"command": ["set_property", "ontop", "no"]})
@@ -1779,98 +1960,145 @@ class SyncApp:
                 u.SetWindowLongPtrW(p.hwnd, -16, saved if saved < 0x80000000 else saved - 0x100000000)
                 u.SetWindowPos(p.hwnd, 0, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0004 | 0x0020)
             self.pip[tag] = False
+            self._pip_crop_off(tag)
             self.status_lbl.config(text="PiP off - window back to normal.")
 
-    # -- integrated PiP -----------------------------------------------------
+    # -- integrated PiP (true video-in-video overlay) -------------------------
     def _toggle_pip_int(self, tag):
-        """Integrated PiP: embed the `tag` video INSIDE the other mpv
-        window. The embedded window is stripped to a bare popup (no caption,
-        no thickframe), kept glued over the host by the 30 Hz poll, and can
-        be dragged with the mouse or nudged with the arrow keys. Escape or
-        toggling again undocks it. Requires Sync Lock so both videos stay
-        aligned inside the one window."""
+        """Integrated PiP: the `tag` video window becomes a CHILD window of
+        the other video's window (SetParent) - a real video-over-video
+        overlay rendered INSIDE the host's feed, not a separate floating
+        window. The pane follows the host's video area (client space) and
+        the 30 Hz poll keeps it glued; X/Y arrows in the panel (or the
+        arrow keys) move it, Escape or toggling again undocks it. Requires
+        Sync Lock so the two feeds stay aligned."""
+        if self.pip_int:
+            self._undock_pip_int()
+            return
+        if not self.started:
+            self.status_lbl.config(text="Start playback first so both video windows exist.")
+            return
         p = self.players.get(tag)
-        if not (p and p.running):
-            self.status_lbl.config(text="Start playback first so the video window exists.")
+        host_tag = "B" if tag == "A" else "A"
+        hp = self.players.get(host_tag)
+        if not (p and hp and p.running and hp.running and p.hwnd and hp.hwnd):
+            self.status_lbl.config(text="Video windows not ready yet.")
             return
         if not self.sync_locked:
             self.status_lbl.config(
                 text="Integrated PiP needs Sync Lock (Lock sync) first - both videos must stay aligned.")
             return
-        if self.pip_int:
-            self._undock_pip_int()
-            return
-        u = ctypes.windll.user32
-        host_tag = "B" if tag == "A" else "A"
-        hp = self.players.get(host_tag)
-        if not (hp and hp.running and hp.hwnd and p.hwnd):
-            self.status_lbl.config(text="Video windows not ready yet.")
-            return
-        p.cmd({"command": ["set_property", "ontop", "yes"]})
-        style = (u.GetWindowLongPtrW(p.hwnd, -16) or 0) & 0xFFFFFFFF
-        if style:
-            self._pip_saved[tag] = style
-            bare = (0x80000000 | 0x00040000) & ~(0x00C00000 | 0x00080000 |
-                                                 0x00020000 | 0x00010000)
-            u.SetWindowLongPtrW(p.hwnd, -16,
-                                bare if bare < 0x80000000 else bare - 0x100000000)
-            u.SetWindowPos(p.hwnd, 0, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0004 | 0x0020)
         self.pip_int = True
         self._pip_int_tag = tag
+        self._pip_int_host = host_tag
         self._pip_int_hwnd = p.hwnd
-        self._pip_update_pane(force=True)
+        self._pip_int_drag = False
+        self._embed_pane(p, hp, tag)
         self.status_lbl.config(
-            text="Integrated PiP: %s is embedded. Drag the pane, arrow keys nudge, Escape undocks." %
-                 ("Movie" if tag == "A" else "Reaction"))
+            text="Integrated PiP: %s is embedded INSIDE the %s feed. X/Y arrows (or the arrow keys) position it; Escape undocks." %
+                 ("Movie" if tag == "A" else "Reaction",
+                  "Reaction" if tag == "A" else "Movie"))
+
+    def _embed_pane(self, pane, host, tag):
+        """Superimpose the pane over the host feed: frameless popup (no
+        caption/sysmenu/thickframe - it LOOKS like part of the feed), kept
+        always on top and glued inside the host's client area by the 30 Hz
+        poll. NOTE: SetParent(WS_CHILD) was tried and REJECTED - mpv does
+        not present frames into a reparented child window (black capture)."""
+        u = ctypes.windll.user32
+        self._pip_rect_saved[tag] = self._win_rect(pane.hwnd)
+        st = (u.GetWindowLongPtrW(pane.hwnd, -16) or 0) & 0xFFFFFFFF
+        if st:
+            self._pip_saved[tag] = st
+            bare = (0x80000000 | 0x10000000) & ~(0x00C00000 | 0x00080000 |
+                                                 0x00040000 | 0x00020000 |
+                                                 0x00010000)
+            u.SetWindowLongPtrW(pane.hwnd, -16,
+                                bare if bare < 0x80000000 else bare - 0x100000000)
+            u.SetWindowPos(pane.hwnd, 0, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0004 | 0x0020)
+        pane.cmd({"command": ["set_property", "ontop", "yes"]})
+        pane.cmd({"command": ["set_property", "window-dragging", "no"]})
+        self._pip_crop_on(tag)
+        self._pip_update_pane(force=True)
+
+    @staticmethod
+    def _win_rect(hwnd):
+        u = ctypes.windll.user32
+        r = ctypes.wintypes.RECT()
+        if u.GetWindowRect(hwnd, ctypes.byref(r)):
+            return (r.left, r.top, r.right - r.left, r.bottom - r.top)
+        return None
+
+    @staticmethod
+    def _client_size(hwnd):
+        u = ctypes.windll.user32
+        r = ctypes.wintypes.RECT()
+        if u.GetClientRect(hwnd, ctypes.byref(r)):
+            return (r.right - r.left, r.bottom - r.top)
+        return None
 
     def _undock_pip_int(self):
+        """Restore the pane to a normal top-level window at its saved spot."""
         tag = self._pip_int_tag
         p = self.players.get(tag) if tag else None
         u = ctypes.windll.user32
-        if p and p.running and p.hwnd and self._pip_saved.get(tag):
-            saved = self._pip_saved.get(tag) & 0xFFFFFFFF
-            u.SetWindowLongPtrW(p.hwnd, -16,
-                                saved if saved < 0x80000000 else saved - 0x100000000)
-            u.SetWindowPos(p.hwnd, 0, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0004 | 0x0020)
+        if p and p.running and p.hwnd:
+            if self._pip_saved.get(tag):
+                saved = self._pip_saved.get(tag) & 0xFFFFFFFF
+                u.SetWindowLongPtrW(p.hwnd, -16,
+                                    saved if saved < 0x80000000 else saved - 0x100000000)
+                u.SetWindowPos(p.hwnd, 0, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0004 | 0x0020)
+            rect = self._pip_rect_saved.get(tag)
+            if rect:
+                u.SetWindowPos(p.hwnd, 0, rect[0], rect[1],
+                               max(60, rect[2]), max(34, rect[3]),
+                               0x0001 | 0x0002 | 0x0004 | 0x0020)
             p.cmd({"command": ["set_property", "ontop", "no"]})
+            p.cmd({"command": ["set_property", "window-dragging", "yes"]})
+            self._pip_crop_off(tag)
         self.pip_int = False
         self._pip_int_tag = None
+        self._pip_int_host = None
         self._pip_int_hwnd = None
         self._pip_int_drag = False
-        self.status_lbl.config(text="Integrated PiP off - video back in its own window.")
+        self.status_lbl.config(text="Integrated PiP off - the video is back in its own window.")
 
     def _pip_update_pane(self, force=False):
-        """Keep the embedded pane glued to its slot over the host window.
-        Runs from the 30 Hz poll; during a drag the slot follows the mouse."""
+        """30 Hz glue: keep the child pane at its slot inside the host's
+        client area, so it moves/resizes with the host feed automatically."""
         if not (self.pip_int and self._pip_int_hwnd):
             return
         tag = self._pip_int_tag
-        host_tag = "B" if tag == "A" else "A"
-        host = self.players.get(host_tag)
+        host = self.players.get(self._pip_int_host) if self._pip_int_host else None
         pane = self.players.get(tag)
-        if not (host and host.running and host.hwnd and pane and pane.running):
+        if not (host and pane and host.running and pane.running
+                and host.hwnd and pane.hwnd):
+            return
+        if pane.hwnd != self._pip_int_hwnd:
+            # mpv recreated its window (style reset): embed it again
+            self._embed_pane(pane, host, tag)
+            self._pip_int_hwnd = pane.hwnd
             return
         u = ctypes.windll.user32
-        rect = ctypes.wintypes.RECT()
-        if not u.GetWindowRect(host.hwnd, ctypes.byref(rect)):
+        csz = self._client_size(host.hwnd)
+        if not csz or csz[0] <= 0 or csz[1] <= 0:
             return
-        hw = rect.right - rect.left
-        hh = rect.bottom - rect.top
-        if hw <= 0 or hh <= 0:
+        cw, ch = csz
+        # client origin in screen coordinates (the pane is a top-level window)
+        pt = ctypes.wintypes.POINT(0, 0)
+        if not u.ClientToScreen(host.hwnd, ctypes.byref(pt)):
             return
-        if self._pip_int_drag:
-            # mpv is dragging the real window: record where it actually is
-            # (as host fractions) and stay out of its way.
-            pr = ctypes.wintypes.RECT()
-            if pane.hwnd and u.GetWindowRect(pane.hwnd, ctypes.byref(pr)):
-                self._pip_int_pos = [min(1.0, max(0.0, (pr.left - rect.left) / hw)),
-                                     min(1.0, max(0.0, (pr.top - rect.top) / hh))]
-            self._pip_int_hwnd = pane.hwnd   # follow any style recreation
-            return
-        fx = self._pip_int_pos[0] * hw
-        fy = self._pip_int_pos[1] * hh
-        fw = self._pip_int_size[0] * hw
-        fh = self._pip_int_size[1] * hh
+        x = pt.x + int(self._pip_int_pos[0] * cw)
+        y = pt.y + int(self._pip_int_pos[1] * ch)
+        w = max(60, int(self._pip_int_size[0] * cw))
+        h = max(34, int(self._pip_int_size[1] * ch))
+        asp = self._pip_int_asp
+        if asp:
+            h = int(w / asp)
+            maxh = int(0.92 * ch)
+            if h > maxh:
+                h = maxh
+                w = max(60, int(h * asp))
         if self._pip_move_run:
             return
         self._pip_move_run = True
@@ -1879,60 +2107,48 @@ class SyncApp:
             try:
                 hwnd = self._pip_int_hwnd
                 if hwnd:
-                    u.SetWindowPos(hwnd, 0, int(rect.left + fx), int(rect.top + fy),
-                                   max(60, int(fw)), max(34, int(fh)),
-                                   0x0004 | 0x0010)
+                    u.SetWindowPos(hwnd, 0, x, y, w, h, 0x0004 | 0x0010)
             finally:
                 self._pip_move_run = False
         threading.Thread(target=_place, daemon=True).start()
 
-    def _pip_start_drag(self):
-        if not (self.pip_int and self._pip_int_hwnd):
+    def _pip_move(self, dx, dy):
+        """Panel X/Y arrows: nudge the pane 4% of the host feed per press."""
+        if not self.pip_int:
             return False
-        u = ctypes.windll.user32
-        rect = ctypes.wintypes.RECT()
-        pr = ctypes.wintypes.RECT()
-        host_tag = "B" if self._pip_int_tag == "A" else "A"
-        host = self.players.get(host_tag)
-        pane = self.players.get(self._pip_int_tag)
-        if not (host and host.hwnd and pane and pane.hwnd):
-            return False
-        if not (u.GetWindowRect(host.hwnd, ctypes.byref(rect)) and
-                u.GetWindowRect(pane.hwnd, ctypes.byref(pr))):
-            return False
-        # mpv window-dragging moves the real window; we only record the
-        # pane size (relative to the host) so the poll tracks host fractions.
-        self._pip_int_size = [(pr.right - pr.left) / max(1, rect.right - rect.left),
-                              (pr.bottom - pr.top) / max(1, rect.bottom - rect.top)]
-        self._pip_int_drag = True
-        self.status_lbl.config(
-            text="PiP pane dragging - release to drop, arrow keys nudge, Escape undocks.")
+        step = 0.04
+        self._pip_int_pos[0] = min(1.0 - self._pip_int_size[0],
+                                   max(0.0, self._pip_int_pos[0] + step * dx))
+        self._pip_int_pos[1] = min(1.0 - self._pip_int_size[1],
+                                   max(0.0, self._pip_int_pos[1] + step * dy))
+        self._pip_update_pane(force=True)
         return True
 
     def _pip_nudge(self, dx, dy):
+        """Arrow keys: nudge the pane by px amounts (host-relative)."""
         if not self.pip_int:
             return False
-        host_tag = "B" if self._pip_int_tag == "A" else "A"
-        host = self.players.get(host_tag)
-        if not (host and host.hwnd):
+        host = self.players.get(self._pip_int_host) if self._pip_int_host else None
+        csz = self._client_size(host.hwnd) if (host and host.hwnd) else None
+        if not csz or csz[0] <= 0 or csz[1] <= 0:
             return False
-        u = ctypes.windll.user32
-        rect = ctypes.wintypes.RECT()
-        if not u.GetWindowRect(host.hwnd, ctypes.byref(rect)):
-            return False
-        hw = max(1, rect.right - rect.left)
-        hh = max(1, rect.bottom - rect.top)
-        self._pip_int_pos[0] = min(1.0, max(0.0, self._pip_int_pos[0] + dx / hw))
-        self._pip_int_pos[1] = min(1.0, max(0.0, self._pip_int_pos[1] + dy / hh))
+        self._pip_int_pos[0] = min(1.0 - self._pip_int_size[0],
+                                   max(0.0, self._pip_int_pos[0] + dx / csz[0]))
+        self._pip_int_pos[1] = min(1.0 - self._pip_int_size[1],
+                                   max(0.0, self._pip_int_pos[1] + dy / csz[1]))
         self._pip_update_pane(force=True)
         return True
+
+    def _pip_start_drag(self):
+        # mpv window-dragging is disabled on the embedded pane; all
+        # positioning happens through the panel arrows / the arrow keys.
+        return False
 
     def _pip_end_drag(self):
         self._pip_int_drag = False
 
     def _on_global_press(self, event):
-        # Presses on the Tk panel are ordinary UI handling; the embedded
-        # pane reports its own drags via SYNCPIPDRAG|start (mpv side).
+        # Presses on the Tk panel are ordinary UI handling.
         pass
 
     def _on_root_release(self, event):

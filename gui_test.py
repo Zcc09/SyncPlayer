@@ -521,6 +521,17 @@ ok = wait_until(lambda: _vals(app.combo_sub["B"]) and _vals(app.combo_sub["B"])[
 check("tracks: B sub list starts with Off", ok)
 check("tracks: combos stay readonly (not editable text)",
       "readonly" in (app.combo_audio["A"].state() or []))
+import tkinter.ttk as _ttk
+_style = _ttk.Style(root)
+_fbg = str(_style.lookup("TCombobox", "fieldbackground") or "")
+check("theme: combobox field is dark (not white)", _fbg.lower() in ("#1f232b", "1f232b"), "bg=%s" % _fbg)
+_pd = root.tk.call("ttk::combobox::PopdownWindow", app.combo_audio["A"])
+_lbg = str(root.tk.call(_pd + ".f.l", "cget", "-background") or "")
+_lfg = str(root.tk.call(_pd + ".f.l", "cget", "-foreground") or "")
+check("theme: popdown listbox is dark (not white)", _lbg.lower() in ("#1f232b", "1f232b"),
+      "bg=%s" % _lbg)
+check("theme: popdown listbox text is light (readable)",
+      _lfg.lower() in ("#e8e8ea", "#e8e8ea"), "fg=%s" % _lfg)
 
 # picking the German subtitle must switch sid to 2
 gsub = next((v for v in _vals(app.combo_sub["A"]) if "German" in v), "Off")
@@ -577,8 +588,12 @@ check("ipip: state on (A embedded)", app.pip_int and app._pip_int_tag == "A")
 hwnd = app._pip_int_hwnd
 check("ipip: embedded hwnd recorded", bool(hwnd))
 st = (u.GetWindowLongPtrW(hwnd, -16) or 0) & 0xFFFFFFFF
-check("ipip: bare popup style (no caption/sysmenu, popup on) - %08X" % st,
-      (st & 0x00C00000) == 0 and (st & 0x00080000) == 0 and (st & 0x80000000) != 0)
+check("ipip: frameless style (popup, no caption/sysmenu/thickframe) - %08X" % st,
+      (st & 0x00C00000) == 0 and (st & 0x00080000) == 0
+      and (st & 0x00040000) == 0 and (st & 0x80000000) != 0)
+check("ipip: top-level (not a child)", u.GetParent(hwnd) == 0)
+check("ipip: ontop sent to mpv",
+      ("A", {"command": ["set_property", "ontop", "yes"]}) in _cmd_log)
 pump(1.2)   # let the 30 Hz poll place the pane over the host
 hr = wt.RECT(); pr = wt.RECT()
 ok = u.GetWindowRect(app.players["B"].hwnd, ctypes.byref(hr)) and \
@@ -590,13 +605,20 @@ check("ipip: pane sits INSIDE the host window", inside,
       "host=(%d,%d,%d,%d) pane=(%d,%d,%d,%d)"
       % (hr.left, hr.top, hr.right, hr.bottom, pr.left, pr.top, pr.right, pr.bottom))
 px0, py0 = pr.left, pr.top
-app._pip_nudge(80, 40)
+app._pip_nudge(80, 40)   # arrow keys: px-based nudge
 pump(1.0)
 ok = u.GetWindowRect(hwnd, ctypes.byref(pr))
 moved = ok and (abs(pr.left - px0) > 20 or abs(pr.top - py0) > 20)
-check("ipip: nudge moves the pane (%d,%d -> %d,%d)" % (px0, py0, pr.left, pr.top), moved)
-check("ipip: ontop sent to mpv",
-      ("A", {"command": ["set_property", "ontop", "yes"]}) in _cmd_log)
+check("ipip: arrow-key nudge moves the pane (%d,%d -> %d,%d)" % (px0, py0, pr.left, pr.top), moved)
+px0, py0 = pr.left, pr.top
+app._pip_move(-1, -1)    # panel X/Y arrows: move left+up (away from clamps)
+pump(1.0)
+ok = u.GetWindowRect(hwnd, ctypes.byref(pr))
+moved = ok and (pr.left < px0 - 25 and pr.top < py0 - 15)
+check("ipip: X/Y arrow buttons move the pane (%d,%d -> %d,%d)" % (px0, py0, pr.left, pr.top), moved,
+      "size=%s" % app._pip_int_size)
+check("ipip: window-dragging disabled on the pane",
+      ("A", {"command": ["set_property", "window-dragging", "no"]}) in _cmd_log)
 app._toggle_pip_int("A")   # toggle again = undock
 pump(0.4)
 st2 = (u.GetWindowLongPtrW(hwnd, -16) or 0) & 0xFFFFFFFF
@@ -604,8 +626,68 @@ check("ipip: undock clears state", not app.pip_int)
 check("ipip: undock restores caption", (st2 & 0x00C00000) != 0)
 check("ipip: undock clears ontop",
       ("A", {"command": ["set_property", "ontop", "no"]}) in _cmd_log)
+check("ipip: undock restores window-dragging",
+      ("A", {"command": ["set_property", "window-dragging", "yes"]}) in _cmd_log)
 app._toggle_lock()
 check("ipip: lock released after PiP tests", not app.sync_locked)
+
+# --------------------- 11f. PiP black-bar removal (crop) -------------------
+BARSRC = os.path.join(BASE, "testmedia", "bars.mp4")   # 1280x540 in 1280x720
+crop = sp.detect_crop_rect(BARSRC, duration=6.0)
+check("crop: detect_crop_rect finds the letterbox (1280x540+0+90)", crop == (1280, 540, 0, 90),
+      "crop=%r" % (crop,))
+crop2 = sp.detect_crop_rect(MOVIE, duration=12.0)
+check("crop: bar-free source returns None", crop2 is None, "crop=%r" % (crop2,))
+
+# two-window PiP engages the crop and clears it on exit
+app._crop_cache[app._srcs["B"]] = (1280, 540, 0, 90)
+app._toggle_pip("B")
+pump(0.8)
+e, vc = app.players["B"].get_property("video-crop", timeout=3.0)
+check("crop: two-window PiP applies video-crop", e == "success" and vc == "1280x540+0+90",
+      "vc=%r" % (vc,))
+app._toggle_pip("B")
+pump(0.8)
+e, vc = app.players["B"].get_property("video-crop", timeout=3.0)
+check("crop: PiP off clears video-crop", e == "success" and vc in ("", None), "vc=%r" % (vc,))
+
+# embedded PiP: pane refits to the cropped aspect (needs Sync Lock)
+# A = multi.mkv (640x360) - seed a crop that FITS it: 640x270+0+45 (2.37:1)
+app._toggle_lock()
+app._crop_cache[app._srcs["A"]] = (640, 270, 0, 45)
+app._toggle_pip_int("A")
+pump(1.2)
+e, vc = app.players["A"].get_property("video-crop", timeout=3.0)
+check("crop: embedded PiP applies video-crop", e == "success" and vc == "640x270+0+45",
+      "vc=%r" % (vc,))
+ok = app._pip_int_asp is not None and abs(app._pip_int_asp - 640.0 / 270.0) < 0.05
+check("crop: embedded pane aspect follows the crop", ok, "asp=%r" % (app._pip_int_asp,))
+hr = wt.RECT(); pr = wt.RECT()
+u.GetWindowRect(app.players["B"].hwnd, ctypes.byref(hr))
+u.GetWindowRect(app._pip_int_hwnd, ctypes.byref(pr))
+pw, ph = pr.right - pr.left, pr.bottom - pr.top
+ratio = pw / float(ph) if ph else 0
+check("crop: pane rect is wide (no letterbox) - %dx%d ratio=%.3f" % (pw, ph, ratio),
+      abs(ratio - 640.0 / 270.0) < 0.15)
+app._toggle_pip_int("A")
+pump(0.8)
+e, vc = app.players["A"].get_property("video-crop", timeout=3.0)
+check("crop: undock clears video-crop", e == "success" and vc in ("", None), "vc=%r" % (vc,))
+check("crop: undock resets pane aspect", app._pip_int_asp is None)
+
+# guard: an over-sized crop rect (stale detection on a smaller file) is
+# refused by the app and evicted, instead of silently ignored by mpv
+app._crop_cache[app._srcs["A"]] = (1280, 540, 0, 90)
+app._toggle_pip_int("A")
+pump(1.2)
+e, vc = app.players["A"].get_property("video-crop", timeout=3.0)
+check("crop: oversized rect refused (guard)", e == "success" and vc in ("", None),
+      "vc=%r" % (vc,))
+check("crop: oversized rect evicted from cache", app._crop_cache.get(app._srcs["A"]) is None)
+app._toggle_pip_int("A")
+pump(0.8)
+app._toggle_lock()
+check("crop: lock released after crop PiP tests", not app.sync_locked)
 
 # ------------------------------------------------------ 12. screenshots --
 before = set(os.listdir(sp.SHOT_DIR)) if os.path.isdir(sp.SHOT_DIR) else set()

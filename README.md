@@ -77,6 +77,13 @@ together for the whole runtime.**
   embeds one video **inside** the other's window — borderless, always on
   top. Drag the small pane with the mouse, nudge with the arrow keys,
   `Esc` to undock. Requires Sync Lock so both stay aligned.
+- **⬛ Black-bar removal (both PiP modes)**: when a PiP engages, the app
+  probes that file once (headless mpv crop-detection, no extra deps) and,
+  if black letterbox/pillarbox bars are found, applies mpv's `video-crop`
+  and re-fits the embedded pane to the cropped aspect — so neither the
+  borderless window nor the embedded pane shows bars. Cleared on exit.
+  Bar-free sources are untouched; an out-of-date crop (e.g. the file was
+  swapped for a smaller one) is refused and re-detected.
 - **🎵 Tracks**: per-video pickers for **audio** and **subtitles**, built
   from the file's own streams (language + title shown; Off disables).
 - **Click-to-pause mirrors to both** windows, so they never fight each other.
@@ -98,10 +105,11 @@ together for the whole runtime.**
 ```
 syncplayer.py        # the whole app (panel + two mpv drivers + sync loop)
 selftest.py          # 41-check headless verification (python selftest.py)
-gui_test.py          # 134-check END-TO-END test: drives the real GUI + real
+gui_test.py          # 153-check END-TO-END test: drives the real GUI + real
                      # mpv processes (python gui_test.py) — bars track, per-
                      # video seeks, drift correction, volume read-back from
-                     # mpv, speed, pause, Sync Lock, PiP, frame-step, tracks
+                     # mpv, speed, pause, Sync Lock, PiP, frame-step, tracks,
+                     # PiP black-bar crop & guard
 make_testclips.sh    # regenerates the demo clips (needs ffmpeg)
 make_icon.py         # regenerates icon.png / icon.ico
 dist/SyncPlayer.exe  # PyInstaller onefile build
