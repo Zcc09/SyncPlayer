@@ -879,6 +879,51 @@ check("yt subs: parser splits auto vs uploaded",
       "n=%d" % len(_psubs))
 app._srcs["A"] = app._srcs["A"]  # keep as-is (no later section depends on it)
 
+# ------- 11z. Z-series: crop PERSISTS across free-window/PiP + Auto --------
+# user-initiated (nudge/Auto) crops must survive every mode change
+app._crop_tag = "A"
+app._crop_nudge("bottom", 1)
+pump(0.4)
+_mc = app._cur_crop("A")
+check("z: manual nudge sets a crop (persist source)", bool(_mc) and app._manual_crop["A"] == _mc,
+      "crop=%r manual=%r" % (_mc, app._manual_crop["A"]))
+# per-video PiP on/off round trip: crop must survive
+app._toggle_pip("A"); pump(0.6)
+app._toggle_pip("A"); pump(0.6)
+check("z: crop survives per-video PiP on/off", app._cur_crop("A") == _mc,
+      "crop=%r" % (app._cur_crop("A"),))
+# integrated PiP embed + undock: crop must survive
+if not app.sync_locked:
+    app._toggle_lock(); pump(0.3)
+if not app.pip_int:
+    app._toggle_pip_int("A"); pump(1.2)
+check("z: crop survives integrated PiP embed", app._cur_crop("A") == _mc,
+      "crop=%r" % (app._cur_crop("A"),))
+if app.pip_int:
+    app._toggle_pip_int("A"); pump(0.8)
+check("z: crop survives integrated PiP undock", app._cur_crop("A") == _mc,
+      "crop=%r" % (app._cur_crop("A"),))
+if app.sync_locked:
+    app._toggle_lock(); pump(0.3)
+# Clear drops it AND a later PiP round trip must not resurrect it
+app._crop_clear(); pump(0.4)
+_clr = app._cur_crop("A")
+app._toggle_pip("A"); pump(0.6)
+app._toggle_pip("A"); pump(0.6)
+check("z: Clear drops the crop and PiP doesn't bring it back",
+      _clr is None and app._cur_crop("A") is None and app._manual_crop["A"] is None,
+      "cleared=%r after=%r manual=%r" % (_clr, app._cur_crop("A"), app._manual_crop["A"]))
+# Auto re-probes (ignores a stale 'no bars' cache) and its feedback is pinned
+# against the ~30 Hz poll, so the button visibly reacts even on a bar-less file
+app._crop_tag = "A"
+app._srcs["A"] = MULTI    # A really plays multi.mkv (no bars) - probe it
+app._crop_auto()
+_zz = wait_until(lambda: "No black bars" in app.status_lbl.cget("text")
+                 or "cropped to" in app.status_lbl.cget("text"),
+                 25.0)
+check("z: Auto reacts (re-probes + feedback survives the poll)", _zz,
+      "status=%r" % app.status_lbl.cget("text"))
+
 # ------------------------------------------------------ 12. screenshots --
 before = set(os.listdir(sp.SHOT_DIR)) if os.path.isdir(sp.SHOT_DIR) else set()
 app._shot()

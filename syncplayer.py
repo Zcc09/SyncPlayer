@@ -224,7 +224,15 @@ def detect_crop_rect(src, duration=None, timeout=30):
     (no audio, no video window). Runs libavfilter's cropdetect over ~2.5 s
     sampled a little into the file and parses the detected crop rect from
     the verbose log. Returns (w, h, x, y) in source pixels, or None when no
-    bars are detected / the probe fails (URLs included - never applied)."""
+    bars are detected / the probe fails (URLs included - never applied).
+
+    The cropdetect args are limit:round:threshold. The old value 24:2:0 put
+    the black threshold at 0, so only PITCH-BLACK (0,0,0) letterbox was ever
+    detected - real encodes have near-black/dark-gray bars (luma ~16-40)
+    that 0 missed, which is why Auto looked dead. 32:2:16 raises the luma
+    threshold to 16 and the limit to 32, catching both pure-black and
+    dark-gray bars at 1280x540+0+90 while rejecting bar-less clips. A sanity
+    guard rejects a "bar" that eats more than 45% of a frame."""
     if not src or src.startswith(("http://", "https://")) or not os.path.isfile(src):
         return None
     start = 1.0
@@ -235,7 +243,7 @@ def detect_crop_rect(src, duration=None, timeout=30):
             [find_mpv(), "--no-config", "--input-terminal=no",
              "--vo=null", "--no-audio", "--keep-open=no",
              "--frames=75", "--start=%.2f" % start, "-v",
-             "--vf=lavfi-cropdetect=24:2:0", src],
+             "--vf=lavfi-cropdetect=32:2:16", src],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, errors="replace", timeout=timeout,
             creationflags=subprocess.CREATE_NO_WINDOW)
@@ -254,6 +262,9 @@ def detect_crop_rect(src, duration=None, timeout=30):
         sw, sh = int(m.group(1)), int(m.group(2))
         if rect[0] >= sw - 2 and rect[1] >= sh - 2 and rect[2] == 0 and rect[3] == 0:
             return None        # full frame: no bars
+        if (max(rect[3], sh - (rect[1] + rect[3])) > 0.45 * sh
+                or max(rect[2], sw - (rect[0] + rect[2])) > 0.45 * sw):
+            return None        # a "bar" this big is content, not letterbox
     return rect
 
 
@@ -1002,6 +1013,9 @@ class SyncApp:
         self._crop_busy = set()    # sources with a detection run in flight
         self._pip_int_asp = None   # embedded pane aspect override (cropped)
         self._crop_tag = "A"            # which video the manual crop controls
+        self._manual_crop = {"A": None, "B": None}   # user crop (persists across PiP)
+        self._crop_auto_pending = None   # (tag, rect|None) worker->main handoff for Auto
+        self._status_pin = 0.0   # until this monotonic time the poll must NOT rewrite the status bar
         self._yt_subs = {"A": [], "B": []}     # yt-dlp subtitle options per video
         self._yt_sub_lock = {"A": False, "B": False}  # yt subtitle download in flight
         self._icon_img = None
@@ -1622,6 +1636,11 @@ class SyncApp:
         self._srcs = {"A": ra, "B": rb}
         for _t, _s in (("A", ra), ("B", rb)):
             threading.Thread(target=self._crop_preheat, args=(_t, _s), daemon=True).start()
+        # Re-apply any persisted manual crop (mpv restarts crop-less) once the
+        # players have loaded; _pip_crop_apply re-fits the window too.
+        for _t in ("A", "B"):
+            if self._manual_crop.get(_t):
+                self.root.after(1200, self._crop_apply, _t, self._manual_crop[_t])
         # arrange the two mpv windows side by side once they appear
         threading.Thread(target=self._arrange_thread, daemon=True).start()
 
@@ -2106,9 +2125,9 @@ class SyncApp:
                            "%dx%d+%d+%d" % (w, h, x, y)]})
         if self.pip_int and self._pip_int_tag == tag:
             self._set_pip_asp(asp)
-        elif self.pip.get(tag) and asp and p.hwnd:
+        elif asp and p.hwnd and not self.pip_int:
             # keepaspect-window=no: mpv no longer refits the window to the
-            # cropped aspect - do it here (remember the pre-crop rect first)
+            # cropped aspect in the free window either - do it here.
             if not self._pip_crop_saved.get(tag):
                 self._pip_crop_saved[tag] = self._win_rect(p.hwnd)
             self._fit_pip_window(tag, asp)
@@ -2127,8 +2146,14 @@ class SyncApp:
                                           0x0004 | 0x0010)
 
     def _pip_crop_on(self, tag):
-        """PiP engage hook: crop baked-in bars off this player (the
-        detection is cached from Start; a cache miss starts the probe)."""
+        """PiP engage hook: reapply this player's saved crop (manual first,
+        else the auto-detected bars) so it survives the free-window <-> PiP
+        switch; a cache miss starts the probe."""
+        p = self.players.get(tag)
+        manual = self._manual_crop.get(tag)
+        if manual and p and p.running:
+            self._pip_crop_apply(tag, manual)
+            return
         src = self._srcs.get(tag)
         if src and src not in self._crop_cache and src not in self._crop_busy:
             threading.Thread(target=self._crop_preheat,
@@ -2141,12 +2166,19 @@ class SyncApp:
                              args=(tag,), daemon=True).start()
 
     def _pip_crop_off(self, tag):
+        """PiP-mode-off hook. A MANUAL crop (set with the Crop panel) is app
+        state that PERSISTS across the free-window <-> PiP switch, so it is
+        reapplied rather than cleared. Only an AUTO crop (no manual rect yet)
+        is lost here, and the pre-crop window shape is restored."""
         p = self.players.get(tag)
+        manual = self._manual_crop.get(tag)
+        if manual and p and p.running:
+            self._pip_crop_apply(tag, manual)
+            return
         if p and p.running:
             p.cmd({"command": ["set_property", "video-crop", ""]})
         saved = self._pip_crop_saved.get(tag)
-        if (saved and p and p.running and p.hwnd and self.pip.get(tag)
-                and not self.pip_int):
+        if (saved and p and p.running and p.hwnd and not self.pip_int):
             u = ctypes.windll.user32
             u.SetWindowPos(p.hwnd, 0, saved[0], saved[1],
                            max(60, saved[2]), max(34, saved[3]),
@@ -2182,12 +2214,16 @@ class SyncApp:
         return (0, 0)
 
     def _crop_apply(self, tag, rect):
-        """Apply a crop rect (w,h,x,y) to a player (+ refit if PiP)."""
+        """Apply a crop rect (w,h,x,y) via the user's crop panel (nudge/Auto).
+        Remembers it so it PERSISTS across the free-window <-> PiP switch;
+        Clear drops it."""
         if not rect:
             self._crop_clear()
             return
+        self._manual_crop[tag] = rect      # remember it: survives PiP switches
         self._pip_crop_apply(tag, rect)
         name = "Movie" if tag == "A" else "Reaction"
+        self._status_pin = time.monotonic() + 3.0
         self.status_lbl.config(
             text="%s cropped to %dx%d+%d+%d (black bars removed). Clear to undo."
                  % (name, rect[0], rect[1], rect[2], rect[3]))
@@ -2232,32 +2268,43 @@ class SyncApp:
         self._crop_apply(tag, (int(w), int(h), int(x), int(y)))
 
     def _crop_auto(self):
-        """Auto-detect the bars on the current source and apply the crop."""
+        """Auto-detect the bars on the current source and apply the crop.
+        Re-probes EVERY time (a stale 'no bars' cache from Start would make
+        the button look dead), and the result becomes the persisted manual
+        crop so it survives free-window <-> PiP switches. Feedback is pinned
+        so the ~30 Hz poll can't clobber it before the user reads it."""
         tag = self._crop_tag
         src = self._srcs.get(tag)
         name = "Movie" if tag == "A" else "Reaction"
         if not (src and self.players.get(tag) and self.players[tag].running):
             self.status_lbl.config(text="Start playback first, then Auto-crop.")
             return
-        if src not in self._crop_cache and src not in self._crop_busy:
-            threading.Thread(target=self._crop_preheat,
-                             args=(tag, src), daemon=True).start()
+        self._crop_busy.discard(src)          # ignore any stale busy flag
+        self._crop_auto_pending = None        # worker -> main-loop handoff
+        self._status_pin = time.monotonic() + 3.0
+        self.status_lbl.config(
+            text="Auto-cropping the %s video (probing for black bars)..." % name)
 
-        def _apply():
-            rect = self._crop_cache.get(src)
-            if rect:
-                self.root.after(0, lambda r=rect: self._crop_apply(tag, r))
-            else:
-                self.root.after(0, lambda: self.status_lbl.config(
-                    text="No black bars detected on the %s video." % name))
+        def _work():
+            try:
+                sp_rect = detect_crop_rect(src, self.last_dur.get(tag))
+            except Exception:
+                sp_rect = None
+            self._crop_cache[src] = sp_rect
+            self._crop_busy.discard(src)
+            # hand the result to the main loop - tkinter widgets must only be
+            # touched from the main thread
+            self._crop_auto_pending = (tag, sp_rect)
 
-        threading.Thread(target=_apply, daemon=True).start()
+        threading.Thread(target=_work, daemon=True).start()
 
     def _crop_clear(self):
-        """Remove the crop on the current video."""
+        """Remove the crop on the current video (manual + auto)."""
         tag = self._crop_tag
+        self._manual_crop[tag] = None     # forget it, else _pip_crop_off reapplies it
         self._pip_crop_off(tag)
         name = "Movie" if tag == "A" else "Reaction"
+        self._status_pin = time.monotonic() + 3.0
         self.status_lbl.config(text="Crop removed on %s (full frame)." % name)
 
     def _on_crop_tag(self, tag):
@@ -2389,6 +2436,7 @@ class SyncApp:
                     u.SetWindowPos(p.hwnd, 0, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0004 | 0x0020)
             self.pip[tag] = True
             self._pip_crop_on(tag)
+            self._status_pin = time.monotonic() + 3.0
             self.status_lbl.config(text="PiP on: this window is borderless, always on top; drag its edges to resize.")
         else:
             p.cmd({"command": ["set_property", "ontop", "no"]})
@@ -2398,7 +2446,8 @@ class SyncApp:
                 u.SetWindowPos(p.hwnd, 0, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0004 | 0x0020)
             self._pip_crop_off(tag)
             self.pip[tag] = False
-            self.status_lbl.config(text="PiP off - window back to normal.")
+            self._status_pin = time.monotonic() + 3.0
+            self.status_lbl.config(text="PiP off - window back to normal (crop kept).")
 
     # -- integrated PiP (true video-in-video overlay) -------------------------
     def _toggle_pip_int(self, tag):
@@ -2431,8 +2480,9 @@ class SyncApp:
         self._pip_int_hwnd = p.hwnd
         self._pip_int_drag = False
         self._embed_pane(p, hp, tag)
+        self._status_pin = time.monotonic() + 3.0
         self.status_lbl.config(
-            text="Integrated PiP: %s is embedded INSIDE the %s feed. X/Y arrows (or the arrow keys) position it; Escape undocks." %
+            text="Integrated PiP: %s is embedded INSIDE the %s feed. X/Y arrows (or the arrow keys) position it; Escape undocks (crop kept)." %
                  ("Movie" if tag == "A" else "Reaction",
                   "Reaction" if tag == "A" else "Movie"))
 
@@ -2498,7 +2548,8 @@ class SyncApp:
         self._pip_int_host = None
         self._pip_int_hwnd = None
         self._pip_int_drag = False
-        self.status_lbl.config(text="Integrated PiP off - the video is back in its own window.")
+        self._status_pin = time.monotonic() + 3.0
+        self.status_lbl.config(text="Integrated PiP off - the video is back in its own window (crop kept).")
 
     def _pip_update_pane(self, force=False):
         """30 Hz glue: keep the child pane at its slot inside the host's
@@ -2916,6 +2967,16 @@ class SyncApp:
                         self._undock_pip_int()
                 elif kind == "exit":
                     self._stop()
+        if self._crop_auto_pending:
+            tag, sp_rect = self._crop_auto_pending
+            self._crop_auto_pending = None
+            if sp_rect:
+                self._crop_apply(tag, sp_rect)
+            else:
+                self._status_pin = time.monotonic() + 3.0
+                n = "Movie" if tag == "A" else "Reaction"
+                self.status_lbl.config(
+                    text="No black bars detected on the %s video." % n)
         if self.started:
             a = self.combo_audio["A"]
             b = self.combo_audio["B"]
@@ -3040,7 +3101,7 @@ class SyncApp:
         lock_txt = " · SYNC LOCKED" if self.sync_locked else ""
         if ra is not None:
             txt = "Movie %s  ·  Reaction %s  ·  %s%s" % (ma, rb_fmt, d_txt, lock_txt)
-            if self._lbl_status_cache != txt:
+            if time.monotonic() >= self._status_pin and self._lbl_status_cache != txt:
                 self.status_lbl.config(text=txt)
                 self._lbl_status_cache = txt
 

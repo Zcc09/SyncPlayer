@@ -100,7 +100,11 @@ together for the whole runtime.**
 - **⬛ Manual crop**: a dedicated *Crop* section lets you kill baked-in
   black bars by hand — per-video **Top/Bottom/Left/Right** − / + nudges
   (8 px per press), **⭯ Auto** (re-run detection) and **✖ Clear**. Works
-  on the regular window (not just PiP).
+  on the regular window (not just PiP), and the crop **PERSISTS across
+  the free-window ↔ PiP switch** (it's app state, reapplied on re-engage
+  and on reload, until you Clear it). Auto re-probes every press (a stale
+  "no bars" result is ignored) and announces its outcome on the status
+  line (kept long enough to read).
 - **🎯 Editable timecode**: the master seek row has a **Go-to** box — type
   `90`, `83:45` or `1:23:45` and hit Enter to jump both videos there
   (no scrubbing). The time labels show **HH:MM:SS** once a video is over
@@ -126,14 +130,14 @@ together for the whole runtime.**
 
 ```
 syncplayer.py        # the whole app (panel + two mpv drivers + sync loop)
-selftest.py          # 48-check headless verification (python selftest.py)
-gui_test.py          # 173-check END-TO-END test: drives the real GUI + real
+selftest.py          # 51-check headless verification (python selftest.py)
+gui_test.py          # 179-check END-TO-END test: drives the real GUI + real
                      # mpv processes (python gui_test.py) — bars track, per-
                      # video seeks, drift correction, volume read-back from
                      # mpv, speed, pause, Sync Lock, PiP, frame-step, tracks,
                      # PiP black-bar crop & guard, double-click fullscreen,
                      # PiP size, free-form resize, manual crop, Go-to timecode,
-                     # yt subtitle merge
+                     # yt subtitle merge, crop persistence + Auto re-probe
 make_testclips.sh    # regenerates the demo clips (needs ffmpeg)
 make_icon.py         # regenerates icon.png / icon.ico
 dist/SyncPlayer.exe  # PyInstaller onefile build

@@ -291,5 +291,21 @@ check("quit: A exited", not dA.running)
 check("quit: B exited", not dB.running)
 kill_mpv()
 
+# ---- crop detection (32:2:16 catches black AND dark-gray bars) ----------
+BASE_T = os.path.dirname(os.path.abspath(__file__))
+_bars = os.path.join(BASE_T, "testmedia", "bars.mp4")
+_gray = os.path.join(BASE_T, "testmedia", "bars_gray.mp4")
+_movie = os.path.join(BASE_T, "testmedia", "movie.mp4")
+# pitch-black letterbox (1280x540 content in 1280x720, 90px bars)
+cb = sp.detect_crop_rect(_bars)
+check("detect: pitch-black bars cropped", cb == (1280, 540, 0, 90), "rect=%r" % (cb,))
+# dark-gray (Y~32) letterbox - the case threshold 0 missed (the Auto bug)
+cg = sp.detect_crop_rect(_gray)
+check("detect: dark-gray bars cropped", cg == (1280, 540, 0, 90), "rect=%r" % (cg,))
+# bar-less clip -> no crop
+cm = sp.detect_crop_rect(_movie)
+check("detect: bar-less clip rejected", cm is None, "rect=%r" % (cm,))
+kill_mpv()
+
 print("==== %d/%d checks passed ====" % (passed, passed + failed))
 sys.exit(0 if failed == 0 else 1)
