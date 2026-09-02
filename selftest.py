@@ -78,6 +78,21 @@ check("parse: nan -> None", sp.MpvDriver._to_seconds("nan") is None)
 check("parse: empty -> None", sp.MpvDriver._to_seconds("") is None)
 check("parse: negative", sp.MpvDriver._to_seconds("-4.5") == -4.5)
 
+# --------------------------------------------------- 2b. yt subs + time fmt --
+_smp = ("[info] Available automatic captions for the video:\n"
+        "Language      Name\nen            English\nde            German\n"
+        "[info] Available subtitles for the video:\n"
+        "Language      Name\nfr            French\n")
+_sps = sp.yt_parse_list_subs(_smp)
+check("yt subs: detects auto-generated captions", any(s["auto"] for s in _sps))
+check("yt subs: detects uploaded subtitles", any(not s["auto"] for s in _sps))
+check("yt subs: auto labels are marked", any("(auto)" in s["label"] for s in _sps))
+check("yt subs: no false header row", all(s["lang"] != "Language" for s in _sps))
+check("fmt: under an hour -> MM:SS", sp.SyncApp._fmt(90, 120) == "01:30 / 02:00")
+check("fmt: over an hour -> HH:MM:SS",
+      sp.SyncApp._fmt(3723.5, 4100) == "1:02:03 / 1:08:20")
+check("fmt: None -> placeholder", sp.SyncApp._fmt(None, 120) == "--:--")
+
 # ---------------------------------------------------------- 3. dual launch --
 kill_mpv()
 time.sleep(1)

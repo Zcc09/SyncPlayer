@@ -29,6 +29,7 @@ Requires: mpv on PATH (or MPV_PATH env / common install dirs).
 
 import ctypes
 import ctypes.wintypes  # noqa: F401 (ctypes.wintypes.DWORD etc. used in window helpers)
+import glob
 import io
 import json
 import os
@@ -37,6 +38,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import tkinter as tk
@@ -301,6 +303,57 @@ def is_youtube(url):
         return "youtube.com" in u or "youtu.be" in u
     except Exception:
         return False
+
+
+def yt_parse_list_subs(text):
+    """Parse `yt-dlp --list-subs` stdout into [{lang, label, auto}] boxes.
+
+    yt-dlp prints two sections: 'Available automatic captions for the video:'
+    (auto-generated ASR) and 'Available subtitles for the video:' (uploaded).
+    Each is followed by a 'Language  Name' header row, then lang/name rows."""
+    subs = []
+    section = None
+    for line in (text or "").splitlines():
+        s = line.strip()
+        low = s.lower()
+        if "automatic captions for the video" in low:
+            section = "auto"
+            continue
+        if "subtitles for the video" in low and "automatic" not in low:
+            section = "manual"
+            continue
+        if not s or s.startswith("Language"):
+            continue
+        parts = s.split(None, 1)
+        if len(parts) != 2:
+            continue
+        lang = parts[0]
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", lang):
+            continue
+        name = parts[1].strip()
+        auto = (section == "auto")
+        label = "%s [%s]%s" % (name or lang, lang, " (auto)" if auto else "")
+        subs.append({"lang": lang, "auto": auto, "label": label})
+    return subs
+
+
+def yt_subtitle_repo(url):
+    """List YouTube subtitles (auto + uploaded) for a URL via the yt-dlp CLI."""
+    if not is_youtube(url):
+        return []
+    ytdl = shutil.which("yt-dlp")
+    if not ytdl:
+        return []
+    try:
+        out = subprocess.run(
+            [ytdl, "--list-subs", "--no-warnings", "--no-playlist",
+             "--skip-download", url],
+            capture_output=True, text=True, timeout=180)
+        if out.returncode != 0:
+            return []
+        return yt_parse_list_subs(out.stdout)
+    except Exception:
+        return []
 
 
 def resolve_url(url):
@@ -948,6 +1001,9 @@ class SyncApp:
         self._crop_cache = {}      # source path -> (w, h, x, y) or None
         self._crop_busy = set()    # sources with a detection run in flight
         self._pip_int_asp = None   # embedded pane aspect override (cropped)
+        self._crop_tag = "A"            # which video the manual crop controls
+        self._yt_subs = {"A": [], "B": []}     # yt-dlp subtitle options per video
+        self._yt_sub_lock = {"A": False, "B": False}  # yt subtitle download in flight
         self._icon_img = None
         try:
             self._icon_img = tk.PhotoImage(data=ICON_B64)
@@ -1135,7 +1191,7 @@ class SyncApp:
             nbtn.pack(side="left", padx=(0, 4))
             Tooltip(nbtn, "Play/pause THIS video only - the other one keeps going (handy before you lock the sync).")
             self._ctrls.append(nbtn)
-            lbl = ttk.Label(row, text="00:00 / --:--", width=14, anchor="e")
+            lbl = ttk.Label(row, text="00:00 / --:--", width=20, anchor="e")
             lbl.pack(side="right")
             self._ctrls.append(slider)
             Tooltip(slider, tip)
@@ -1161,7 +1217,20 @@ class SyncApp:
         self._ctrls.append(self.btn_play_m)
         self.seek_m = ttk.Scale(mrow, from_=0, to=600)
         self.seek_m.pack(side="left", fill="x", expand=True, padx=(4, 8))
-        self.lbl_m = ttk.Label(mrow, text="00:00 / --:--", width=14, anchor="e")
+        # editable timecode: type a target (90 / 83:45 / 1:23:45) and hit Enter
+        # or Go to seek BOTH videos there (no scrubbing needed)
+        goto = ttk.Frame(mrow)
+        goto.pack(side="right", padx=(0, 6))
+        self.goto_var = tk.StringVar()
+        ge = ttk.Entry(goto, textvariable=self.goto_var, width=9)
+        ge.pack(side="left")
+        ge.bind("<Return>", lambda e: self._on_goto())
+        Tooltip(ge, "Jump both videos to a typed time: seconds, MM:SS or HH:MM:SS (Enter/Go).")
+        gb = ttk.Button(goto, text="Go", width=3, command=self._on_goto)
+        gb.pack(side="left", padx=(2, 0))
+        Tooltip(gb, "Jump both videos to the typed timecode.")
+        self._ctrls.extend([ge, gb])
+        self.lbl_m = ttk.Label(mrow, text="00:00 / --:--", width=20, anchor="e")
         self.lbl_m.pack(side="right")
         self._ctrls.append(self.seek_m)
         Tooltip(self.seek_m, "Locked out until you engage Lock Sync \u2014 then this bar drives BOTH videos together, keeping their alignment. Its play button toggles both videos at any time.")
@@ -1258,6 +1327,41 @@ class SyncApp:
             Tooltip(b, tip)
             self._pip_sz_btns.append(b)
             self._ctrls.append(b)
+
+        # ---- crop (manual black-bar removal) ------------------------------
+        crop = ttk.LabelFrame(body, text=" Crop (remove black bars) ", padding=8)
+        crop.pack(fill="x", pady=(0, 8))
+        crow = ttk.Frame(crop)
+        crow.pack(fill="x")
+        ttk.Label(crow, text="Crop:", style="Dim.TLabel").pack(side="left")
+        self._crop_tag_btns = {}
+        for txt, tag in (("Movie", "A"), ("Reaction", "B")):
+            b = ttk.Button(crow, text=txt, width=8,
+                           command=lambda t=tag: self._on_crop_tag(t))
+            b.pack(side="left", padx=(2, 0))
+            self._crop_tag_btns[tag] = b
+            self._ctrls.append(b)
+        self._crop_tag_btns["A"].state(["pressed"])
+        b = ttk.Button(crow, text="\u2b21 Auto", width=8, command=self._crop_auto)
+        b.pack(side="left", padx=(10, 0))
+        Tooltip(b, "Auto-detect and remove the video's baked-in letterbox/pillarbox bars.")
+        self._ctrls.append(b)
+        b = ttk.Button(crow, text="\u2716 Clear", width=7, command=self._crop_clear)
+        b.pack(side="left", padx=(4, 0))
+        Tooltip(b, "Remove the crop (show the full frame again).")
+        self._ctrls.append(b)
+        erow = ttk.Frame(crop)
+        erow.pack(fill="x", pady=(5, 0))
+        ttk.Label(erow, text="Edges:", style="Dim.TLabel").pack(side="left")
+        for edge, lbl in (("top", "Top"), ("bottom", "Bottom"),
+                          ("left", "Left"), ("right", "Right")):
+            ttk.Label(erow, text=lbl, style="Dim.TLabel").pack(side="left", padx=(8, 0))
+            for txt, d in (("\u2212", -1), ("+", 1)):
+                b = ttk.Button(erow, text=txt, width=3,
+                               command=lambda e=edge, d=d: self._crop_nudge(e, d))
+                b.pack(side="left", padx=(1, 0))
+                Tooltip(b, "Crop the %s edge %s (remove black bars)." % (lbl, "less" if d < 0 else "more"))
+                self._ctrls.append(b)
 
         # ---- volumes -------------------------------------------------------
         vol = ttk.Frame(body)
@@ -1509,6 +1613,10 @@ class SyncApp:
         self.root.after(1500, self._refresh_tracks)
         self.root.after(4000, self._refresh_tracks)
         self.root.after(2500, self._fetch_meta)
+        if is_youtube(ra):
+            self.root.after(2500, lambda: self._list_yt_subs("A"))
+        if is_youtube(rb):
+            self.root.after(2500, lambda: self._list_yt_subs("B"))
         self._apply_volumes()
         self._apply_speed()
         self._srcs = {"A": ra, "B": rb}
@@ -1649,6 +1757,27 @@ class SyncApp:
             if self.last_pos[t] is not None:
                 self._commit_seek(t, max(0.0, self.last_pos[t] + delta))
 
+    def _on_goto(self):
+        """Jump both videos to a typed timecode (seconds / MM:SS / HH:MM:SS)."""
+        if not self.started:
+            return
+        txt = self.goto_var.get().strip()
+        if not txt:
+            return
+        try:
+            pos = MpvDriver._to_seconds(txt)
+        except Exception:
+            pos = None
+        if pos is None or pos < 0:
+            self.status_lbl.config(text="Enter a timecode like 1:23:45, 83:45 or 90.")
+            return
+        durs = [d for d in (self.last_dur.get("A"), self.last_dur.get("B")) if d]
+        if durs:
+            pos = min(pos, max(durs))
+        self._seek(pos)
+        self.goto_var.set("")
+        self.status_lbl.config(text="Seek to %s." % self._fmt(pos, None))
+
     # -- help / tracks / master play ----------------------------------------
     def _show_help(self):
         help_w = getattr(self, "_help_win", None)
@@ -1691,7 +1820,15 @@ class SyncApp:
             "- Windows can be resized freely (no aspect lock) - shape a" + chr(10) +
             "  window to the movie's aspect ratio and the black bars go away." + chr(10) +
             "- Tracks: choose audio and subtitles per video in the" + chr(10) +
-            "  Tracks panel (Off turns subtitles off)." + chr(10) +
+            "  Tracks panel (Off turns subtitles off). For a YouTube URL the" + chr(10) +
+            "  picker also lists the video's uploaded subtitles AND the" + chr(10) +
+            "  auto-generated captions (picking one downloads + attaches it)." + chr(10) +
+            "- Crop: remove baked-in black bars by hand - pick Movie or" + chr(10) +
+            "  Reaction, then nudge Top/Bottom/Left/Right with - / + (Auto" + chr(10) +
+            "  re-detects, Clear restores the full frame)." + chr(10) +
+            "- Go-to: type a timecode (90 / 83:45 / 1:23:45) in the Master" + chr(10) +
+            "  row and press Enter to jump both videos there. Time labels" + chr(10) +
+            "  show HH:MM:SS once a video exceeds an hour." + chr(10) +
             "- Shortcuts: Space play/pause both, Left/Right seek 5 s" + chr(10) +
             "  both, arrow keys nudge the PiP pane while dragging.")
         lbl = tk.Label(w, text=txt, bg="#16181d", fg="#e8e8ea",
@@ -1735,6 +1872,7 @@ class SyncApp:
             cs = self.combo_sub[tag]
             if not (p and p.running):
                 continue
+            src = self._srcs.get(tag)
             tl = p.track_list()
             audio = [t for t in tl if t.get("type") == "audio"]
             subs = [t for t in tl if t.get("type") == "sub"]
@@ -1752,6 +1890,15 @@ class SyncApp:
                 lbl = self._track_label(t)
                 sopts.append(lbl)
                 smap[lbl] = t.get("id")
+            # YouTube: merge fetched external subtitle options (incl. the
+            # auto-generated ASR captions) so they show in the track picker
+            for sub in (self._yt_subs.get(tag) or []):
+                lbl = sub["label"]
+                if lbl not in sopts:
+                    sopts.append(lbl)
+                    smap[lbl] = {"yt": True, "lang": sub["lang"],
+                                 "auto": sub["auto"], "url": src,
+                                 "label": lbl}
             cur_a = p.audio_id
             cur_s = p.sub_id
             ca["values"] = aopts
@@ -1788,8 +1935,13 @@ class SyncApp:
             self.status_lbl.config(text="Audio track set on %s." % name)
         else:
             lbl = self.combo_sub[tag].get()
-            p.set_sub(opts.get("sub", {}).get(lbl))
-            self.status_lbl.config(text="Subtitle track set on %s." % name)
+            sel = opts.get("sub", {}).get(lbl)
+            if isinstance(sel, dict) and sel.get("yt"):
+                threading.Thread(target=self._load_yt_sub,
+                                 args=(tag, sel), daemon=True).start()
+            else:
+                p.set_sub(sel)
+                self.status_lbl.config(text="Subtitle track set on %s." % name)
 
     def _toggle_pause_m(self):
         if not self.started:
@@ -2001,6 +2153,192 @@ class SyncApp:
                            0x0004 | 0x0010)
             self._pip_crop_saved[tag] = None
         self._pip_int_asp = None
+
+    def _cur_crop(self, tag):
+        """Return the player's current video-crop rect (w,h,x,y) or None."""
+        p = self.players.get(tag)
+        if not (p and p.running):
+            return None
+        err, vc = p.get_property("video-crop", timeout=2.0)
+        if err == "success" and vc:
+            m = re.match(r"^(\d+)x(\d+)\+(-?\d+)\+(-?\d+)$", str(vc).strip())
+            if m:
+                return tuple(int(g) for g in m.groups())
+        return None
+
+    def _crop_video_dims(self, tag):
+        """(w, h) of the video's decoded frame (from video-params)."""
+        p = self.players.get(tag)
+        if not (p and p.running):
+            return (0, 0)
+        try:
+            e, vp = p.get_property("video-params", timeout=2.0)
+            if e == "success" and isinstance(vp, dict):
+                w = max(float(vp.get("dw") or 0), float(vp.get("w") or 0))
+                h = max(float(vp.get("dh") or 0), float(vp.get("h") or 0))
+                return (int(w), int(h))
+        except Exception:
+            pass
+        return (0, 0)
+
+    def _crop_apply(self, tag, rect):
+        """Apply a crop rect (w,h,x,y) to a player (+ refit if PiP)."""
+        if not rect:
+            self._crop_clear()
+            return
+        self._pip_crop_apply(tag, rect)
+        name = "Movie" if tag == "A" else "Reaction"
+        self.status_lbl.config(
+            text="%s cropped to %dx%d+%d+%d (black bars removed). Clear to undo."
+                 % (name, rect[0], rect[1], rect[2], rect[3]))
+
+    def _crop_nudge(self, edge, delta):
+        """Move one crop edge ~8px (delta +1 = crop MORE of that edge)."""
+        tag = self._crop_tag
+        p = self.players.get(tag)
+        if not (p and p.running):
+            self.status_lbl.config(text="Start playback first, then crop.")
+            return
+        vw, vh = self._crop_video_dims(tag)
+        if not vw or not vh:
+            return
+        cur = self._cur_crop(tag) or (vw, vh, 0, 0)
+        w, h, x, y = cur
+        d = 8
+        if edge == "top":
+            if delta > 0:
+                dy = min(d, vh - (y + h)); y += dy; h -= dy
+            else:
+                dy = min(d, y); y -= dy; h += dy
+        elif edge == "bottom":
+            if delta > 0:
+                h = max(16, h - d)
+            else:
+                h = min(vh - y, h + d)
+        elif edge == "left":
+            if delta > 0:
+                dx = min(d, vw - (x + w)); x += dx; w -= dx
+            else:
+                dx = min(d, x); x -= dx; w += dx
+        elif edge == "right":
+            if delta > 0:
+                w = max(16, w - d)
+            else:
+                w = min(vw - x, w + d)
+        w = max(8, min(int(w), vw - x))
+        h = max(8, min(int(h), vh - y))
+        if w < 8 or h < 8 or x < 0 or y < 0:
+            return
+        self._crop_apply(tag, (int(w), int(h), int(x), int(y)))
+
+    def _crop_auto(self):
+        """Auto-detect the bars on the current source and apply the crop."""
+        tag = self._crop_tag
+        src = self._srcs.get(tag)
+        name = "Movie" if tag == "A" else "Reaction"
+        if not (src and self.players.get(tag) and self.players[tag].running):
+            self.status_lbl.config(text="Start playback first, then Auto-crop.")
+            return
+        if src not in self._crop_cache and src not in self._crop_busy:
+            threading.Thread(target=self._crop_preheat,
+                             args=(tag, src), daemon=True).start()
+
+        def _apply():
+            rect = self._crop_cache.get(src)
+            if rect:
+                self.root.after(0, lambda r=rect: self._crop_apply(tag, r))
+            else:
+                self.root.after(0, lambda: self.status_lbl.config(
+                    text="No black bars detected on the %s video." % name))
+
+        threading.Thread(target=_apply, daemon=True).start()
+
+    def _crop_clear(self):
+        """Remove the crop on the current video."""
+        tag = self._crop_tag
+        self._pip_crop_off(tag)
+        name = "Movie" if tag == "A" else "Reaction"
+        self.status_lbl.config(text="Crop removed on %s (full frame)." % name)
+
+    def _on_crop_tag(self, tag):
+        self._crop_tag = tag
+        for t, b in self._crop_tag_btns.items():
+            if t == tag:
+                b.state(["pressed"])
+            else:
+                b.state(["!pressed"])
+        name = "Movie" if tag == "A" else "Reaction"
+        self.status_lbl.config(text="Cropping %s." % name)
+
+    def _list_yt_subs(self, tag):
+        """Fetch YouTube subtitle options for a source (background)."""
+        src = self._srcs.get(tag)
+        p = self.players.get(tag)
+        if not (src and is_youtube(src) and p and p.running):
+            return
+        if self._yt_subs.get(tag):
+            return
+        try:
+            subs = yt_subtitle_repo(src)
+        except Exception:
+            subs = []
+        if subs:
+            self._yt_subs[tag] = subs
+            try:
+                self.root.after(0, self._refresh_tracks)
+            except Exception:
+                pass
+
+    def _load_yt_sub(self, tag, sub):
+        """Download a YouTube subtitle (auto or uploaded) and attach to mpv."""
+        p = self.players.get(tag)
+        src = self._srcs.get(tag)
+        name = "Movie" if tag == "A" else "Reaction"
+        if not (p and p.running and src):
+            return
+        if self._yt_sub_lock.get(tag):
+            self.status_lbl.config(text="A subtitle is still downloading for %s." % name)
+            return
+        self._yt_sub_lock[tag] = True
+        ok = False
+        try:
+            lbl = sub.get("label") or sub.get("lang") or "subtitle"
+            self.status_lbl.config(text="Downloading %s subtitle for %s..." % (lbl, name))
+            ytdl = shutil.which("yt-dlp")
+            if not ytdl:
+                return
+            outdir = os.path.join(tempfile.gettempdir(), "syncplayer_subs")
+            os.makedirs(outdir, exist_ok=True)
+            tmpl = os.path.join(outdir, "%(id)s.%(ext)s")
+            args = [ytdl, "--skip-download",
+                    "--write-auto-subs" if sub.get("auto") else "--write-subs",
+                    "--subs-langs", sub["lang"], "--subs-format", "vtt",
+                    "--no-warnings", "--no-playlist", "--output", tmpl, src]
+            out = subprocess.run(args, capture_output=True, text=True, timeout=300)
+            if out.returncode == 0:
+                cand = sorted(glob.glob(os.path.join(outdir, "*.vtt")),
+                              key=os.path.getmtime, reverse=True)
+                if cand and os.path.isfile(cand[0]):
+                    path = cand[0]
+                    p.cmd({"command": ["sub-add", path, "select", lbl, sub["lang"]]})
+                    ok = True
+        except Exception:
+            ok = False
+        finally:
+            self._yt_sub_lock[tag] = False
+            if ok:
+                # drop the option so the picker shows the newly added track
+                self._yt_subs[tag] = [s for s in self._yt_subs.get(tag, [])
+                                      if not (s.get("lang") == sub["lang"]
+                                              and s.get("auto") == sub["auto"])]
+                try:
+                    self.root.after(700, self._refresh_tracks)
+                except Exception:
+                    pass
+                self.status_lbl.config(text="Subtitle '%s' attached to %s."
+                                          % (sub.get("label") or sub.get("lang"), name))
+            else:
+                self.status_lbl.config(text="Couldn't fetch that subtitle for %s." % name)
 
     def _set_pip_asp(self, asp):
         self._pip_int_asp = asp
@@ -2710,9 +3048,16 @@ class SyncApp:
     def _fmt(pos, dur):
         if pos is None:
             return "--:--"
-        s = "%02d:%02d" % (int(pos // 60), int(pos % 60))
+
+        def _hms(v):
+            v = max(0.0, float(v))
+            if v >= 3600.0:
+                return "%d:%02d:%02d" % (int(v // 3600), int(v // 60 % 60), int(v % 60))
+            return "%02d:%02d" % (int(v // 60), int(v % 60))
+
+        s = _hms(pos)
         if dur:
-            s += " / %02d:%02d" % (int(dur // 60), int(dur % 60))
+            s += " / " + _hms(dur)
         return s
 
     # -- config -------------------------------------------------------------

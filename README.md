@@ -94,6 +94,17 @@ together for the whole runtime.**
   itself when the black-bar crop turns on/off.
 - **🎵 Tracks**: per-video pickers for **audio** and **subtitles**, built
   from the file's own streams (language + title shown; Off disables).
+- **🌐 YouTube subtitles**: for a URL source, the Tracks picker also lists
+  the video's **uploaded subtitles AND auto-generated (ASR) captions**
+  (fetched via yt-dlp); picking one downloads it and attaches it live.
+- **⬛ Manual crop**: a dedicated *Crop* section lets you kill baked-in
+  black bars by hand — per-video **Top/Bottom/Left/Right** − / + nudges
+  (8 px per press), **⭯ Auto** (re-run detection) and **✖ Clear**. Works
+  on the regular window (not just PiP).
+- **🎯 Editable timecode**: the master seek row has a **Go-to** box — type
+  `90`, `83:45` or `1:23:45` and hit Enter to jump both videos there
+  (no scrubbing). The time labels show **HH:MM:SS** once a video is over
+  an hour (MM:SS below it).
 - **Click-to-pause mirrors to both** windows, so they never fight each
   other; **double-clicking a video fullscreens it and never pauses** (the
   deferred single-click pause is cancelled by the double-click), so both
@@ -115,13 +126,14 @@ together for the whole runtime.**
 
 ```
 syncplayer.py        # the whole app (panel + two mpv drivers + sync loop)
-selftest.py          # 41-check headless verification (python selftest.py)
-gui_test.py          # 165-check END-TO-END test: drives the real GUI + real
+selftest.py          # 48-check headless verification (python selftest.py)
+gui_test.py          # 173-check END-TO-END test: drives the real GUI + real
                      # mpv processes (python gui_test.py) — bars track, per-
                      # video seeks, drift correction, volume read-back from
                      # mpv, speed, pause, Sync Lock, PiP, frame-step, tracks,
                      # PiP black-bar crop & guard, double-click fullscreen,
-                     # PiP size, free-form window resize
+                     # PiP size, free-form resize, manual crop, Go-to timecode,
+                     # yt subtitle merge
 make_testclips.sh    # regenerates the demo clips (needs ffmpeg)
 make_icon.py         # regenerates icon.png / icon.ico
 dist/SyncPlayer.exe  # PyInstaller onefile build

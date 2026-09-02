@@ -823,6 +823,62 @@ pump(0.5)
 app._toggle_lock()
 check("x: pip size - lock released after tests", not app.sync_locked)
 
+# --------- 11y. Y-series: manual crop, HH:MM:SS + Go-to, yt subtitle merge ---
+# 1) time format: MM:SS under an hour, HH:MM:SS over
+check("fmt: under an hour -> MM:SS", app._fmt(90, 120) == "01:30 / 02:00",
+      app._fmt(90, 120))
+check("fmt: over an hour -> HH:MM:SS",
+      app._fmt(3723.5, 4100) == "1:02:03 / 1:08:20", app._fmt(3723.5, 4100))
+
+# 2) manual crop on a regular (non-PiP) window - A is playing
+app._crop_tag = "A"
+w0, h0 = app._crop_video_dims("A")
+app._crop_nudge("bottom", 1)
+pump(0.5)
+_e1, _c1 = app.players["A"].get_property("video-crop", timeout=3.0)
+check("crop: manual bottom nudge applies a crop", _e1 == "success" and bool(_c1),
+      "vc=%r" % (_c1,))
+app._crop_nudge("top", 1)
+pump(0.4)
+_e2, _c2 = app.players["A"].get_property("video-crop", timeout=3.0)
+check("crop: manual top nudge moves the crop origin",
+      _e2 == "success" and bool(_c2) and _c2 != _c1, "vc2=%r vc1=%r" % (_c2, _c1))
+app._crop_clear()
+pump(0.4)
+_e3, _c3 = app.players["A"].get_property("video-crop", timeout=3.0)
+check("crop: manual clear removes the crop", _e3 == "success" and _c3 in ("", None),
+      "vc=%r" % (_c3,))
+
+# 3) editable timecode: Go-to seeks both (clamped to the longest duration)
+app.goto_var.set("90")
+app._on_goto()
+pump(0.6)
+_e4, _gp = app.players["A"].get_property("time-pos", timeout=3.0)
+_lim = max(app.last_dur.get("A") or 0, app.last_dur.get("B") or 0)
+check("goto: typed timecode seeks (clamped to duration)",
+      _e4 == "success" and _gp is not None and _gp >= _lim - 0.6, "pos=%r lim=%r" % (_gp, _lim))
+app.goto_var.set("not-a-time")
+app._on_goto()   # must not throw / must not seek away
+
+# 4) yt subtitle merge: options appear in the subtitle picker (seeded)
+app._srcs["A"] = "https://www.youtube.com/watch?v=TEST"
+app._yt_subs["A"] = [{"lang": "en", "auto": True, "label": "English [en] (auto)"},
+                     {"lang": "fr", "auto": False, "label": "French [fr]"}]
+app._refresh_tracks()
+_vals = list(app.combo_sub["A"].cget("values"))
+check("yt subs: merged into the subtitle picker",
+      "English [en] (auto)" in _vals and "French [fr]" in _vals, "vals=%s" % _vals)
+_psample = ("[info] Available automatic captions for the video:\n"
+            "Language      Name\nen            English\n"
+            "[info] Available subtitles for the video:\n"
+            "Language      Name\nfr            French\n")
+_psubs = sp.yt_parse_list_subs(_psample)
+check("yt subs: parser splits auto vs uploaded",
+      any(s["auto"] and s["lang"] == "en" for s in _psubs)
+      and any((not s["auto"]) and s["lang"] == "fr" for s in _psubs),
+      "n=%d" % len(_psubs))
+app._srcs["A"] = app._srcs["A"]  # keep as-is (no later section depends on it)
+
 # ------------------------------------------------------ 12. screenshots --
 before = set(os.listdir(sp.SHOT_DIR)) if os.path.isdir(sp.SHOT_DIR) else set()
 app._shot()
