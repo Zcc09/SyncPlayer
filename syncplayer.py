@@ -618,6 +618,13 @@ class MpvDriver:
             pass
 
         title = "SyncPlayer — Movie" if tag == "A" else "SyncPlayer — Reaction"
+        # capture mpv's output so a crash on another machine is diagnosable
+        self._mpv_log = None
+        try:
+            self._mpv_log = open(os.path.join(SHOT_DIR, "mpv_%s.log" % tag),
+                                  "w", encoding="utf-8", errors="replace")
+        except Exception:
+            self._mpv_log = None
         mpv = find_mpv()
         if not mpv:
             raise MpvNotFoundError(
@@ -639,7 +646,7 @@ class MpvDriver:
                 "--keep-open=yes",
                 "--keepaspect=yes",
                 "--keepaspect-window=no",   # free-form window resize (no aspect snap)
-                "--hwdec=auto",
+                "--hwdec=safe",
                 "--fs=no",
                 "--ytdl=yes",
                 "--force-window=yes",
@@ -750,6 +757,12 @@ class MpvDriver:
     def _stdout_reader(self):
         try:
             for line in self.proc.stdout:
+                if self._mpv_log:
+                    try:
+                        self._mpv_log.write(line)
+                        self._mpv_log.flush()
+                    except Exception:
+                        pass
                 if line.startswith(STATUS_PREFIX):
                     self._parse_status(line[len(STATUS_PREFIX):].strip())
                 elif "SYNCPOS|" in line:
@@ -785,6 +798,11 @@ class MpvDriver:
         except Exception:
             pass
         finally:
+            if self._mpv_log:
+                try:
+                    self._mpv_log.close()
+                except Exception:
+                    pass
             if not self.stopped.is_set():
                 self.q.put(("exit", None))
                 # NOTE: never call self.on_exit() here — it would run on this
@@ -3228,7 +3246,31 @@ class SyncApp:
         self.root.destroy()
 
 
+def _install_crash_hook():
+    import traceback
+    def hook(exc_type, exc, tb):
+        msg = "".join(traceback.format_exception(exc_type, exc, tb))
+        logp = os.path.join(SHOT_DIR, "syncplayer_crash.txt")
+        try:
+            with open(logp, "a", encoding="utf-8") as f:
+                f.write("\n===== %s =====\n%s\n" % (
+                    time.strftime("%Y-%m-%d %H:%M:%S"), msg))
+        except Exception:
+            pass
+        if "--smoke" in sys.argv:
+            return   # don't block the auto-close in packaged smoke tests
+        try:
+            from tkinter import messagebox
+            messagebox.showerror(APP_NAME,
+                "SyncPlayer hit an error and closed.\n\n%s\n\nLog: %s"
+                % (msg[-400:], logp))
+        except Exception:
+            pass
+    sys.excepthook = hook
+
+
 def main():
+    _install_crash_hook()
     try:  # keep the GUI sharp on HiDPI
         ctypes.windll.shcore.SetProcessDpiAwareness(1)
     except Exception:

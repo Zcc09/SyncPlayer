@@ -205,6 +205,13 @@ def _gui_main(install_dir, no_shortcuts, launch):
     root.geometry("480x220")
     root.resizable(False, False)
     root.configure(bg="#1f232b")
+    try:
+        root.lift()
+        root.attributes("-topmost", True)
+        root.after(300, lambda: root.attributes("-topmost", False))
+        root.focus_force()
+    except Exception:
+        pass
 
     status = tk.StringVar(value="Preparing to install...")
     tk.Label(root, textvariable=status, fg="#e8e8ea", bg="#1f232b",
