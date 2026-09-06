@@ -50,6 +50,13 @@ except Exception:
 from tkinter import ttk, filedialog, messagebox
 
 APP_NAME = "SyncPlayer"
+APP_VERSION = "1.4.0"
+
+
+class MpvNotFoundError(Exception):
+    """Raised when mpv cannot be located (not bundled, not on PATH)."""
+
+
 if getattr(sys, "frozen", False):
     # packaged exe: keep data out of the exe's folder (e.g. Desktop)
     BASE = os.path.dirname(sys.executable)
@@ -190,14 +197,37 @@ _mpv_cache = None
 _ffprobe_cache = None
 
 
+def _bundled_mpv():
+    """Return a path to an mpv.exe shipped next to the app (self-contained
+    installs), or None. Uses the executable dir when frozen, else the source
+    dir. This is the fix for "stuck at starting" on a machine with no mpv
+    on PATH - the installer puts mpv in <exe dir>\mpv\."""
+    if getattr(sys, "frozen", False):
+        base = os.path.dirname(sys.executable)
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    for cand in (os.path.join(base, "mpv", "mpv.exe"),
+                 os.path.join(base, "mpv.exe")):
+        if os.path.isfile(cand):
+            return cand
+    return None
+
+
 def find_mpv():
     global _mpv_cache
     if _mpv_cache:
         return _mpv_cache
+    # 1) explicit override
     env = os.environ.get("MPV_PATH")
     if env and os.path.isfile(env):
         _mpv_cache = env
         return env
+    # 2) mpv bundled next to the app (self-contained install)
+    bundled = _bundled_mpv()
+    if bundled:
+        _mpv_cache = bundled
+        return bundled
+    # 3) PATH
     found = shutil.which("mpv")
     if found:
         # prefer the real exe over mpv.com (the console-hiding shim breaks pipes)
@@ -207,6 +237,7 @@ def find_mpv():
                 found = exe
         _mpv_cache = found
         return found
+    # 4) common install dirs
     for c in (r"C:\Program Files\MPV Player\mpv.exe",
               r"C:\Tools\mpv\mpv.exe",
               os.path.expanduser(r"~\AppData\Local\Programs\mpv\mpv.exe"),
@@ -215,8 +246,8 @@ def find_mpv():
         if os.path.isfile(c):
             _mpv_cache = c
             return c
-    _mpv_cache = "mpv"
-    return _mpv_cache
+    _mpv_cache = None
+    return None
 
 
 def detect_crop_rect(src, duration=None, timeout=30):
@@ -239,8 +270,11 @@ def detect_crop_rect(src, duration=None, timeout=30):
     if duration and duration > 8:
         start = min(2.0, duration * 0.2)
     try:
+        mpv = find_mpv()
+        if not mpv:
+            return None
         proc = subprocess.run(
-            [find_mpv(), "--no-config", "--input-terminal=no",
+            [mpv, "--no-config", "--input-terminal=no",
              "--vo=null", "--no-audio", "--keep-open=no",
              "--frames=75", "--start=%.2f" % start, "-v",
              "--vf=lavfi-cropdetect=32:2:16", src],
@@ -571,7 +605,12 @@ class MpvDriver:
             pass
 
         title = "SyncPlayer — Movie" if tag == "A" else "SyncPlayer — Reaction"
-        args = [find_mpv(),
+        mpv = find_mpv()
+        if not mpv:
+            raise MpvNotFoundError(
+                "mpv was not found. Install SyncPlayer (it bundles mpv), or "
+                "put mpv on PATH, or set the MPV_PATH environment variable.")
+        args = [mpv,
                 "--no-config",
                 "--input-ipc-server=%s" % pipe_name,
                 "--input-conf=%s" % self.input_conf,
@@ -1605,11 +1644,17 @@ class SyncApp:
             rb = resolve_url(b)
         # YouTube URLs are passed straight to mpv (--ytdl=yes).
 
-        self.players["A"] = MpvDriver(ra, "A", on_pause=self._on_player_pause,
-                                      on_exit=self._on_exit,
-                                      start_paused=True)
-        self.players["B"] = MpvDriver(rb, "B", on_pause=self._on_player_pause,
-        on_exit=self._on_exit, start_paused=True)
+        try:
+            self.players["A"] = MpvDriver(ra, "A", on_pause=self._on_player_pause,
+                                          on_exit=self._on_exit,
+                                          start_paused=True)
+            self.players["B"] = MpvDriver(rb, "B", on_pause=self._on_player_pause,
+            on_exit=self._on_exit, start_paused=True)
+        except MpvNotFoundError as _e:
+            self.btn_play.config(state="normal")
+            self.status_lbl.config(text="mpv not found")
+            messagebox.showerror(APP_NAME, str(_e))
+            return
         self.started = True
         self.paused = True   # loaded PAUSED: Play/Space starts both videos
         self.sync_off = 0.0

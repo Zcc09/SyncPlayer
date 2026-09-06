@@ -18,7 +18,9 @@ together for the whole runtime.**
 
 ## Quick start
 
-1. **`SyncPlayer.exe`** (Desktop) — double-click to open the panel.
+1. **Install** with `SyncPlayer-Setup.exe` (installs the app **plus a bundled
+   mpv**, so nothing else is needed on the machine). Then launch
+   **SyncPlayer** from the Desktop / Start-Menu shortcut.
 2. Source A = your movie (Browse… or URL…), Source B = the reaction.
 3. Hit **Start** — both videos load **paused** and open side by side.
 4. Press **▶ Play** (transport or Master row, or `Space`) when ready.
@@ -28,6 +30,10 @@ together for the whole runtime.**
    one frame at a time.
 6. Let it run — SyncPlayer gently re-syncs any drift, so they stay locked.
 7. Balance the two **volume sliders**, then enjoy.
+
+> **Updates**: run **SyncPlayer — Check for Updates** (Start Menu) — it
+> fetches the latest **SyncPlayer** and **mpv** releases and installs
+> whatever is missing or outdated. No account or token needed.
 
 > URLs: paste a YouTube link into either source. It streams via mpv's
 > built-in yt-dlp (no download needed).
@@ -122,15 +128,17 @@ together for the whole runtime.**
 
 ## Requirements
 
-- Windows, **mpv** installed (`winget install shinchiro.mpv`), optional
-  **yt-dlp** for URLs.
-- The exe bundles everything else.
+- Windows 10/11. **mpv is bundled** by the installer — nothing else to
+  install (the updater keeps mpv current too). Optional **yt-dlp** for URLs
+  (used by the app's subtitle fetcher).
+- The bare `SyncPlayer.exe` (a standalone asset) still needs mpv present; the
+  **installer is the recommended** way to get a working app.
 
 ## For developers
 
 ```
 syncplayer.py        # the whole app (panel + two mpv drivers + sync loop)
-selftest.py          # 51-check headless verification (python selftest.py)
+selftest.py          # 59-check headless verification (python selftest.py)
 gui_test.py          # 179-check END-TO-END test: drives the real GUI + real
                      # mpv processes (python gui_test.py) — bars track, per-
                      # video seeks, drift correction, volume read-back from
@@ -138,17 +146,38 @@ gui_test.py          # 179-check END-TO-END test: drives the real GUI + real
                      # PiP black-bar crop & guard, double-click fullscreen,
                      # PiP size, free-form resize, manual crop, Go-to timecode,
                      # yt subtitle merge, crop persistence + Auto re-probe
+installer.py         # self-contained installer (bundles app + mpv + updater)
+updater.py           # checks/installs latest SyncPlayer + mpv releases
 make_testclips.sh    # regenerates the demo clips (needs ffmpeg)
 make_icon.py         # regenerates icon.png / icon.ico
-dist/SyncPlayer.exe  # PyInstaller onefile build
+dist/SyncPlayer.exe        # PyInstaller onefile build
+dist/SyncPlayer-Setup.exe  # installer (primary download)
+dist/SyncPlayer-Updater.exe# updater (GUI)
 ```
 
-Rebuild the exe:
+Build the app exe, then the installer and updater:
 
 ```
+# 1. app exe
 python -m PyInstaller --noconfirm --clean --onefile --windowed \
   --name SyncPlayer --icon icon.ico --version-file version_info.txt syncplayer.py
+
+# 2. updater (no bundled data)
+python -m PyInstaller --noconfirm --clean --onefile --windowed \
+  --name SyncPlayer-Updater --icon icon.ico updater.py
+
+# 3. installer (bundles the app exe + mpv distro + updater)
+cp dist/SyncPlayer.exe bundle/SyncPlayer.exe
+cp dist/SyncPlayer-Updater.exe bundle/SyncPlayer-Updater.exe
+python -m PyInstaller --noconfirm --clean --onefile --windowed \
+  --name SyncPlayer-Setup --icon icon.ico installer.py \
+  --add-data "bundle/SyncPlayer.exe;." \
+  --add-data "bundle/SyncPlayer-Updater.exe;." \
+  --add-data "bundle/mpv;mpv"
 ```
+
+The `bundle/mpv` dir is the extracted mpv Windows distro (not committed — it
+is large and rebuilt by the installer build; `bundle/` is gitignored).
 
 ### How the sync works (architecture)
 

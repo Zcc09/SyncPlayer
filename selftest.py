@@ -70,6 +70,56 @@ check("sync math: no correct when dragging",
       sp.needs_correction(110.0, 100.0, 0.0, dragging=True) is False)
 check("sync math: correct when drifted", sp.needs_correction(110.0, 100.0, 0.0) is True)
 
+
+# ------------------------------------------------ 1b. mpv discovery (bundled) --
+def _bundled_mpv_scenarios():
+    import shutil, tempfile
+    d = tempfile.mkdtemp()
+    saved_frozen = getattr(sp.sys, "frozen", None)
+    saved_exec = sp.sys.executable
+    res = {"found": False, "right": False, "missing": False}
+    try:
+        os.makedirs(os.path.join(d, "mpv"))
+        open(os.path.join(d, "mpv", "mpv.exe"), "w").write("x")
+        sp._mpv_cache = None
+        sp.sys.frozen = True
+        sp.sys.executable = os.path.join(d, "SyncPlayer.exe")
+        b = sp._bundled_mpv()
+        res["found"] = b is not None
+        res["right"] = bool(b) and b.endswith(os.path.join("mpv", "mpv.exe"))
+        # absent -> None
+        os.remove(os.path.join(d, "mpv", "mpv.exe"))
+        os.rmdir(os.path.join(d, "mpv"))
+        sp._mpv_cache = None
+        res["missing"] = sp._bundled_mpv() is None
+    finally:
+        sp._mpv_cache = None
+        if saved_frozen is None:
+            try:
+                del sp.sys.frozen
+            except Exception:
+                pass
+        else:
+            sp.sys.frozen = saved_frozen
+        sp.sys.executable = saved_exec
+        shutil.rmtree(d, ignore_errors=True)
+    return res
+
+
+_mr = _bundled_mpv_scenarios()
+check("mpv discovery: bundled mpv found next to exe", _mr["found"])
+check("mpv discovery: returns mpv\\mpv.exe", _mr["right"])
+check("mpv discovery: absent -> None", _mr["missing"])
+
+
+# ------------------------------------------------ 1c. updater version logic --
+import updater as _up
+check("updater: parse v0.41.0", _up.parse_version("v0.41.0") == (0, 41, 0))
+check("updater: parse 1.4.0", _up.parse_version("1.4.0") == (1, 4, 0))
+check("updater: parse dev string", _up.parse_version("0.41.0-dev-g41f6a6450") == (0, 41, 0))
+check("updater: ver_gt newer", _up.ver_gt("1.4.0", "1.3.1") is True)
+check("updater: ver_gt equal", _up.ver_gt("0.41.0", "0.41.0") is False)
+
 # ---------------------------------------------------------------- 2. parse --
 check("parse: plain seconds", sp.MpvDriver._to_seconds("123.45") == 123.45)
 check("parse: HH:MM:SS.mmm", abs(sp.MpvDriver._to_seconds("01:02:03.500") - 3723.5) < 1e-6)

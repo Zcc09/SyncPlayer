@@ -17,3 +17,8 @@ screenshots/
 *.bak2
 *.log
 _out*.txt
+
+# Installer / updater bundle + artifacts (large, machine-built)
+bundle/
+installer/
+*.iss
