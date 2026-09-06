@@ -128,11 +128,11 @@ together for the whole runtime.**
 
 ## Requirements
 
-- Windows 10/11. **mpv is bundled** by the installer — nothing else to
-  install (the updater keeps mpv current too). Optional **yt-dlp** for URLs
-  (used by the app's subtitle fetcher).
-- The bare `SyncPlayer.exe` (a standalone asset) still needs mpv present; the
-  **installer is the recommended** way to get a working app.
+- Windows 10/11. **mpv and yt-dlp are bundled** by the installer — nothing
+  else to install, and **YouTube links work out of the box** (the updater
+  keeps mpv + yt-dlp current too). Optional **yt-dlp** not needed separately.
+- The bare `SyncPlayer.exe` (a standalone asset) still needs mpv + yt-dlp
+  present; the **installer is the recommended** way to get a working app.
 
 ## For developers
 
@@ -146,8 +146,11 @@ gui_test.py          # 179-check END-TO-END test: drives the real GUI + real
                      # PiP black-bar crop & guard, double-click fullscreen,
                      # PiP size, free-form resize, manual crop, Go-to timecode,
                      # yt subtitle merge, crop persistence + Auto re-probe
-installer.py         # self-contained installer (bundles app + mpv + updater)
-updater.py           # checks/installs latest SyncPlayer + mpv releases
+installer.py         # self-contained installer (bundles app + mpv + yt-dlp + updater)
+updater.py           # checks/installs latest SyncPlayer + mpv + yt-dlp releases
+install_test.py      # 15-check DEPLOYMENT test: runs the real installer, then
+                     # verifies the installed app plays TWO videos (one a
+                     # YouTube link) using the bundled mpv + yt-dlp
 make_testclips.sh    # regenerates the demo clips (needs ffmpeg)
 make_icon.py         # regenerates icon.png / icon.ico
 dist/SyncPlayer.exe        # PyInstaller onefile build

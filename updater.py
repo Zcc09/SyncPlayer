@@ -31,6 +31,7 @@ import zipfile
 APP_NAME = "SyncPlayer"
 SYNC_REPO = "Zcc09/SyncPlayer"
 MPV_REPO = "mpv-player/mpv"
+YTDLP_REPO = "yt-dlp/yt-dlp"
 # The mpv release tag that our bundled build corresponds to (used as the
 # baseline "current" version when install.json has no mpv_version).
 MPV_RELEASE_VERSION = "0.41.0"
@@ -234,6 +235,21 @@ def run_check(install_dir):
         }
     except Exception as e:
         out["mpv"] = {"error": str(e)}
+    # yt-dlp (bundled alongside mpv; needed for YouTube links)
+    try:
+        yt = github_latest(YTDLP_REPO)
+        ytdlp_path = os.path.join(install_dir, "mpv", "yt-dlp.exe")
+        present = os.path.isfile(ytdlp_path)
+        cur = st.get("ytdlp_version") or ("present" if present else "0")
+        out["ytdlp"] = {
+            "current": cur,
+            "latest": yt["version"],
+            "available": ver_gt(yt["version"], cur),
+            "missing": not present,
+            "asset": yt["assets"].get("yt-dlp.exe"),
+        }
+    except Exception as e:
+        out["ytdlp"] = {"error": str(e)}
     return out
 
 
@@ -268,6 +284,21 @@ def apply_updates(install_dir, check, progress=None):
         else:
             log.append("mpv update requested but no matching asset found.")
 
+    ytdlp = check.get("ytdlp", {})
+    ytdlp_url = ytdlp.get("asset", {}).get("url") if ytdlp.get("asset") else None
+    if ytdlp.get("missing") or ytdlp.get("available"):
+        if ytdlp_url:
+            log.append("Updating yt-dlp...")
+            tmp = tempfile.mktemp(suffix=".exe")
+            download(ytdlp_url, tmp, progress=progress)
+            mpv_dir = os.path.join(install_dir, "mpv")
+            os.makedirs(mpv_dir, exist_ok=True)
+            replace_file(tmp, os.path.join(mpv_dir, "yt-dlp.exe"))
+            os.remove(tmp)
+            log.append("yt-dlp installed/updated.")
+        else:
+            log.append("yt-dlp update requested but no asset found.")
+
     # Persist a fresh install.json so future checks have a baseline.
     exe = os.path.join(install_dir, APP_NAME + ".exe")
     state = {
@@ -275,6 +306,7 @@ def apply_updates(install_dir, check, progress=None):
             "current", "0.0.0"),
         "mpv_version": check.get("mpv", {}).get("latest",
                                                 MPV_RELEASE_VERSION),
+        "ytdlp_version": check.get("ytdlp", {}).get("latest", "0"),
         "install_dir": os.path.abspath(install_dir),
         "installed_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }

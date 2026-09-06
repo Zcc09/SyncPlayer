@@ -213,6 +213,18 @@ def _bundled_mpv():
     return None
 
 
+def _prepend_path(d):
+    """Put d at the front of PATH so the bundled yt-dlp.exe and the FFmpeg
+    DLLs next to mpv are discoverable by the mpv subprocess (and its
+    ytdl_hook), so a YouTube URL plays on a fresh machine with no yt-dlp
+    installed globally."""
+    if not d:
+        return
+    path = os.environ.get("PATH", "")
+    if path and d.lower() not in path.lower().split(os.pathsep):
+        os.environ["PATH"] = d + os.pathsep + path
+
+
 def find_mpv():
     global _mpv_cache
     if _mpv_cache:
@@ -225,6 +237,7 @@ def find_mpv():
     # 2) mpv bundled next to the app (self-contained install)
     bundled = _bundled_mpv()
     if bundled:
+        _prepend_path(os.path.dirname(bundled))
         _mpv_cache = bundled
         return bundled
     # 3) PATH
