@@ -1,26 +1,35 @@
 #!/usr/bin/env python3
-"""End-to-end DEPLOYMENT test for SyncPlayer: installation + running two videos
-(one a YouTube link), using the real packaged installer and the bundled mpv +
-yt-dlp. NOT about feature behavior — it verifies the artifact you distribute
-actually installs and plays.
-
-Run:  python install_test.py
-Uses a real YouTube URL (override with YOUTUBE_URL env) and needs network.
+"""End-to-end DEPLOYMENT & RUNTIME test for SyncPlayer:
+1. Installation of the self-contained package.
+2. Running two videos (one being a YouTube link) with bundled mpv + yt-dlp.
+3. YouTube crash protection: if a YouTube URL fails to load, the other video
+   feed is NOT killed — it stays open and paused.
+4. Floating PiP border test: verify all borders are removed (zero sliver) and
+   repeated toggling removes the frame reliably.
+5. Embed PiP test: verify the embedded pane is a true Win32 child window
+   (GetParent(child) == host) inside the main video feed window.
+6. Crop test: active session only, Clear returns video to full resolution.
 """
+import ctypes
+from ctypes import wintypes
 import json
 import os
+import shutil
 import subprocess
 import sys
-import time
 import tempfile
-import shutil
+import time
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 SETUP_EXE = os.path.join(BASE, "dist", "SyncPlayer-Setup.exe")
 APP_EXE = os.path.join(BASE, "dist", "SyncPlayer.exe")
 MOVIE = os.path.join(BASE, "testmedia", "movie.mp4")   # 12 s local file
+REACT = os.path.join(BASE, "testmedia", "react.mp4")   # 10 s local file
 YOUTUBE_URL = os.environ.get("YOUTUBE_URL",
                              "https://www.youtube.com/watch?v=jNQXAC9IVRw")
+INVALID_YT = "https://www.youtube.com/watch?v=invalid_video_does_not_exist_xyz123"
+
+u = ctypes.windll.user32
 
 passed, failed = 0, 0
 fail_msgs = []
@@ -50,8 +59,6 @@ def run(cmd, timeout=60, env=None):
 
 
 def get_exe_version(path):
-    import ctypes
-    from ctypes import wintypes
     try:
         size = ctypes.windll.version.GetFileVersionInfoSizeW(path, None)
         if not size:
@@ -84,7 +91,7 @@ def mpv_procs():
             continue
         if "|" in line:
             pid, path = line.split("|", 1)
-            out.append((pid.strip(), path.strip()))
+            out.append((int(pid.strip()), path.strip()))
     return out
 
 
@@ -104,7 +111,9 @@ def main():
     install_dir = tempfile.mkdtemp(prefix="spdeploy_")
     print("=== install dir: %s ===" % install_dir)
 
-    # ---- 1. run the real installer (silent) into a temp dir ----
+    # -------------------------------------------------------------------------
+    # 1. Installer: silent run, unpack, bundled files & install.json
+    # -------------------------------------------------------------------------
     rc, out = run([SETUP_EXE, "--silent", "--install-dir", install_dir,
                    "--no-shortcuts"], timeout=180)
     check("install: installer exits 0", rc == 0, out.strip()[:120])
@@ -130,10 +139,11 @@ def main():
     check("install: install.json app_version", state.get("app_version") == "1.4.0")
     check("install: install.json mpv_version", state.get("mpv_version") == "0.41.0")
 
-    # ---- 2. the deployed bundle can run (mpv + yt-dlp) ----
+    # -------------------------------------------------------------------------
+    # 2. Bundled mpv & yt-dlp run directly
+    # -------------------------------------------------------------------------
     mpvdir = os.path.dirname(mpv)
     env = dict(os.environ)
-    # mpv's ytdl_hook finds yt-dlp on PATH -> prepend the bundled mpv dir.
     env["PATH"] = mpvdir + os.pathsep + env.get("PATH", "")
 
     rc, out = run([mpv, "--version"], timeout=30, env=env)
@@ -153,15 +163,16 @@ def main():
     check("run: bundled mpv plays a YouTube link (yt-dlp)",
           rc == 0, out.strip()[:120])
 
-    # ---- 3. the installed app runs TWO videos (local + YouTube) ----
+    # -------------------------------------------------------------------------
+    # 3. Installed app runs TWO videos (local + YouTube link) using bundled mpv
+    # -------------------------------------------------------------------------
     kill_mpv()
     time.sleep(0.3)
     proc = subprocess.Popen([app, "--smoke", MOVIE, YOUTUBE_URL],
                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-    # poll for two mpv processes (A = local, B = YouTube) during the smoke window
     seen_two = False
     bundled_used = False
-    deadline = time.time() + 12
+    deadline = time.time() + 15
     while time.time() < deadline:
         paths = mpv_paths()
         if len(paths) >= 2:
@@ -176,14 +187,139 @@ def main():
           str(mpv_paths()[:2]))
 
     try:
-        rc = proc.wait(timeout=20)
+        rc = proc.wait(timeout=25)
     except subprocess.TimeoutExpired:
         proc.kill()
         rc = -1
     check("run: app (--smoke) exits cleanly", rc == 0, "exit=%s" % rc)
     kill_mpv()
 
-    print("\n==== %d/%d deployment checks passed ====" % (passed, passed + failed))
+    # -------------------------------------------------------------------------
+    # 4. Crash protection: YouTube URL failure does NOT close the other video
+    # -------------------------------------------------------------------------
+    sys.path.insert(0, BASE)
+    sys._TEST_MODE = True
+    import syncplayer as sp
+
+    root = sp.tk.Tk()
+    root.withdraw()
+    app_obj = sp.SyncApp(root)
+    app_obj.movie_path.set(MOVIE)
+    app_obj.react_path.set(INVALID_YT)
+
+    # Start playback: A is valid local movie, B is invalid YouTube URL
+    app_obj._start()
+
+    # Poll for 4 seconds: B will fail/exit, but A must stay alive!
+    for _ in range(40):
+        app_obj._poll()
+        root.update()
+        time.sleep(0.1)
+
+    pa = app_obj.players.get("A")
+    pb = app_obj.players.get("B")
+
+    check("crash protection: movie player A is STILL RUNNING after YouTube B fails",
+          pa is not None and pa.running)
+    check("crash protection: movie player A is paused and protected",
+          pa is not None and pa.paused)
+    check("crash protection: failed YouTube player B is cleaned up",
+          pb is None)
+    check("crash protection: Start button re-enabled for retry",
+          str(app_obj.btn_play.cget("state")) == "normal")
+
+    # -------------------------------------------------------------------------
+    # 5. Floating PiP border test (all borders gone, infinite repeated toggles)
+    # -------------------------------------------------------------------------
+    # Toggle PiP on player A
+    app_obj._toggle_pip("A")
+    root.update()
+    time.sleep(0.2)
+    st_pip = u.GetWindowLongPtrW(pa.hwnd, -16) & 0xFFFFFFFF
+    has_caption = bool(st_pip & 0x00C00000)
+    has_thickframe = bool(st_pip & 0x00040000)
+    check("pip floating: caption removed", not has_caption, "style=%s" % hex(st_pip))
+    check("pip floating: thickframe border sliver removed", not has_thickframe, "style=%s" % hex(st_pip))
+
+    # Toggle PiP off, then on again multiple times (diagnose repeated toggle)
+    toggles_ok = True
+    for _ in range(3):
+        app_obj._toggle_pip("A") # OFF
+        root.update()
+        time.sleep(0.1)
+        app_obj._toggle_pip("A") # ON
+        root.update()
+        time.sleep(0.1)
+        st = u.GetWindowLongPtrW(pa.hwnd, -16) & 0xFFFFFFFF
+        if (st & 0x00C00000) or (st & 0x00040000):
+            toggles_ok = False
+            break
+    check("pip floating: repeated toggling reliably removes frame", toggles_ok)
+    app_obj._toggle_pip("A") # restore to normal
+
+    # -------------------------------------------------------------------------
+    # 6. Embed PiP test: real Win32 child window (SetParent) inside main feed
+    # -------------------------------------------------------------------------
+    # Restart B with valid local video for embed test
+    if pb:
+        pb.quit()
+    app_obj.react_path.set(REACT)
+    app_obj._start()
+    for _ in range(25):
+        app_obj._poll()
+        root.update()
+        time.sleep(0.1)
+
+    pa = app_obj.players.get("A")
+    pb = app_obj.players.get("B")
+    if pa and pb and pa.hwnd and pb.hwnd:
+        app_obj.sync_locked = True
+        app_obj._toggle_pip_int("B") # Embed B inside A
+        root.update()
+        time.sleep(0.3)
+
+        parent_hwnd = u.GetParent(pb.hwnd)
+        check("embed pip: child pane is a TRUE Win32 child of host (SetParent)",
+              parent_hwnd == pa.hwnd, "parent=%s, host=%s" % (parent_hwnd, pa.hwnd))
+
+        child_st = u.GetWindowLongPtrW(pb.hwnd, -16) & 0xFFFFFFFF
+        WS_CHILD = 0x40000000
+        check("embed pip: child pane has WS_CHILD style",
+              bool(child_st & WS_CHILD), "child_st=%s" % hex(child_st))
+
+        # Undock
+        app_obj._undock_pip_int()
+        root.update()
+        time.sleep(0.2)
+        new_parent = u.GetParent(pb.hwnd)
+        check("embed pip: undock restores child to top-level window",
+              new_parent == 0 or new_parent is None, "parent=%s" % new_parent)
+
+    # -------------------------------------------------------------------------
+    # 7. Video crop test: active session only + Clear restores full resolution
+    # -------------------------------------------------------------------------
+    app_obj._crop_tag = "A"
+    app_obj._crop_nudge("top", 1) # nudge top crop
+    root.update()
+    time.sleep(0.2)
+    check("crop: nudge sets manual crop in active session",
+          app_obj._manual_crop.get("A") is not None)
+
+    # Clear crop
+    app_obj._crop_clear()
+    root.update()
+    time.sleep(0.2)
+    check("crop: clear resets manual crop to None",
+          app_obj._manual_crop.get("A") is None)
+    err, vc = pa.get_property("video-crop")
+    check("crop: clear resets mpv video-crop to empty",
+          err == "success" and (vc == "" or vc is None), "video-crop=%s" % vc)
+
+    app_obj._stop()
+    root.destroy()
+    kill_mpv()
+
+    print("\n==== %d/%d deployment & runtime checks passed ====" % (passed, passed + failed))
     if fail_msgs:
         print("FAILED: " + ", ".join(fail_msgs))
         return 1

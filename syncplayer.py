@@ -225,6 +225,31 @@ def _prepend_path(d):
         os.environ["PATH"] = d + os.pathsep + path
 
 
+_ytdl_cache = None
+
+
+def find_ytdl():
+    """Locate yt-dlp.exe: next to mpv, in %LOCALAPPDATA%\SyncPlayer\mpv, or on PATH."""
+    global _ytdl_cache
+    if _ytdl_cache and os.path.isfile(_ytdl_cache):
+        return _ytdl_cache
+    mpv = find_mpv()
+    if mpv:
+        cand = os.path.join(os.path.dirname(mpv), "yt-dlp.exe")
+        if os.path.isfile(cand):
+            _ytdl_cache = cand
+            return cand
+    local = os.path.join(os.environ.get("LOCALAPPDATA") or "", "SyncPlayer", "mpv", "yt-dlp.exe")
+    if os.path.isfile(local):
+        _ytdl_cache = local
+        return local
+    w = shutil.which("yt-dlp")
+    if w:
+        _ytdl_cache = w
+        return w
+    return None
+
+
 def find_mpv():
     global _mpv_cache
     if _mpv_cache:
@@ -240,17 +265,22 @@ def find_mpv():
         _prepend_path(os.path.dirname(bundled))
         _mpv_cache = bundled
         return bundled
-    # 3) PATH
+    # 3) %LOCALAPPDATA%\SyncPlayer\mpv\mpv.exe (installer target)
+    inst_mpv = os.path.join(os.environ.get("LOCALAPPDATA") or "", "SyncPlayer", "mpv", "mpv.exe")
+    if os.path.isfile(inst_mpv):
+        _prepend_path(os.path.dirname(inst_mpv))
+        _mpv_cache = inst_mpv
+        return inst_mpv
+    # 4) PATH
     found = shutil.which("mpv")
     if found:
-        # prefer the real exe over mpv.com (the console-hiding shim breaks pipes)
         if found.lower().endswith(".com"):
             exe = os.path.join(os.path.dirname(found), "mpv.exe")
             if os.path.isfile(exe):
                 found = exe
         _mpv_cache = found
         return found
-    # 4) common install dirs
+    # 5) common install dirs
     for c in (r"C:\Program Files\MPV Player\mpv.exe",
               r"C:\Tools\mpv\mpv.exe",
               os.path.expanduser(r"~\AppData\Local\Programs\mpv\mpv.exe"),
@@ -630,6 +660,9 @@ class MpvDriver:
             raise MpvNotFoundError(
                 "mpv was not found. Install SyncPlayer (it bundles mpv), or "
                 "put mpv on PATH, or set the MPV_PATH environment variable.")
+        ytdl_bin = find_ytdl()
+        if ytdl_bin:
+            _prepend_path(os.path.dirname(ytdl_bin))
         args = [mpv,
                 "--no-config",
                 "--input-ipc-server=%s" % pipe_name,
@@ -649,11 +682,15 @@ class MpvDriver:
                 "--hwdec=safe",
                 "--fs=no",
                 "--ytdl=yes",
+                ]
+        if ytdl_bin:
+            args.append("--script-opts=ytdl_hook-ytdl_path=%s" % ytdl_bin)
+        args.extend([
                 "--force-window=yes",
                 "--title=%s" % title,
                 "--pause=yes" if start_paused else "--pause=no",
                 src,
-                ]
+                ])
         self.proc = subprocess.Popen(
             args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, text=True, encoding="utf-8",
@@ -1426,13 +1463,9 @@ class SyncApp:
             self._crop_tag_btns[tag] = b
             self._ctrls.append(b)
         self._crop_tag_btns["A"].state(["pressed"])
-        b = ttk.Button(crow, text="\u2b21 Auto", width=8, command=self._crop_auto)
+        b = ttk.Button(crow, text="\u2716 Clear", width=8, command=self._crop_clear)
         b.pack(side="left", padx=(10, 0))
-        Tooltip(b, "Auto-detect and remove the video's baked-in letterbox/pillarbox bars.")
-        self._ctrls.append(b)
-        b = ttk.Button(crow, text="\u2716 Clear", width=7, command=self._crop_clear)
-        b.pack(side="left", padx=(4, 0))
-        Tooltip(b, "Remove the crop (show the full frame again).")
+        Tooltip(b, "Remove crop and return the video to its full resolution.")
         self._ctrls.append(b)
         erow = ttk.Frame(crop)
         erow.pack(fill="x", pady=(5, 0))
@@ -1710,13 +1743,9 @@ class SyncApp:
         self._apply_volumes()
         self._apply_speed()
         self._srcs = {"A": ra, "B": rb}
-        for _t, _s in (("A", ra), ("B", rb)):
-            threading.Thread(target=self._crop_preheat, args=(_t, _s), daemon=True).start()
-        # Re-apply any persisted manual crop (mpv restarts crop-less) once the
-        # players have loaded; _pip_crop_apply re-fits the window too.
-        for _t in ("A", "B"):
-            if self._manual_crop.get(_t):
-                self.root.after(1200, self._crop_apply, _t, self._manual_crop[_t])
+        # Crop is active-session only: reset on start (not persistent across sessions/restarts)
+        self._manual_crop = {"A": None, "B": None}
+        self._pip_crop_saved = {"A": None, "B": None}
         # arrange the two mpv windows side by side once they appear
         threading.Thread(target=self._arrange_thread, daemon=True).start()
 
@@ -1756,6 +1785,46 @@ class SyncApp:
 
     def _arrange_windows(self):
         threading.Thread(target=self._arrange_thread, daemon=True).start()
+
+    def _on_player_exit(self, tag):
+        """Handle exit of player `tag` without killing the other video feed (crash protection)."""
+        name = "Movie" if tag == "A" else "Reaction"
+        other_tag = "B" if tag == "A" else "A"
+        other_name = "Reaction" if tag == "A" else "Movie"
+        other_p = self.players.get(other_tag)
+        p = self.players.get(tag)
+        if p:
+            p.stopped.set()
+        self.players[tag] = None
+        self.last_pos[tag] = None
+
+        if other_p and other_p.running:
+            other_p.set_pause(True)
+            self.paused = True
+            self.btn_play_m.config(text="▶")
+            self.btn_pause_all.config(text="▶  Play")
+            self.btn_play.config(state="normal", text="Start")
+            src = self._srcs.get(tag, "")
+            is_yt = is_youtube(src) or src.startswith("http")
+            self._status_pin = time.monotonic() + 10.0
+            if is_yt:
+                self.status_lbl.config(
+                    text="%s (YouTube stream) failed or closed. %s paused & kept open." % (name, other_name))
+                if "--smoke" not in sys.argv and not getattr(sys, "_TEST_MODE", False):
+                    try:
+                        messagebox.showwarning(
+                            APP_NAME,
+                            "The YouTube stream for %s failed to load or closed unexpectedly.\n\n"
+                            "URL: %s\n\n"
+                            "The %s video has been paused and kept open.\n"
+                            "You can adjust the URL and press Start again." % (name, src, other_name))
+                    except Exception:
+                        pass
+            else:
+                self.status_lbl.config(
+                    text="%s window closed. %s is paused and kept open." % (name, other_name))
+        else:
+            self._stop()
 
     def _stop(self):
         if self.pip_int:
@@ -2375,13 +2444,30 @@ class SyncApp:
         threading.Thread(target=_work, daemon=True).start()
 
     def _crop_clear(self):
-        """Remove the crop on the current video (manual + auto)."""
+        """Remove the crop on current video and return it to full resolution/aspect."""
         tag = self._crop_tag
-        self._manual_crop[tag] = None     # forget it, else _pip_crop_off reapplies it
-        self._pip_crop_off(tag)
+        self._manual_crop[tag] = None
+        p = self.players.get(tag)
+        if p and p.running:
+            p.cmd({"command": ["set_property", "video-crop", ""]})
+            p.cmd({"command": ["set_property", "video-zoom", 0]})
+            p.cmd({"command": ["set_property", "video-pan-x", 0]})
+            p.cmd({"command": ["set_property", "video-pan-y", 0]})
+            u = ctypes.windll.user32
+            saved = self._pip_crop_saved.get(tag)
+            if saved and p.hwnd and not self.pip_int:
+                u.SetWindowPos(p.hwnd, 0, saved[0], saved[1],
+                               max(160, saved[2]), max(120, saved[3]),
+                               0x0004 | 0x0010)
+                self._pip_crop_saved[tag] = None
+            else:
+                vw, vh = self._crop_video_dims(tag)
+                if vw > 0 and vh > 0 and p.hwnd and not self.pip_int:
+                    self._fit_pip_window(tag, float(vw) / float(vh))
+        self._pip_crop_saved[tag] = None
         name = "Movie" if tag == "A" else "Reaction"
         self._status_pin = time.monotonic() + 3.0
-        self.status_lbl.config(text="Crop removed on %s (full frame)." % name)
+        self.status_lbl.config(text="Crop cleared on %s (returned to full resolution)." % name)
 
     def _on_crop_tag(self, tag):
         self._crop_tag = tag
@@ -2485,13 +2571,9 @@ class SyncApp:
                 self._set_pip_asp(w / h)
 
     def _toggle_pip(self, tag):
-        """Picture-in-picture for THIS video: border removed and always on
-        Topmost goes through mpv's OWN ontop property (cross-process
-        SetWindowPos/HWND_TOPMOST fails with ERROR_INVALID_WINDOW_HANDLE,
-        and mpv re-applies its own topmost state on window recreation).
-        The frame removal is app-side style surgery; WS_THICKFRAME is kept
-        so the edges still drag-resize, and the video area still drags to
-        move (mpv window-dragging)."""
+        """Picture-in-picture for THIS video: all borders completely removed,
+        pure video feed with zero top sliver, always on top. Can be toggled
+        repeatedly without frame-removal degradation."""
         p = self.players.get(tag)
         if not (p and p.running):
             self.status_lbl.config(text="Start playback first so the video window exists.")
@@ -2503,27 +2585,32 @@ class SyncApp:
         u = ctypes.windll.user32
         if not self.pip.get(tag):
             p.cmd({"command": ["set_property", "ontop", "yes"]})
+            p.cmd({"command": ["set_property", "border", "no"]})
+            p.cmd({"command": ["set_property", "window-dragging", "yes"]})
             if p.hwnd:
-                style = (u.GetWindowLongPtrW(p.hwnd, -16) or 0) & 0xFFFFFFFF
-                if style:
-                    self._pip_saved[tag] = style
-                    new_style = (style | 0x80000000 | 0x00040000) & ~(0x00C00000 | 0x00080000 | 0x00020000 | 0x00010000)
-                    u.SetWindowLongPtrW(p.hwnd, -16, new_style if new_style < 0x80000000 else new_style - 0x100000000)
-                    u.SetWindowPos(p.hwnd, 0, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0004 | 0x0020)
+                cur_style = (u.GetWindowLongPtrW(p.hwnd, -16) or 0) & 0xFFFFFFFF
+                if cur_style & 0x00C00000:  # has WS_CAPTION: only save normal window style
+                    self._pip_saved[tag] = cur_style
+                # Pure borderless popup: WS_POPUP | WS_VISIBLE | WS_CLIPSIBLINGS, NO thickframe sliver
+                bare = (0x80000000 | 0x10000000 | 0x04000000)
+                u.SetWindowLongPtrW(p.hwnd, -16, bare if bare < 0x80000000 else bare - 0x100000000)
+                u.SetWindowPos(p.hwnd, 0, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0004 | 0x0020)
             self.pip[tag] = True
             self._pip_crop_on(tag)
             self._status_pin = time.monotonic() + 3.0
-            self.status_lbl.config(text="PiP on: this window is borderless, always on top; drag its edges to resize.")
+            self.status_lbl.config(text="PiP on: pure borderless video feed, always on top.")
         else:
             p.cmd({"command": ["set_property", "ontop", "no"]})
-            if p.hwnd and self._pip_saved.get(tag):
-                saved = self._pip_saved.get(tag) & 0xFFFFFFFF
+            p.cmd({"command": ["set_property", "border", "yes"]})
+            if p.hwnd:
+                saved = self._pip_saved.get(tag) or (0x10000000 | 0x00CF0000)
                 u.SetWindowLongPtrW(p.hwnd, -16, saved if saved < 0x80000000 else saved - 0x100000000)
                 u.SetWindowPos(p.hwnd, 0, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0004 | 0x0020)
+                self._pip_saved[tag] = None  # reset so subsequent PiP re-reads fresh normal style
             self._pip_crop_off(tag)
             self.pip[tag] = False
             self._status_pin = time.monotonic() + 3.0
-            self.status_lbl.config(text="PiP off - window back to normal (crop kept).")
+            self.status_lbl.config(text="PiP off - window frame restored.")
 
     # -- integrated PiP (true video-in-video overlay) -------------------------
     def _toggle_pip_int(self, tag):
@@ -2563,23 +2650,25 @@ class SyncApp:
                   "Reaction" if tag == "A" else "Movie"))
 
     def _embed_pane(self, pane, host, tag):
-        """Superimpose the pane over the host feed: frameless popup (no
-        caption/sysmenu/thickframe - it LOOKS like part of the feed), kept
-        always on top and glued inside the host's client area by the 30 Hz
-        poll. NOTE: SetParent(WS_CHILD) was tried and REJECTED - mpv does
-        not present frames into a reparented child window (black capture)."""
+        """Embed the pane as a TRUE Win32 child window inside the host's video window
+        using SetParent. With WS_CLIPCHILDREN on the host and WS_CHILD on the pane,
+        the video feeds render together in ONE window rather than separate windows."""
         u = ctypes.windll.user32
         self._pip_rect_saved[tag] = self._win_rect(pane.hwnd)
         st = (u.GetWindowLongPtrW(pane.hwnd, -16) or 0) & 0xFFFFFFFF
-        if st:
+        if st and (st & 0x00C00000):
             self._pip_saved[tag] = st
-            bare = (0x80000000 | 0x10000000) & ~(0x00C00000 | 0x00080000 |
-                                                 0x00040000 | 0x00020000 |
-                                                 0x00010000)
-            u.SetWindowLongPtrW(pane.hwnd, -16,
-                                bare if bare < 0x80000000 else bare - 0x100000000)
-            u.SetWindowPos(pane.hwnd, 0, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0004 | 0x0020)
-        pane.cmd({"command": ["set_property", "ontop", "yes"]})
+
+        # Enable WS_CLIPCHILDREN (0x02000000) on the host so host swapchain does not overdraw child
+        host_st = (u.GetWindowLongPtrW(host.hwnd, -16) or 0) & 0xFFFFFFFF
+        u.SetWindowLongPtrW(host.hwnd, -16, host_st | 0x02000000)
+
+        # Reparent pane as a child of host
+        u.SetParent(pane.hwnd, host.hwnd)
+        # WS_CHILD (0x40000000) | WS_VISIBLE (0x10000000) | WS_CLIPSIBLINGS (0x04000000)
+        child_style = 0x40000000 | 0x10000000 | 0x04000000
+        u.SetWindowLongPtrW(pane.hwnd, -16, child_style)
+        pane.cmd({"command": ["set_property", "border", "no"]})
         pane.cmd({"command": ["set_property", "window-dragging", "no"]})
         self._pip_crop_on(tag)
         self._pip_update_pane(force=True)
@@ -2601,21 +2690,21 @@ class SyncApp:
         return None
 
     def _undock_pip_int(self):
-        """Restore the pane to a normal top-level window at its saved spot."""
+        """Detach child pane from host window and restore as normal top-level window."""
         tag = self._pip_int_tag
         p = self.players.get(tag) if tag else None
         u = ctypes.windll.user32
         if p and p.running and p.hwnd:
-            if self._pip_saved.get(tag):
-                saved = self._pip_saved.get(tag) & 0xFFFFFFFF
-                u.SetWindowLongPtrW(p.hwnd, -16,
-                                    saved if saved < 0x80000000 else saved - 0x100000000)
-                u.SetWindowPos(p.hwnd, 0, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0004 | 0x0020)
+            u.SetParent(p.hwnd, 0)  # Detach from host parent
+            p.cmd({"command": ["set_property", "border", "yes"]})
+            saved = self._pip_saved.get(tag) or (0x10000000 | 0x00CF0000)
+            u.SetWindowLongPtrW(p.hwnd, -16,
+                                saved if saved < 0x80000000 else saved - 0x100000000)
             rect = self._pip_rect_saved.get(tag)
             if rect:
                 u.SetWindowPos(p.hwnd, 0, rect[0], rect[1],
-                               max(60, rect[2]), max(34, rect[3]),
-                               0x0001 | 0x0002 | 0x0004 | 0x0020)
+                               max(160, rect[2]), max(120, rect[3]),
+                               0x0004 | 0x0020)
             p.cmd({"command": ["set_property", "ontop", "no"]})
             p.cmd({"command": ["set_property", "window-dragging", "yes"]})
             self._pip_crop_off(tag)
@@ -2625,11 +2714,10 @@ class SyncApp:
         self._pip_int_hwnd = None
         self._pip_int_drag = False
         self._status_pin = time.monotonic() + 3.0
-        self.status_lbl.config(text="Integrated PiP off - the video is back in its own window (crop kept).")
+        self.status_lbl.config(text="Integrated PiP off - video restored to its own window.")
 
     def _pip_update_pane(self, force=False):
-        """30 Hz glue: keep the child pane at its slot inside the host's
-        client area, so it moves/resizes with the host feed automatically."""
+        """Update the position of the embedded child pane inside the host client area."""
         if not (self.pip_int and self._pip_int_hwnd):
             return
         tag = self._pip_int_tag
@@ -2639,7 +2727,6 @@ class SyncApp:
                 and host.hwnd and pane.hwnd):
             return
         if pane.hwnd != self._pip_int_hwnd:
-            # mpv recreated its window (style reset): embed it again
             self._embed_pane(pane, host, tag)
             self._pip_int_hwnd = pane.hwnd
             return
@@ -2648,12 +2735,9 @@ class SyncApp:
         if not csz or csz[0] <= 0 or csz[1] <= 0:
             return
         cw, ch = csz
-        # client origin in screen coordinates (the pane is a top-level window)
-        pt = ctypes.wintypes.POINT(0, 0)
-        if not u.ClientToScreen(host.hwnd, ctypes.byref(pt)):
-            return
-        x = pt.x + int(self._pip_int_pos[0] * cw)
-        y = pt.y + int(self._pip_int_pos[1] * ch)
+        # Coordinates are relative to host's client area directly (true Win32 child window)
+        x = int(self._pip_int_pos[0] * cw)
+        y = int(self._pip_int_pos[1] * ch)
         w = max(60, int(self._pip_int_size[0] * cw))
         h = max(34, int(self._pip_int_size[1] * ch))
         asp = self._pip_int_asp
@@ -2671,7 +2755,7 @@ class SyncApp:
             try:
                 hwnd = self._pip_int_hwnd
                 if hwnd:
-                    u.SetWindowPos(hwnd, 0, x, y, w, h, 0x0004 | 0x0010)
+                    u.SetWindowPos(hwnd, 0, x, y, w, h, 0x0004 | 0x0020)
             finally:
                 self._pip_move_run = False
         threading.Thread(target=_place, daemon=True).start()
@@ -3042,17 +3126,8 @@ class SyncApp:
                     elif rec == "undock" and self.pip_int:
                         self._undock_pip_int()
                 elif kind == "exit":
-                    self._stop()
-        if self._crop_auto_pending:
-            tag, sp_rect = self._crop_auto_pending
-            self._crop_auto_pending = None
-            if sp_rect:
-                self._crop_apply(tag, sp_rect)
-            else:
-                self._status_pin = time.monotonic() + 3.0
-                n = "Movie" if tag == "A" else "Reaction"
-                self.status_lbl.config(
-                    text="No black bars detected on the %s video." % n)
+                    self._on_player_exit(t)
+        # (auto crop feature removed)
         if self.started:
             a = self.combo_audio["A"]
             b = self.combo_audio["B"]
@@ -3102,15 +3177,18 @@ class SyncApp:
         now = time.monotonic()
         ra = self._est_pos("A", now)
         rb = self._est_pos("B", now)
-        pa, pb = self.players["A"], self.players["B"]
-        playing = not (self.paused or pa.paused or pb.paused)
+        pa, pb = self.players.get("A"), self.players.get("B")
+        pa_paused = pa.paused if (pa and pa.running) else True
+        pb_paused = pb.paused if (pb and pb.running) else True
+        playing = not (self.paused or pa_paused or pb_paused)
         # gentle drift correction: pull the reaction back to its aligned spot.
         # Suppressed right after a manual seek (grace) and rate-limited so a
         # correction can land and be observed before the next one.
         cooldown = 1.0 if self.sync_locked else 2.0
         thr = 0.15 if self.sync_locked else 0.45
         b_dur = self.last_dur.get("B")
-        react_at_end = pb.at_end or (b_dur and rb is not None and rb >= b_dur - 0.5)
+        pb_at_end = pb.at_end if (pb and pb.running) else True
+        react_at_end = pb_at_end or (b_dur and rb is not None and rb >= b_dur - 0.5)
         if (pa and pb and pa.running and pb.running and playing
                 and now - pb.last_seek_ts > 1.2     # grace for ANY seek path
                 and now - self._frame_step_ts > 1.2  # grace after frame steps
@@ -3119,9 +3197,10 @@ class SyncApp:
                 and not (self.dragging_seek_a or self.dragging_seek_b
                          or self.dragging_seek_m)):
             target = reaction_target(ra, self.sync_off)
+            pa_at_end = pa.at_end if (pa and pa.running) else True
             if needs_correction(rb, ra, self.sync_off, threshold=thr,
                                 playing=True, dragging=False,
-                                movie_at_end=pa.at_end,
+                                movie_at_end=pa_at_end,
                                 react_at_end=react_at_end):
                 if b_dur and target is not None and target > b_dur - 0.05:
                     # the aligned spot is past the reaction's own end: it
