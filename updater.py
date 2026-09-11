@@ -401,6 +401,17 @@ def _gui_main(install_dir):
 
 
 def main(argv):
+    if not sys.platform.startswith("win"):
+        # The self-updater ships Windows binaries (SyncPlayer.exe, mpv.exe,
+        # yt-dlp.exe). On Linux everything comes from the distro / the
+        # installer script instead, so point the user at the right command
+        # rather than downloading a wrong-platform asset.
+        print("SyncPlayer self-update is Windows-only.")
+        print("On Linux, update with:")
+        print("  git -C <repo> pull && ./install.sh     # if installed from a checkout")
+        print("  sudo pacman -Syu mpv yt-dlp            # or your distro's package manager")
+        print("  yt-dlp -U                             # if you bundled a private yt-dlp")
+        return 1
     install_dir = find_install_dir()
     if "--dir" in argv:
         try:

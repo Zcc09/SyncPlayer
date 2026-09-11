@@ -28,7 +28,6 @@ Requires: mpv on PATH (or MPV_PATH env / common install dirs).
 """
 
 import ctypes
-import ctypes.wintypes  # noqa: F401 (ctypes.wintypes.DWORD etc. used in window helpers)
 import glob
 import io
 import json
@@ -42,6 +41,8 @@ import tempfile
 import threading
 import time
 import tkinter as tk
+if sys.platform.startswith("win"):
+    import ctypes.wintypes  # noqa: F401 (Win32 window helpers; absent on Linux)
 try:
     from tkinterdnd2 import TkinterDnD, DND_FILES
     _HAS_DND = True
@@ -53,9 +54,10 @@ try:
 except Exception:
     _HAS_PIL = False
 from tkinter import ttk, filedialog, messagebox
+import sp_plat as plat   # cross-platform: paths, mpv IPC, window control
 
 APP_NAME = "SyncPlayer"
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
 
 
 class MpvNotFoundError(Exception):
@@ -63,11 +65,10 @@ class MpvNotFoundError(Exception):
 
 
 if getattr(sys, "frozen", False):
-    # packaged exe: keep data out of the exe's folder (e.g. Desktop)
+    # packaged app: keep data OUT of the app's own folder (e.g. Desktop)
     BASE = os.path.dirname(sys.executable)
-    _appdata = os.environ.get("APPDATA") or BASE
-    CONFIG_PATH = os.path.join(_appdata, "SyncPlayer", "syncplayer_config.json")
-    SHOT_DIR = os.path.join(os.path.expanduser("~"), "Pictures", "SyncPlayer")
+    CONFIG_PATH = os.path.join(plat.config_dir(), "syncplayer_config.json")
+    SHOT_DIR = plat.shot_dir()
 else:
     BASE = os.path.dirname(os.path.abspath(__file__))
     CONFIG_PATH = os.path.join(BASE, "syncplayer_config.json")
@@ -77,6 +78,34 @@ os.makedirs(SHOT_DIR, exist_ok=True)
 STATUS_PREFIX = "SYNCSTATUS|"
 STATUS_APPEND = "|${sub-id}|${aid}|${demuxer-cache-duration}"   # includes stream buffer duration
 YOUTUBE_HOSTS = ("youtube.com", "youtu.be", "music.youtube.com")
+
+
+def _linux_mpv_gpu_context():
+    """Which --gpu-context to force on Linux (or None).
+
+    On a Wayland session mpv would render into a native Wayland surface, and
+    the app cannot move / stack / reparent those windows (Wayland forbids it by
+    design). Routing mpv through X11 (Xwayland) keeps arranging, floating PiP
+    and embedded PiP working. Overridable with SYNCPLAYER_MPV_GPU_CONTEXT
+    (set it to "auto" to let mpv decide).
+    """
+    if not plat.IS_LINUX:
+        return None
+    env = os.environ.get("SYNCPLAYER_MPV_GPU_CONTEXT")
+    if env is not None:
+        return None if env.strip().lower() in ("", "auto", "none") else env.strip()
+    if not os.environ.get("DISPLAY"):
+        return None                      # no X11 at all: let mpv use Wayland/native
+    if (os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland"
+            and not os.environ.get("WAYLAND_DISPLAY")):
+        return "x11egl"
+    if os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland":
+        return "x11egl"                  # Wayland desktop w/ Xwayland: force X11
+    return None                          # native X11 session: mpv picks X11 anyway
+
+
+# set when a forced --gpu-context made mpv fail to start (then we stop forcing)
+_GPU_CTX_DISABLED = False
 
 LUA_SCRIPT = """
 -- frame-accurate position beacon: mpv 0.41's ${time-pos} in the status
@@ -203,16 +232,15 @@ _ffprobe_cache = None
 
 
 def _bundled_mpv():
-    """Return a path to an mpv.exe shipped next to the app (self-contained
-    installs), or None. Uses the executable dir when frozen, else the source
-    dir. This is the fix for "stuck at starting" on a machine with no mpv
-    on PATH - the installer puts mpv in <exe dir>\mpv\."""
+    r"""Return a path to mpv shipped next to the app (self-contained installs),
+    or None. Uses the executable dir when frozen, else the source dir. This is
+    the fix for "stuck at starting" on a machine with no mpv on PATH - the
+    installer puts mpv in <exe dir>/mpv/."""
     if getattr(sys, "frozen", False):
         base = os.path.dirname(sys.executable)
     else:
         base = os.path.dirname(os.path.abspath(__file__))
-    for cand in (os.path.join(base, "mpv", "mpv.exe"),
-                 os.path.join(base, "mpv.exe")):
+    for cand in plat.bundled_mpv_candidates_for(base):
         if os.path.isfile(cand):
             return cand
     return None
@@ -234,21 +262,21 @@ _ytdl_cache = None
 
 
 def find_ytdl():
-    """Locate yt-dlp.exe: next to mpv, in %LOCALAPPDATA%\SyncPlayer\mpv, or on PATH."""
+    """Locate yt-dlp: next to mpv, in the SyncPlayer install dir, or on PATH."""
     global _ytdl_cache
     if _ytdl_cache and os.path.isfile(_ytdl_cache):
         return _ytdl_cache
     mpv = find_mpv()
     if mpv:
-        cand = os.path.join(os.path.dirname(mpv), "yt-dlp.exe")
+        cand = os.path.join(os.path.dirname(mpv), plat.YTDL_EXE)
         if os.path.isfile(cand):
             _ytdl_cache = cand
             return cand
-    local = os.path.join(os.environ.get("LOCALAPPDATA") or "", "SyncPlayer", "mpv", "yt-dlp.exe")
-    if os.path.isfile(local):
-        _ytdl_cache = local
-        return local
-    w = shutil.which("yt-dlp")
+    for cand in plat.installed_ytdl_candidates():
+        if cand and os.path.isfile(cand):
+            _ytdl_cache = cand
+            return cand
+    w = shutil.which(plat.YTDL_EXE) or shutil.which("yt-dlp")
     if w:
         _ytdl_cache = w
         return w
@@ -270,27 +298,24 @@ def find_mpv():
         _prepend_path(os.path.dirname(bundled))
         _mpv_cache = bundled
         return bundled
-    # 3) %LOCALAPPDATA%\SyncPlayer\mpv\mpv.exe (installer target)
-    inst_mpv = os.path.join(os.environ.get("LOCALAPPDATA") or "", "SyncPlayer", "mpv", "mpv.exe")
-    if os.path.isfile(inst_mpv):
-        _prepend_path(os.path.dirname(inst_mpv))
-        _mpv_cache = inst_mpv
-        return inst_mpv
+    # 3) installed by SyncPlayer (the installer's own target dir)
+    for cand in plat.installed_mpv_candidates():
+        if cand and os.path.isfile(cand):
+            _prepend_path(os.path.dirname(cand))
+            _mpv_cache = cand
+            return cand
     # 4) PATH
-    found = shutil.which("mpv")
+    found = shutil.which(plat.MPV_EXE) or shutil.which("mpv")
     if found:
-        if found.lower().endswith(".com"):
+        if found.lower().endswith(".com"):   # Windows ships mpv.com beside mpv.exe
             exe = os.path.join(os.path.dirname(found), "mpv.exe")
             if os.path.isfile(exe):
                 found = exe
+        _prepend_path(os.path.dirname(found))
         _mpv_cache = found
         return found
-    # 5) common install dirs
-    for c in (r"C:\Program Files\MPV Player\mpv.exe",
-              r"C:\Tools\mpv\mpv.exe",
-              os.path.expanduser(r"~\AppData\Local\Programs\mpv\mpv.exe"),
-              os.path.expanduser(r"~\scoop\apps\mpv\current\mpv.exe"),
-              r"C:\Program Files\mpv\mpv.exe"):
+    # 5) common install locations (per platform)
+    for c in plat.system_mpv_candidates():
         if os.path.isfile(c):
             _mpv_cache = c
             return c
@@ -328,7 +353,7 @@ def detect_crop_rect(src, duration=None, timeout=30):
              "--vf=lavfi-cropdetect=32:2:16", src],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, errors="replace", timeout=timeout,
-            creationflags=subprocess.CREATE_NO_WINDOW)
+            **plat.run_extra())
         out = proc.stdout or ""
     except Exception:
         return None
@@ -369,7 +394,7 @@ def probe_media(path, timeout=20):
              "-show_entries", "stream=codec_type,width,height",
              "-of", "json", path],
             capture_output=True, text=True, timeout=timeout,
-            creationflags=subprocess.CREATE_NO_WINDOW)
+            **plat.run_extra())
         d = json.loads(out.stdout or "{}")
         dur = None
         try:
@@ -506,7 +531,7 @@ def needs_correction(react_pos, movie_pos, sync_off, threshold=0.45,
 # Win32 helpers (window placement; reliable at any DPI scaling)
 # ---------------------------------------------------------------------------
 
-_SWP_NOZORDER_NOACTIVATE = 0x0004 | 0x0010
+_SWP_NOZORDER_NOACTIVATE = 0x0004 | 0x0010   # kept for reference; backends use their own
 
 # ---- mpv IPC pipe plumbing ------------------------------------------------
 # Overlapped I/O: the CRT poisons a pipe handle that has been read, and a
@@ -514,90 +539,27 @@ _SWP_NOZORDER_NOACTIVATE = 0x0004 | 0x0010
 # full - which a drag-spammed volume/seek burst does in a second. Writes
 # go through a dedicated writer thread and replies are drained by a
 # reader thread, so the GUI thread can never block on the pipe.
-_GENERIC_READ = 0x80000000
-_GENERIC_WRITE = 0x40000000
-_OPEN_EXISTING = 3
-_FILE_FLAG_OVERLAPPED = 0x40000000
-_ERROR_IO_PENDING = 997
-_ERROR_BROKEN_PIPE = 109
-_ERROR_OPERATION_ABORTED = 995
-_ERROR_INVALID_HANDLE = 6
-_WAIT_TIMEOUT = 258
+# The mpv JSON-IPC transport is OS specific (named pipe on Windows,
+# unix domain socket on Linux) and lives in sp_plat.Ipc.
 
 
-class _OVERLAPPED(ctypes.Structure):
-    _fields_ = [("Internal", ctypes.c_void_p),
-                ("InternalHigh", ctypes.c_void_p),
-                ("Offset", ctypes.wintypes.DWORD),
-                ("OffsetHigh", ctypes.wintypes.DWORD),
-                ("hEvent", ctypes.c_void_p)]
-
-
-_k32 = ctypes.windll.kernel32
-_k32.CreateFileW.restype = ctypes.c_void_p
-_k32.CreateFileW.argtypes = [ctypes.c_wchar_p, ctypes.wintypes.DWORD,
-                             ctypes.wintypes.DWORD, ctypes.c_void_p,
-                             ctypes.wintypes.DWORD, ctypes.wintypes.DWORD,
-                             ctypes.c_void_p]
-_k32.ReadFile.restype = ctypes.wintypes.BOOL
-_k32.ReadFile.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.wintypes.DWORD,
-                          ctypes.POINTER(ctypes.wintypes.DWORD), ctypes.c_void_p]
-_k32.WriteFile.restype = ctypes.wintypes.BOOL
-_k32.WriteFile.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.wintypes.DWORD,
-                           ctypes.POINTER(ctypes.wintypes.DWORD), ctypes.c_void_p]
-_k32.GetOverlappedResult.restype = ctypes.wintypes.BOOL
-_k32.GetOverlappedResult.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
-                                     ctypes.POINTER(ctypes.wintypes.DWORD),
-                                     ctypes.wintypes.BOOL]
-_k32.CloseHandle.argtypes = [ctypes.c_void_p]
-_k32.CancelIoEx.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+def _wb():
+    """The active window backend (Win32 / X11 / none)."""
+    return plat.get_window_backend()
 
 
 def screen_size():
-    try:
-        u = ctypes.windll.user32
-        return u.GetSystemMetrics(0), u.GetSystemMetrics(1)
-    except Exception:
-        return 1920, 1080
+    return _wb().screen_size()
 
 
 def find_mpv_window(pid, title_sub, tries=120, delay=0.25):
-    """Find the visible top-level 'mpv' window of a process (by PID + title).
-    Returns the HWND or None. The 'mpv smtc' helper window is skipped by
-    class-name matching."""
-    user32 = ctypes.windll.user32
-    found = [0]
-    for _ in range(tries):
-        found[0] = 0
-        cb = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
-
-        def _cb(h, _l):
-            pid2 = ctypes.wintypes.DWORD()
-            user32.GetWindowThreadProcessId(h, ctypes.byref(pid2))
-            if pid2.value == pid and user32.IsWindowVisible(h):
-                cls = ctypes.create_unicode_buffer(64)
-                user32.GetClassNameW(h, cls, 64)
-                if cls.value == "mpv":
-                    buf = ctypes.create_unicode_buffer(256)
-                    user32.GetWindowTextW(h, buf, 256)
-                    if title_sub in buf.value:
-                        found[0] = h
-            return True
-
-        user32.EnumWindows(cb(_cb), 0)
-        if found[0]:
-            return found[0]
-        time.sleep(delay)
-    return None
+    """Find the visible top-level video window of a process (by PID + title).
+    Returns a Win32 HWND or an X11 window id; None when not found."""
+    return _wb().find_window(pid, title_sub, tries=tries, delay=delay)
 
 
 def place_window(hwnd, x, y, w, h):
-    try:
-        ctypes.windll.user32.SetWindowPos(hwnd, 0, x, y, max(160, w), max(120, h),
-                                          _SWP_NOZORDER_NOACTIVATE)
-        return True
-    except Exception:
-        return False
+    return _wb().place(hwnd, x, y, w, h)
 
 
 # ---------------------------------------------------------------------------
@@ -614,7 +576,7 @@ class MpvDriver:
         self.q = queue.Queue()
         self.lock = threading.Lock()
         self.stopped = threading.Event()
-        self._h = None               # overlapped pipe handle
+        self.ipc = None              # sp_plat.Ipc transport (pipe/socket)
         self._cmdq = queue.Queue()   # IPC commands, drained by a writer thread
         self._next_rid = 1           # outgoing get_property request ids
         self.rq = queue.Queue()      # replies: (request_id, error, data)
@@ -625,9 +587,11 @@ class MpvDriver:
         self._eof_hold = False           # parked in the keep-open EOF hold
         self.hwnd = None
         self.last_seek_ts = 0.0         # any seek path stamps this
+        self.start_ts = time.monotonic()   # used to spot "died on startup"
 
-        # Windows named pipe for JSON IPC (open() works directly on \\\\.\\pipe\\...)
-        pipe_name = "syncplayer-%d-%d-%s" % (os.getpid(), threading.get_ident(), tag)
+        # JSON IPC endpoint: Windows named pipe / Linux unix socket
+        _ipc_name = "syncplayer-%d-%d-%s" % (os.getpid(), threading.get_ident(), tag)
+        _ipc_server, _ipc_client = plat.ipc_endpoint(_ipc_name)
 
         # custom input map: SPACE pauses; the mouse keys dispatch the Lua
         # beacon's named bindings (input.conf is the TOP of mpv's binding
@@ -671,7 +635,7 @@ class MpvDriver:
             _prepend_path(os.path.dirname(ytdl_bin))
         args = [mpv,
                 "--no-config",
-                "--input-ipc-server=%s" % pipe_name,
+                "--input-ipc-server=%s" % _ipc_server,
                 "--input-conf=%s" % self.input_conf,
                 "--script=%s" % self.lua_script,
                 "--input-terminal=no",
@@ -690,6 +654,11 @@ class MpvDriver:
                 "--ytdl=yes",
                 "--volume-max=150",
                 ]
+        _ctx = None if _GPU_CTX_DISABLED else _linux_mpv_gpu_context()
+        if _ctx:
+            # force the X11 (Xwayland) video output so the window can be
+            # arranged / moved / reparented by the app on Wayland desktops
+            args.append("--gpu-context=%s" % _ctx)
         if ytdl_bin:
             args.append("--script-opts=ytdl_hook-ytdl_path=%s" % ytdl_bin)
         if is_youtube(src) or src.startswith("http"):
@@ -707,33 +676,32 @@ class MpvDriver:
                 "--pause=yes" if start_paused else "--pause=no",
                 src,
                 ])
+        self.ipc = plat.Ipc()
         self.proc = subprocess.Popen(
             args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, text=True, encoding="utf-8",
             errors="replace", bufsize=1,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            **plat.popen_extra(),
         )
-        threading.Thread(target=self._connect_pipe, args=(pipe_name,), daemon=True).start()
+        threading.Thread(target=self._connect_pipe, args=(_ipc_client,), daemon=True).start()
         threading.Thread(target=self._stdout_reader, daemon=True).start()
 
     # -- pipe ---------------------------------------------------------------
-    # Overlapped connect: open the pipe with FILE_FLAG_OVERLAPPED, then spawn
-    # a writer thread (serializes IPC writes; blocks only itself) and a drain
-    # thread (consumes mpv's replies so its reply buffer never fills).
-    def _connect_pipe(self, name, tries=60, delay=0.25):
-        path = r"\\.\pipe\%s" % name
-        for _ in range(tries):
-            if self.stopped.is_set():
-                return
-            h = _k32.CreateFileW(path,
-                                 _GENERIC_READ | _GENERIC_WRITE, 0, None,
-                                 _OPEN_EXISTING, _FILE_FLAG_OVERLAPPED, None)
-            if h and h != ctypes.c_void_p(-1).value:
-                self._h = h
-                threading.Thread(target=self._drain_replies, daemon=True).start()
-                threading.Thread(target=self._writer_loop, daemon=True).start()
-                return
-            time.sleep(delay)
+    # Transport is OS-specific (named pipe on Windows, unix socket on Linux) -
+    # sp_plat.Ipc hides both. A writer thread serializes IPC writes (blocking
+    # only itself) and a drain thread consumes mpv's replies so its reply
+    # buffer never fills.
+    def _connect_pipe(self, endpoint, tries=60, delay=0.25):
+        def _waiter():
+            for _ in range(tries):
+                if self.stopped.is_set():
+                    return
+                if self.ipc and self.ipc.connect(endpoint, tries=1, delay=0):
+                    threading.Thread(target=self._drain_replies, daemon=True).start()
+                    threading.Thread(target=self._writer_loop, daemon=True).start()
+                    return
+                time.sleep(delay)
+        _waiter()
 
     def _drain_replies(self):
         """Consume and discard mpv reply packets so its server-side buffer
@@ -741,11 +709,6 @@ class MpvDriver:
         wedges the whole sync loop. Reply LINES carrying a request_id are
         routed to rq so get_property() can match replies to its calls."""
         buf = ctypes.create_string_buffer(8192)
-        evt = _k32.CreateEventW(None, False, False, None)
-        ov = _OVERLAPPED()
-        ov.hEvent = evt
-        n = ctypes.wintypes.DWORD(0)
-        h = self._h
         acc = b""
 
         def emit(chunk):
@@ -762,47 +725,29 @@ class MpvDriver:
                 except Exception:
                     pass
 
-        while not self.stopped.is_set() and h:
-            if _k32.ReadFile(h, ctypes.byref(buf), len(buf), ctypes.byref(n),
-                             ctypes.byref(ov)):
-                emit(buf.raw[:n.value])
+        while not self.stopped.is_set() and self.ipc:
+            # "ok" -> data, "timeout" -> keep waiting, "closed" -> mpv gone.
+            # (Windows blocks on the overlapped event; Linux on the socket.)
+            status, data = self.ipc.read(buf, None)
+            if status == "ok":
+                emit(data)
                 continue
-            err = _k32.GetLastError()
-            if err == _ERROR_IO_PENDING:
-                # Block on the event: NEVER re-issue ReadFile while the
-                # OVERLAPPED is still pending (undefined behavior, heap
-                # corruption). quit() cancels the I/O to wake us.
-                _k32.WaitForSingleObject(evt, 0xFFFFFFFF)
-                done = ctypes.wintypes.DWORD(0)
-                if not _k32.GetOverlappedResult(h, ctypes.byref(ov),
-                                                ctypes.byref(done), False):
-                    err = _k32.GetLastError()
-                    if err in (_ERROR_BROKEN_PIPE, _ERROR_OPERATION_ABORTED,
-                               _ERROR_INVALID_HANDLE):
-                        break
-                else:
-                    emit(buf.raw[:done.value])
-            elif err in (_ERROR_BROKEN_PIPE, _ERROR_OPERATION_ABORTED,
-                          _ERROR_INVALID_HANDLE):
-                break
-        if evt:
-            _k32.CloseHandle(evt)
+            if status == "timeout":
+                continue
+            break
 
     def _writer_loop(self):
         """Serial writer: pops queued commands and writes them. A blocked
         write stalls THIS thread only - never the GUI."""
-        while not self.stopped.is_set() and self._h:
+        while not self.stopped.is_set() and self.ipc:
             try:
                 obj = self._cmdq.get(timeout=0.2)
             except queue.Empty:
                 continue
             data = json.dumps(obj, ensure_ascii=False).encode("utf-8") + b"\n"
-            wbuf = ctypes.create_string_buffer(data)
-            written = ctypes.wintypes.DWORD(0)
             try:
-                if not _k32.WriteFile(self._h, ctypes.byref(wbuf), len(data),
-                                     ctypes.byref(written), None):
-                    time.sleep(0.05)      # pipe busy/broken: back off, drop
+                if not self.ipc.write(data):
+                    time.sleep(0.05)      # transport busy/broken: back off, drop
             except Exception:
                 pass
 
@@ -927,7 +872,7 @@ class MpvDriver:
         """Synchronous property read over the IPC pipe: queue the command
         with a unique request_id, then wait for the drain thread to route
         the matching reply line into rq. Returns (error, data)."""
-        if not (self._h and self.running):
+        if not (self.ipc and self.ipc.connected and self.running):
             return None, None
         rid = self._next_rid
         self._next_rid += 1
@@ -1025,11 +970,10 @@ class MpvDriver:
         self.stopped.set()
         try:
             self.cmd({"command": ["quit"]})
-            if self._h:
+            if self.ipc:
                 time.sleep(0.1)   # let the writer deliver "quit"
-                _k32.CancelIoEx(self._h, None)
-                _k32.CloseHandle(self._h)
-                self._h = None
+                self.ipc.close()  # cancels the pending read / closes the socket
+                self.ipc = None
         except Exception:
             pass
         self.pipe = None
@@ -1399,6 +1343,10 @@ class VisualCropDialog(tk.Toplevel):
 class SyncApp:
     def __init__(self, root):
         self.root = root
+        try:      # without this the OS shows Tk's default "tk" title
+            self.root.title(APP_NAME)
+        except Exception:
+            pass
         self.players = {"A": None, "B": None}
         self.started = False
         self.paused = True
@@ -1417,6 +1365,7 @@ class SyncApp:
         self.goto_vars = {"A": tk.StringVar(), "B": tk.StringVar()}
         self.dragging_vol = [False, False]
         self.dragging_master = False
+        self._poll_after_id = None      # single pending 30 Hz poll timer
         self._ctrls = []
         self._status_time = {"A": 0.0, "B": 0.0}   # monotonic clock per stream
         self._beacon_ts = {"A": 0.0, "B": 0.0}       # last fresh Lua position per video
@@ -1434,7 +1383,7 @@ class SyncApp:
         self._lbl_cache = {}           # last label text per bar
         self._lbl_status_cache = ""    # last status text
         self.pip = {"A": False, "B": False}   # picture-in-picture state
-        self._pip_saved = {"A": 0, "B": 0}     # original window styles
+        self._pip_saved = {"A": None, "B": None}   # original window styles/decorations
         self.pip_int = False          # integrated PiP (embedded pane) state
         self._pip_int_tag = None      # which video is the embedded pane
         self._pip_int_pos = [0.60, 0.60]   # pane top-left, fraction of host
@@ -2180,6 +2129,21 @@ class SyncApp:
         self.players[tag] = None
         self.last_pos[tag] = None
 
+        # Linux: a forced --gpu-context may be unsupported by this driver/GPU.
+        # If mpv died moments after launching, stop forcing it and try again.
+        global _GPU_CTX_DISABLED
+        if (plat.IS_LINUX and not _GPU_CTX_DISABLED and p is not None
+                and _linux_mpv_gpu_context()
+                and (time.monotonic() - getattr(p, "start_ts", 0.0)) < 6.0
+                and self.started):
+            _GPU_CTX_DISABLED = True
+            self._status_pin = time.monotonic() + 4.0
+            self.status_lbl.config(
+                text="Video output fallback: retrying %s without the forced X11 context..." % name)
+            self.root.after(600, lambda t=tag, s=self._srcs.get(tag, ""):
+                            self._retry_player(t, s))
+            return
+
         if other_p and other_p.running:
             other_p.set_pause(True)
             self.paused = True
@@ -2358,7 +2322,7 @@ class SyncApp:
         """Reset all video windows back to normal bordered windows side by side."""
         if self.pip_int:
             self._undock_pip_int()
-        u = ctypes.windll.user32
+        wb = _wb()
         for tag in ("A", "B"):
             p = self.players.get(tag)
             if p and p.running:
@@ -2366,9 +2330,7 @@ class SyncApp:
                 p.cmd({"command": ["set_property", "border", "yes"]})
                 p.cmd({"command": ["set_property", "window-dragging", "yes"]})
                 if p.hwnd:
-                    saved = self._pip_saved.get(tag) or (0x10000000 | 0x00CF0000)
-                    u.SetWindowLongPtrW(p.hwnd, -16, saved if saved < 0x80000000 else saved - 0x100000000)
-                    u.SetWindowPos(p.hwnd, 0, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0004 | 0x0020)
+                    wb.restore_style(p.hwnd, self._pip_saved.get(tag))
                     self._pip_saved[tag] = None
             self.pip[tag] = False
         self._arrange_windows()
@@ -2741,8 +2703,7 @@ class SyncApp:
         if not r or r[2] <= 0:
             return
         h = max(34, int(r[2] / asp))
-        ctypes.windll.user32.SetWindowPos(p.hwnd, 0, r[0], r[1], r[2], h,
-                                          0x0004 | 0x0010)
+        _wb().place(p.hwnd, r[0], r[1], r[2], h)
 
     def _pip_crop_on(self, tag):
         """PiP engage hook: reapply this player's saved crop (manual first,
@@ -2778,10 +2739,8 @@ class SyncApp:
             p.cmd({"command": ["set_property", "video-crop", ""]})
         saved = self._pip_crop_saved.get(tag)
         if (saved and p and p.running and p.hwnd and not self.pip_int):
-            u = ctypes.windll.user32
-            u.SetWindowPos(p.hwnd, 0, saved[0], saved[1],
-                           max(60, saved[2]), max(34, saved[3]),
-                           0x0004 | 0x0010)
+            _wb().place(p.hwnd, saved[0], saved[1],
+                        max(60, saved[2]), max(34, saved[3]))
             self._pip_crop_saved[tag] = None
         self._pip_int_asp = None
 
@@ -2937,12 +2896,10 @@ class SyncApp:
             p.cmd({"command": ["set_property", "video-zoom", 0]})
             p.cmd({"command": ["set_property", "video-pan-x", 0]})
             p.cmd({"command": ["set_property", "video-pan-y", 0]})
-            u = ctypes.windll.user32
             saved = self._pip_crop_saved.get(tag)
             if saved and p.hwnd and not self.pip_int:
-                u.SetWindowPos(p.hwnd, 0, saved[0], saved[1],
-                               max(160, saved[2]), max(120, saved[3]),
-                               0x0004 | 0x0010)
+                _wb().place(p.hwnd, saved[0], saved[1],
+                            max(160, saved[2]), max(120, saved[3]))
                 self._pip_crop_saved[tag] = None
             else:
                 vw, vh = self._crop_video_dims(tag)
@@ -3067,19 +3024,18 @@ class SyncApp:
             self.status_lbl.config(
                 text="Integrated PiP is active - exit PIP MODE first.")
             return
-        u = ctypes.windll.user32
+        wb = _wb()
         if not self.pip.get(tag):
             p.cmd({"command": ["set_property", "ontop", "yes"]})
             p.cmd({"command": ["set_property", "border", "no"]})
             p.cmd({"command": ["set_property", "window-dragging", "yes"]})
             if p.hwnd:
-                cur_style = (u.GetWindowLongPtrW(p.hwnd, -16) or 0) & 0xFFFFFFFF
-                if cur_style & 0x00C00000:  # has WS_CAPTION: only save normal window style
-                    self._pip_saved[tag] = cur_style
-                # Pure borderless popup: WS_POPUP | WS_VISIBLE | WS_CLIPSIBLINGS, NO thickframe sliver
-                bare = (0x80000000 | 0x10000000 | 0x04000000)
-                u.SetWindowLongPtrW(p.hwnd, -16, bare if bare < 0x80000000 else bare - 0x100000000)
-                u.SetWindowPos(p.hwnd, 0, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0004 | 0x0020)
+                # save only a NORMAL window's decoration state, then strip it
+                st = wb.save_style(p.hwnd)
+                if st:
+                    self._pip_saved[tag] = st
+                wb.set_borderless(p.hwnd, True)
+                wb.set_ontop(p.hwnd, True)
             self.pip[tag] = True
             self._pip_crop_on(tag)
             self._status_pin = time.monotonic() + 3.0
@@ -3088,10 +3044,9 @@ class SyncApp:
             p.cmd({"command": ["set_property", "ontop", "no"]})
             p.cmd({"command": ["set_property", "border", "yes"]})
             if p.hwnd:
-                saved = self._pip_saved.get(tag) or (0x10000000 | 0x00CF0000)
-                u.SetWindowLongPtrW(p.hwnd, -16, saved if saved < 0x80000000 else saved - 0x100000000)
-                u.SetWindowPos(p.hwnd, 0, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0004 | 0x0020)
-                self._pip_saved[tag] = None  # reset so subsequent PiP re-reads fresh normal style
+                wb.set_ontop(p.hwnd, False)
+                wb.restore_style(p.hwnd, self._pip_saved.get(tag))
+                self._pip_saved[tag] = None  # re-read fresh state on next PiP
             self._pip_crop_off(tag)
             self.pip[tag] = False
             self._status_pin = time.monotonic() + 3.0
@@ -3138,21 +3093,15 @@ class SyncApp:
         """Embed the pane as a TRUE Win32 child window inside the host's video window
         using SetParent. With WS_CLIPCHILDREN on the host and WS_CHILD on the pane,
         the video feeds render together in ONE window rather than separate windows."""
-        u = ctypes.windll.user32
-        self._pip_rect_saved[tag] = self._win_rect(pane.hwnd)
-        st = (u.GetWindowLongPtrW(pane.hwnd, -16) or 0) & 0xFFFFFFFF
-        if st and (st & 0x00C00000):
+        wb = _wb()
+        self._pip_rect_saved[tag] = wb.get_rect(pane.hwnd)
+        st = wb.save_style(pane.hwnd)
+        if st:
             self._pip_saved[tag] = st
 
-        # Enable WS_CLIPCHILDREN (0x02000000) on the host so host swapchain does not overdraw child
-        host_st = (u.GetWindowLongPtrW(host.hwnd, -16) or 0) & 0xFFFFFFFF
-        u.SetWindowLongPtrW(host.hwnd, -16, host_st | 0x02000000)
-
-        # Reparent pane as a child of host
-        u.SetParent(pane.hwnd, host.hwnd)
-        # WS_CHILD (0x40000000) | WS_VISIBLE (0x10000000) | WS_CLIPSIBLINGS (0x04000000)
-        child_style = 0x40000000 | 0x10000000 | 0x04000000
-        u.SetWindowLongPtrW(pane.hwnd, -16, child_style)
+        # Reparent the pane into the host: a true child window, so the two
+        # feeds render inside ONE window (Windows SetParent / X11 XReparentWindow).
+        wb.embed(pane.hwnd, host.hwnd)
         pane.cmd({"command": ["set_property", "border", "no"]})
         pane.cmd({"command": ["set_property", "window-dragging", "no"]})
         self._pip_crop_on(tag)
@@ -3160,36 +3109,25 @@ class SyncApp:
 
     @staticmethod
     def _win_rect(hwnd):
-        u = ctypes.windll.user32
-        r = ctypes.wintypes.RECT()
-        if u.GetWindowRect(hwnd, ctypes.byref(r)):
-            return (r.left, r.top, r.right - r.left, r.bottom - r.top)
-        return None
+        return _wb().get_rect(hwnd)
 
     @staticmethod
     def _client_size(hwnd):
-        u = ctypes.windll.user32
-        r = ctypes.wintypes.RECT()
-        if u.GetClientRect(hwnd, ctypes.byref(r)):
-            return (r.right - r.left, r.bottom - r.top)
-        return None
+        return _wb().client_size(hwnd)
 
     def _undock_pip_int(self):
         """Detach child pane from host window and restore as normal top-level window."""
         tag = self._pip_int_tag
         p = self.players.get(tag) if tag else None
-        u = ctypes.windll.user32
+        wb = _wb()
         if p and p.running and p.hwnd:
-            u.SetParent(p.hwnd, 0)  # Detach from host parent
+            wb.unembed(p.hwnd)                      # detach from the host window
             p.cmd({"command": ["set_property", "border", "yes"]})
-            saved = self._pip_saved.get(tag) or (0x10000000 | 0x00CF0000)
-            u.SetWindowLongPtrW(p.hwnd, -16,
-                                saved if saved < 0x80000000 else saved - 0x100000000)
+            wb.restore_style(p.hwnd, self._pip_saved.get(tag))
             rect = self._pip_rect_saved.get(tag)
             if rect:
-                u.SetWindowPos(p.hwnd, 0, rect[0], rect[1],
-                               max(160, rect[2]), max(120, rect[3]),
-                               0x0004 | 0x0020)
+                wb.place(p.hwnd, rect[0], rect[1],
+                         max(160, rect[2]), max(120, rect[3]))
             p.cmd({"command": ["set_property", "ontop", "no"]})
             p.cmd({"command": ["set_property", "window-dragging", "yes"]})
             self._pip_crop_off(tag)
@@ -3239,7 +3177,6 @@ class SyncApp:
             self._embed_pane(pane, host, tag)
             self._pip_int_hwnd = pane.hwnd
             return
-        u = ctypes.windll.user32
         csz = self._client_size(host.hwnd)
         if not csz or csz[0] <= 0 or csz[1] <= 0:
             return
@@ -3247,7 +3184,7 @@ class SyncApp:
         x, y, w, h, max_x, max_y = self._pip_calc_rect(cw, ch)
         hwnd = self._pip_int_hwnd
         if hwnd:
-            u.SetWindowPos(hwnd, 0, x, y, w, h, 0x0004 | 0x0020)
+            _wb().move_child(hwnd, x, y, w, h)
 
     def _pip_resize(self, direction):
         """PiP size buttons (+/- keys): grow/shrink the embedded pane
@@ -3670,7 +3607,16 @@ class SyncApp:
             except Exception:
                 pass
         self._sync_tick()
-        self.root.after(33, self._poll)      # ~30 Hz: smooth bars
+        # Exactly ONE pending poll timer, whoever calls _poll(). A direct call
+        # (tests, scripts, a stray code path) must not stack an extra timer:
+        # each _poll schedules the next, so duplicate entry points multiply the
+        # poll rate geometrically until the app appears frozen.
+        if self._poll_after_id is not None:
+            try:
+                self.root.after_cancel(self._poll_after_id)
+            except Exception:
+                pass
+        self._poll_after_id = self.root.after(33, self._poll)      # ~30 Hz: smooth bars
 
     def _est_pos(self, tag, now):
         """Best guess of a video's CURRENT position, on a common time base.
@@ -3849,6 +3795,14 @@ class SyncApp:
             self.root.after(300, self._start)
 
     def _on_close(self):
+        # stop the 30 Hz poll timer first: a pending "after" script that fires
+        # after destroy() makes Tk complain ("invalid command name ..._poll")
+        if self._poll_after_id is not None:
+            try:
+                self.root.after_cancel(self._poll_after_id)
+            except Exception:
+                pass
+            self._poll_after_id = None
         try:
             if self.pip_int:
                 self._undock_pip_int()
@@ -3887,10 +3841,18 @@ def _install_crash_hook():
 
 def main():
     _install_crash_hook()
-    try:  # keep the GUI sharp on HiDPI
-        ctypes.windll.shcore.SetProcessDpiAwareness(1)
-    except Exception:
-        pass
+    if "--check-env" in sys.argv:
+        print(json.dumps(plat.diagnose(), indent=2))
+        return
+    if plat.IS_WIN:
+        try:  # keep the GUI sharp on HiDPI
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            pass
+    elif not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        print("SyncPlayer needs a graphical session: no DISPLAY / WAYLAND_DISPLAY set.")
+        print("Run it from your desktop, or use --check-env to inspect the environment.")
+        return
     if _HAS_DND:
         root = TkinterDnD.Tk()
     else:

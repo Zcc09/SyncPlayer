@@ -485,7 +485,9 @@ check("pip: state on", app.pip["A"])
 st = (u.GetWindowLongPtrW(app.players["A"].hwnd, -16) or 0) & 0xFFFFFFFF
 check("pip: borderless (caption + sysmenu gone, popup on) - style=%08X" % st,
       (st & 0x00C00000) == 0 and (st & 0x00080000) == 0 and (st & 0x80000000) != 0)
-check("pip: thick frame kept (resizable edges)", (st & 0x00040000) != 0)
+check("pip: fully frameless (no caption/sysmenu/thickframe, popup on)",
+      (st & 0x00C00000) == 0 and (st & 0x00080000) == 0
+      and (st & 0x00040000) == 0 and (st & 0x80000000) != 0, "style=%08X" % st)
 app._toggle_pip("A")
 check("pip: ontop command sent to mpv",
       ("A", {"command": ["set_property", "ontop", "yes"]}) in _cmd_log, "log=%s" % _cmd_log)
@@ -588,10 +590,13 @@ check("ipip: state on (A embedded)", app.pip_int and app._pip_int_tag == "A")
 hwnd = app._pip_int_hwnd
 check("ipip: embedded hwnd recorded", bool(hwnd))
 st = (u.GetWindowLongPtrW(hwnd, -16) or 0) & 0xFFFFFFFF
-check("ipip: frameless style (popup, no caption/sysmenu/thickframe) - %08X" % st,
-      (st & 0x00C00000) == 0 and (st & 0x00080000) == 0
-      and (st & 0x00040000) == 0 and (st & 0x80000000) != 0)
-check("ipip: top-level (not a child)", u.GetParent(hwnd) == 0)
+check("ipip: pane is a true CHILD window, frameless - %08X" % st,
+      (st & 0x40000000) != 0                      # WS_CHILD = real video-in-video
+      and (st & 0x00C00000) == 0 and (st & 0x00080000) == 0
+      and (st & 0x00040000) == 0)
+check("ipip: pane's parent IS the host video window",
+      u.GetParent(hwnd) == app.players["B"].hwnd,
+      "parent=%s host=%s" % (u.GetParent(hwnd), app.players["B"].hwnd))
 check("ipip: ontop sent to mpv",
       ("A", {"command": ["set_property", "ontop", "yes"]}) in _cmd_log)
 pump(1.2)   # let the 30 Hz poll place the pane over the host
@@ -624,6 +629,8 @@ pump(0.4)
 st2 = (u.GetWindowLongPtrW(hwnd, -16) or 0) & 0xFFFFFFFF
 check("ipip: undock clears state", not app.pip_int)
 check("ipip: undock restores caption", (st2 & 0x00C00000) != 0)
+check("ipip: undock returns the pane to top level (not a child)",
+      u.GetParent(hwnd) == 0, "parent=%s" % u.GetParent(hwnd))
 check("ipip: undock clears ontop",
       ("A", {"command": ["set_property", "ontop", "no"]}) in _cmd_log)
 check("ipip: undock restores window-dragging",
@@ -913,16 +920,22 @@ app._toggle_pip("A"); pump(0.6)
 check("z: Clear drops the crop and PiP doesn't bring it back",
       _clr is None and app._cur_crop("A") is None and app._manual_crop["A"] is None,
       "cleared=%r after=%r manual=%r" % (_clr, app._cur_crop("A"), app._manual_crop["A"]))
-# Auto re-probes (ignores a stale 'no bars' cache) and its feedback is pinned
-# against the ~30 Hz poll, so the button visibly reacts even on a bar-less file
-app._crop_tag = "A"
-app._srcs["A"] = MULTI    # A really plays multi.mkv (no bars) - probe it
-app._crop_auto()
-_zz = wait_until(lambda: "No black bars" in app.status_lbl.cget("text")
-                 or "cropped to" in app.status_lbl.cget("text"),
-                 25.0)
-check("z: Auto reacts (re-probes + feedback survives the poll)", _zz,
-      "status=%r" % app.status_lbl.cget("text"))
+# Auto-crop was REMOVED on purpose: there must be no Auto button / _crop_auto
+# entry point any more, and the manual crop must stay session-only.
+check("z: auto-crop feature is gone (no Auto button, no _crop_auto)",
+      not hasattr(app, "_crop_auto")
+      and not any("Auto" == getattr(b, "_sp_label", None)
+                  for b in getattr(app, "_crop_tag_btns", {}).values()),
+      "hasattr=%s" % hasattr(app, "_crop_auto"))
+# The crop cache may exist (it backs the manual ✂ Visual Crop dialog) but it
+# must never reach into a running player by itself: engaging PiP once must not
+# apply any crop the user did not ask for.
+_manual_before = dict(app._manual_crop)
+app._toggle_pip("A"); pump(0.6)
+app._toggle_pip("A"); pump(0.6)
+check("z: PiP on/off leaves the manual crop untouched (no auto-crop)",
+      app._manual_crop == _manual_before,
+      "before=%r after=%r" % (_manual_before, app._manual_crop))
 
 # ------------------------------------------------------ 12. screenshots --
 before = set(os.listdir(sp.SHOT_DIR)) if os.path.isdir(sp.SHOT_DIR) else set()

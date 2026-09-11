@@ -1,0 +1,20 @@
+# Line-ending policy for a cross-platform repo.
+#
+# Shell scripts MUST be LF: a CRLF shebang ("#!/usr/bin/env bash\r") makes
+# Linux fail with "bad interpreter: No such file or directory", and CRLF also
+# breaks `tar`/`./install.sh` on some systems. Forcing LF here means a Windows
+# checkout (core.autocrlf=true) can still be copied to a Linux box and run.
+*.sh            text eol=lf
+*.desktop       text eol=lf
+Makefile        text eol=lf
+
+# Everything else keeps git's normal text normalization (LF in the repository,
+# platform line endings on checkout). Python is happy either way, and leaving
+# it alone keeps the in-repo CRLF convention for syncplayer.py on Windows.
+
+# Never touch binaries.
+*.ico           binary
+*.png           binary
+*.mp4           binary
+*.exe           binary
+*.tar.gz        binary

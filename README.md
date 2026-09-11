@@ -1,5 +1,7 @@
 # SyncPlayer — dual-video synchronized player (mpv)
 
+*Windows and Linux (X11 and Wayland).*
+
 **Sync a movie you own with a YouTube reaction video, and keep them locked
 together for the whole runtime.**
 
@@ -18,13 +20,42 @@ together for the whole runtime.**
 
 ## Quick start
 
+### Windows
+
 1. **Install** with `SyncPlayer-Setup.exe` (installs the app **plus a bundled
    mpv**, so nothing else is needed on the machine). Then launch
    **SyncPlayer** from the Desktop / Start-Menu shortcut.
-2. Source A = your movie (Browse… or URL…), Source B = the reaction.
-3. Hit **Start** — both videos load **paused** and open side by side.
-4. Press **▶ Play** (transport or Master row, or `Space`) when ready.
-5. Drag the **Movie** or **Reaction** bar until the moments line up — that
+
+### Linux
+
+```bash
+git clone https://github.com/Zcc09/SyncPlayer && cd SyncPlayer
+./install.sh                     # installs to ~/.local/share/syncplayer
+```
+
+`install.sh` checks your dependencies, installs a launcher
+(`~/.local/bin/syncplayer`), adds a **SyncPlayer** entry to your app menu
+(with file-manager "Open with" support), and — if `yt-dlp` is not already on
+your system — fetches a private copy so YouTube links work out of the box.
+It needs `mpv`, `python3-tk` and `libX11` from your distro; the script prints
+the exact package command for apt/dnf/pacman/zypper when something is missing.
+
+```bash
+syncplayer --check-env           # verify mpv, yt-dlp, window backend, paths
+./uninstall.sh                   # remove the app (config + screenshots are kept)
+```
+
+> Wayland sessions are supported: SyncPlayer runs the video windows through
+> **X11 (Xwayland)** so they can be arranged, made borderless and used for
+> PiP. Set `SYNCPLAYER_MPV_GPU_CONTEXT=auto` to let mpv pick its own output
+> (window arranging is then unavailable on Wayland).
+
+### Both platforms
+
+1. Source A = your movie (Browse… or URL…), Source B = the reaction.
+2. Hit **Start** — both videos load **paused** and open side by side.
+3. Press **▶ Play** (transport or Master row, or `Space`) when ready.
+4. Drag the **Movie** or **Reaction** bar until the moments line up — that
    video moves on its own; the other stays put. For frame-perfect
    alignment: pause, then use the **⏴/⏵** step buttons to move one video
    one frame at a time.
@@ -127,17 +158,41 @@ together for the whole runtime.**
 
 ## Requirements
 
+**Windows**
+
 - Windows 10/11. **mpv and yt-dlp are bundled** by the installer — nothing
   else to install, and **YouTube links work out of the box** (the updater
   keeps mpv + yt-dlp current too). Optional **yt-dlp** not needed separately.
 - The bare `SyncPlayer.exe` (a standalone asset) still needs mpv + yt-dlp
   present; the **installer is the recommended** way to get a working app.
 
+**Linux**
+
+- `python3` (3.8+; tested on 3.14) **with tkinter**, `mpv` (tested on 0.41),
+  and `libX11`. `yt-dlp` is optional (install it or let `install.sh` fetch a
+  private copy) but required for URL sources.
+- Tested on **CachyOS / Arch** (KDE Plasma 6, Wayland + Xwayland). Any X11 or
+  Wayland desktops should work; the app drives windows through X11, so on pure
+  Wayland (no Xwayland) the player still works but read the note below.
+- On a **pure Wayland** session with no Xwayland there is no supported way for
+  an app to move or stack other programs' windows, so *arrange*, *floating
+  PiP* and *embedded PiP* are unavailable — the two videos and all sync
+  features (bars, drift correction, frame-step, volume, crop) still work.
+- The Windows self-updater is Windows-only; on Linux update with `git pull &&
+  ./install.sh` plus your package manager (`mpv`, `yt-dlp`).
+
 ## For developers
 
 ```
 syncplayer.py        # the whole app (panel + two mpv drivers + sync loop)
+sp_plat.py           # platform layer: Win32 + X11 window backends, mpv/yt-dlp
+                     # discovery, IPC transport (named pipe / unix socket),
+                     # config + screenshot locations
 selftest.py          # 59-check headless verification (python selftest.py)
+selftest_plat.py     # 20-check platform layer: paths, discovery, real mpv IPC
+                     # round trip (runs on Windows AND Linux)
+selftest_x11.py      # 16-check Linux/X11 window features against two REAL mpv
+                     # windows (find/arrange/borderless/ontop/embed/undock)
 gui_test.py          # 179-check END-TO-END test: drives the real GUI + real
                      # mpv processes (python gui_test.py) — bars track, per-
                      # video seeks, drift correction, volume read-back from
@@ -147,9 +202,13 @@ gui_test.py          # 179-check END-TO-END test: drives the real GUI + real
                      # yt subtitle merge, crop persistence + Auto re-probe
 installer.py         # self-contained installer (bundles app + mpv + yt-dlp + updater)
 updater.py           # checks/installs latest SyncPlayer + mpv + yt-dlp releases
-install_test.py      # 15-check DEPLOYMENT test: runs the real installer, then
+install_test.py      # DEPLOYMENT test (Windows): runs the real installer, then
                      # verifies the installed app plays TWO videos (one a
                      # YouTube link) using the bundled mpv + yt-dlp
+install.sh           # Linux installer (deps check, launcher, .desktop, yt-dlp)
+uninstall.sh         # Linux uninstaller
+install_test_linux.py# DEPLOYMENT test (Linux): install.sh, then TWO videos
+                     # (one YouTube) + playback, window features, crop, volume
 make_testclips.sh    # regenerates the demo clips (needs ffmpeg)
 make_icon.py         # regenerates icon.png / icon.ico
 dist/SyncPlayer.exe        # PyInstaller onefile build
