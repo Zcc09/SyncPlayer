@@ -211,21 +211,34 @@ def main():
     # Start playback: A is valid local movie, B is invalid YouTube URL
     app_obj._start()
 
-    # Poll for 6.5 seconds: B will fail/exit, auto-retry once, then A stays alive!
-    for _ in range(65):
+    # Poll until B has failed AND been cleaned up. This is network-bound:
+    # yt-dlp has to run and fail, the app auto-retries a failed stream ONCE,
+    # and only then is the player torn down. The important invariant is that A
+    # stays alive for the whole sequence, so watch it on every iteration.
+    a_alive_throughout = True
+    deadline = time.time() + 60.0
+    while time.time() < deadline:
         app_obj._poll()
         root.update()
+        pa_now = app_obj.players.get("A")
+        if not (pa_now is not None and pa_now.running):
+            a_alive_throughout = False
+            break
+        if app_obj.players.get("B") is None:      # B failed and was cleaned up
+            break
         time.sleep(0.1)
 
     pa = app_obj.players.get("A")
     pb = app_obj.players.get("B")
 
+    check("crash protection: movie player A stayed alive the whole time B failed",
+          a_alive_throughout, "A=%s B=%s" % (bool(pa and pa.running), bool(pb)))
     check("crash protection: movie player A is STILL RUNNING after YouTube B fails",
           pa is not None and pa.running)
     check("crash protection: movie player A is paused and protected",
           pa is not None and pa.paused)
     check("crash protection: failed YouTube player B is cleaned up",
-          pb is None)
+          pb is None, "pb=%r" % (pb,))
     check("crash protection: Start button re-enabled for retry",
           str(app_obj.btn_play.cget("state")) == "normal")
 
@@ -410,9 +423,24 @@ def main():
     # -------------------------------------------------------------------------
     app_obj.goto_vars["A"].set("00:06") # jump movie A alone to 6s
     app_obj._on_goto_single("A")
-    root.update()
-    time.sleep(0.2)
-    check("goto single: movie A seeks to 6s alone", abs((app_obj.last_pos.get("A") or 0) - 6.0) <= 1.0)
+    # The panel's own bookkeeping (_commit_seek) lands immediately, but a stale
+    # pre-seek position can still be sitting in the player's queue and overwrite
+    # it on the next poll. Verify against mpv ITSELF (authoritative) and give
+    # the seek a moment to land.
+    got = None
+    deadline = time.time() + 6.0
+    while time.time() < deadline:
+        root.update()
+        err, mp = pa.get_property("time-pos")
+        try:
+            got = abs(float(mp))
+        except (TypeError, ValueError):
+            got = None
+        if got is not None and abs(got - 6.0) <= 1.0:
+            break
+        time.sleep(0.1)
+    check("goto single: movie A seeks to 6s alone (mpv time-pos)",
+          got is not None and abs(got - 6.0) <= 1.0, "mpv time-pos=%s" % got)
     check("goto single: goto entry cleared after seek", app_obj.goto_vars["A"].get() == "")
 
     # -------------------------------------------------------------------------
