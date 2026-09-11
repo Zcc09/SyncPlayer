@@ -1077,60 +1077,63 @@ class Tooltip:
 
 class VisualCropDialog(tk.Toplevel):
     """Interactive visual cropping popup: displays a freeze-frame of the video
-    where the user can draw, drag, and resize a crop box with the mouse."""
+    where the user can draw, drag, and resize a crop box with the mouse.
+    The viewport and frame dynamically scale with window resizing, allowing
+    users to expand the window as large as they want for maximum precision."""
     def __init__(self, parent, image_path, initial_crop=None, video_name="Video", on_apply=None):
         super().__init__(parent)
         self.title("Visual Crop — %s" % video_name)
         self.transient(parent)
         self.grab_set()
         self.configure(bg="#1f232b")
+        self.geometry("960x650")
+        self.minsize(500, 380)
+        self.resizable(True, True)
 
         self.on_apply = on_apply
         self.orig_img = Image.open(image_path)
         self.orig_w, self.orig_h = self.orig_img.size
 
-        # Fit comfortably on screen (max 880x520)
-        max_w, max_h = 880, 520
-        scale_w = max_w / float(self.orig_w) if self.orig_w > 0 else 1.0
-        scale_h = max_h / float(self.orig_h) if self.orig_h > 0 else 1.0
-        self.scale = min(1.0, scale_w, scale_h)
-        self.disp_w = max(160, int(self.orig_w * self.scale))
-        self.disp_h = max(120, int(self.orig_h * self.scale))
+        # Crop rectangle in ORIGINAL IMAGE coordinates: ox1, oy1, ox2, oy2
+        if initial_crop and len(initial_crop) == 4:
+            cw, ch, cx, cy = initial_crop
+            self.ox1 = max(0, min(self.orig_w, cx))
+            self.oy1 = max(0, min(self.orig_h, cy))
+            self.ox2 = max(0, min(self.orig_w, cx + cw))
+            self.oy2 = max(0, min(self.orig_h, cy + ch))
+        else:
+            self.ox1, self.oy1 = 0, 0
+            self.ox2, self.oy2 = self.orig_w, self.orig_h
 
-        resample = getattr(Image, "Resampling", Image).LANCZOS
-        self.disp_img = self.orig_img.resize((self.disp_w, self.disp_h), resample)
-        self.photo = ImageTk.PhotoImage(self.disp_img)
+        # Dynamic viewport geometry
+        self.scale = 1.0
+        self.disp_w = self.orig_w
+        self.disp_h = self.orig_h
+        self.off_x = 0
+        self.off_y = 0
+        self.photo = None
 
         # Header info
         hdr = ttk.Frame(self)
         hdr.pack(fill="x", padx=12, pady=(10, 4))
-        self.lbl_info = ttk.Label(hdr, text="Drag to select or resize the crop box", font=("Segoe UI", 9))
+        self.lbl_info = ttk.Label(hdr, text="Drag to select or resize the crop box. Resize window for larger view.", font=("Segoe UI", 9))
         self.lbl_info.pack(side="left")
 
-        # Canvas
-        self.canvas = tk.Canvas(self, width=self.disp_w, height=self.disp_h,
-                                bg="#111317", highlightthickness=1,
-                                highlightbackground="#333740")
-        self.canvas.pack(padx=12, pady=4)
-        self.canvas.create_image(0, 0, anchor="nw", image=self.photo)
+        # Canvas container
+        self.canv_frame = ttk.Frame(self)
+        self.canv_frame.pack(fill="both", expand=True, padx=12, pady=4)
 
-        # Initial crop rect in display coords
-        if initial_crop and len(initial_crop) == 4:
-            cw, ch, cx, cy = initial_crop
-            self.rx1 = int(cx * self.scale)
-            self.ry1 = int(cy * self.scale)
-            self.rx2 = int((cx + cw) * self.scale)
-            self.ry2 = int((cy + ch) * self.scale)
-        else:
-            self.rx1, self.ry1 = 0, 0
-            self.rx2, self.ry2 = self.disp_w, self.disp_h
+        self.canvas = tk.Canvas(self.canv_frame, bg="#111317", highlightthickness=1,
+                                highlightbackground="#333740")
+        self.canvas.pack(fill="both", expand=True)
 
         # Interaction state
         self.mode = None
         self.start_x = 0
         self.start_y = 0
-        self.drag_start_box = (0, 0, 0, 0)
+        self.drag_start_orig = (0, 0, 0, 0)
 
+        self.canvas.bind("<Configure>", self._on_canvas_configure)
         self.canvas.bind("<ButtonPress-1>", self._on_press)
         self.canvas.bind("<B1-Motion>", self._on_drag)
         self.canvas.bind("<ButtonRelease-1>", self._on_release)
@@ -1152,17 +1155,56 @@ class VisualCropDialog(tk.Toplevel):
         self.bind("<Return>", lambda e: self._apply())
         self.bind("<Escape>", lambda e: self.destroy())
 
+    def _on_canvas_configure(self, event):
+        cw = max(50, event.width)
+        ch = max(50, event.height)
+        scale_w = cw / float(self.orig_w) if self.orig_w > 0 else 1.0
+        scale_h = ch / float(self.orig_h) if self.orig_h > 0 else 1.0
+        new_scale = min(scale_w, scale_h)
+        new_dw = max(10, int(self.orig_w * new_scale))
+        new_dh = max(10, int(self.orig_h * new_scale))
+        new_ox = (cw - new_dw) // 2
+        new_oy = (ch - new_dh) // 2
+
+        self.scale = new_scale
+        self.disp_w = new_dw
+        self.disp_h = new_dh
+        self.off_x = new_ox
+        self.off_y = new_oy
+
+        resample = getattr(Image, "Resampling", Image).BILINEAR
+        disp_img = self.orig_img.resize((self.disp_w, self.disp_h), resample)
+        self.photo = ImageTk.PhotoImage(disp_img)
+
+        self.canvas.delete("img")
+        self.canvas.create_image(self.off_x, self.off_y, anchor="nw", image=self.photo, tags="img")
         self._draw_overlay()
 
+    def _to_display(self, ox, oy):
+        return int(self.off_x + ox * self.scale), int(self.off_y + oy * self.scale)
+
+    def _to_orig(self, dx, dy):
+        if self.scale <= 0:
+            return 0, 0
+        ox = int((dx - self.off_x) / self.scale)
+        oy = int((dy - self.off_y) / self.scale)
+        return max(0, min(self.orig_w, ox)), max(0, min(self.orig_h, oy))
+
+    def _get_display_rect(self):
+        x1, y1 = min(self.ox1, self.ox2), min(self.oy1, self.oy2)
+        x2, y2 = max(self.ox1, self.ox2), max(self.oy1, self.oy2)
+        rx1, ry1 = self._to_display(x1, y1)
+        rx2, ry2 = self._to_display(x2, y2)
+        return rx1, ry1, rx2, ry2
+
     def _get_handles(self):
-        x1, y1 = min(self.rx1, self.rx2), min(self.ry1, self.ry2)
-        x2, y2 = max(self.rx1, self.rx2), max(self.ry1, self.ry2)
-        mx = (x1 + x2) // 2
-        my = (y1 + y2) // 2
+        rx1, ry1, rx2, ry2 = self._get_display_rect()
+        mx = (rx1 + rx2) // 2
+        my = (ry1 + ry2) // 2
         return {
-            "nw": (x1, y1), "n": (mx, y1), "ne": (x2, y1),
-            "w": (x1, my),                  "e": (x2, my),
-            "sw": (x1, y2), "s": (mx, y2), "se": (x2, y2)
+            "nw": (rx1, ry1), "n": (mx, ry1), "ne": (rx2, ry1),
+            "w": (rx1, my),                    "e": (rx2, my),
+            "sw": (rx1, ry2), "s": (mx, ry2), "se": (rx2, ry2)
         }
 
     def _hit_test(self, x, y):
@@ -1171,11 +1213,12 @@ class VisualCropDialog(tk.Toplevel):
         for name, (hx, hy) in handles.items():
             if abs(x - hx) <= tol and abs(y - hy) <= tol:
                 return name
-        x1, y1 = min(self.rx1, self.rx2), min(self.ry1, self.ry2)
-        x2, y2 = max(self.rx1, self.rx2), max(self.ry1, self.ry2)
-        if x1 < x < x2 and y1 < y < y2:
+        rx1, ry1, rx2, ry2 = self._get_display_rect()
+        if rx1 < x < rx2 and ry1 < y < ry2:
             return "move"
-        return "new"
+        if self.off_x <= x <= self.off_x + self.disp_w and self.off_y <= y <= self.off_y + self.disp_h:
+            return "new"
+        return None
 
     def _on_hover(self, event):
         hit = self._hit_test(event.x, event.y)
@@ -1187,108 +1230,119 @@ class VisualCropDialog(tk.Toplevel):
             "move": "fleur",
             "new": "crosshair"
         }
-        self.canvas.config(cursor=cursor_map.get(hit, "crosshair"))
+        self.canvas.config(cursor=cursor_map.get(hit, ""))
 
     def _on_press(self, event):
-        self.start_x = max(0, min(self.disp_w, event.x))
-        self.start_y = max(0, min(self.disp_h, event.y))
-        self.drag_start_box = (self.rx1, self.ry1, self.rx2, self.ry2)
-        self.mode = self._hit_test(self.start_x, self.start_y)
+        hit = self._hit_test(event.x, event.y)
+        if not hit:
+            return
+        self.mode = hit
+        self.start_x = event.x
+        self.start_y = event.y
+        self.drag_start_orig = (self.ox1, self.oy1, self.ox2, self.oy2)
         if self.mode == "new":
-            self.rx1 = self.start_x
-            self.ry1 = self.start_y
-            self.rx2 = self.start_x
-            self.ry2 = self.start_y
+            ox, oy = self._to_orig(event.x, event.y)
+            self.ox1 = ox
+            self.oy1 = oy
+            self.ox2 = ox
+            self.oy2 = oy
             self._draw_overlay()
 
     def _on_drag(self, event):
-        cx = max(0, min(self.disp_w, event.x))
-        cy = max(0, min(self.disp_h, event.y))
-        dx = cx - self.start_x
-        dy = cy - self.start_y
-        ox1, oy1, ox2, oy2 = self.drag_start_box
+        if not self.mode:
+            return
+        ox1, oy1, ox2, oy2 = self.drag_start_orig
         x1, y1 = min(ox1, ox2), min(oy1, oy2)
         x2, y2 = max(ox1, ox2), max(oy1, oy2)
 
+        cur_ox, cur_oy = self._to_orig(event.x, event.y)
+        st_ox, st_oy = self._to_orig(self.start_x, self.start_y)
+        d_ox = cur_ox - st_ox
+        d_oy = cur_oy - st_oy
+
         if self.mode == "new":
-            self.rx2 = cx
-            self.ry2 = cy
+            self.ox2 = cur_ox
+            self.oy2 = cur_oy
         elif self.mode == "move":
             bw = x2 - x1
             bh = y2 - y1
-            nx1 = max(0, min(self.disp_w - bw, x1 + dx))
-            ny1 = max(0, min(self.disp_h - bh, y1 + dy))
-            self.rx1, self.ry1 = nx1, ny1
-            self.rx2, self.ry2 = nx1 + bw, ny1 + bh
+            nx1 = max(0, min(self.orig_w - bw, x1 + d_ox))
+            ny1 = max(0, min(self.orig_h - bh, y1 + d_oy))
+            self.ox1, self.oy1 = nx1, ny1
+            self.ox2, self.oy2 = nx1 + bw, ny1 + bh
         elif self.mode == "nw":
-            self.rx1 = min(x2 - 10, max(0, x1 + dx))
-            self.ry1 = min(y2 - 10, max(0, y1 + dy))
-            self.rx2, self.ry2 = x2, y2
+            self.ox1 = min(x2 - 16, max(0, x1 + d_ox))
+            self.oy1 = min(y2 - 16, max(0, y1 + d_oy))
+            self.ox2, self.oy2 = x2, y2
         elif self.mode == "se":
-            self.rx1, self.ry1 = x1, y1
-            self.rx2 = max(x1 + 10, min(self.disp_w, x2 + dx))
-            self.ry2 = max(y1 + 10, min(self.disp_h, y2 + dy))
+            self.ox1, self.oy1 = x1, y1
+            self.ox2 = max(x1 + 16, min(self.orig_w, x2 + d_ox))
+            self.oy2 = max(y1 + 16, min(self.orig_h, y2 + d_oy))
         elif self.mode == "ne":
-            self.rx1 = x1
-            self.ry1 = min(y2 - 10, max(0, y1 + dy))
-            self.rx2 = max(x1 + 10, min(self.disp_w, x2 + dx))
-            self.ry2 = y2
+            self.ox1 = x1
+            self.oy1 = min(y2 - 16, max(0, y1 + d_oy))
+            self.ox2 = max(x1 + 16, min(self.orig_w, x2 + d_ox))
+            self.oy2 = y2
         elif self.mode == "sw":
-            self.rx1 = min(x2 - 10, max(0, x1 + dx))
-            self.ry1 = y1
-            self.rx2 = x2
-            self.ry2 = max(y1 + 10, min(self.disp_h, y2 + dy))
+            self.ox1 = min(x2 - 16, max(0, x1 + d_ox))
+            self.oy1 = y1
+            self.ox2 = x2
+            self.oy2 = max(y1 + 16, min(self.orig_h, y2 + d_oy))
         elif self.mode == "n":
-            self.rx1, self.rx2 = x1, x2
-            self.ry1 = min(y2 - 10, max(0, y1 + dy))
-            self.ry2 = y2
+            self.ox1, self.ox2 = x1, x2
+            self.oy1 = min(y2 - 16, max(0, y1 + d_oy))
+            self.oy2 = y2
         elif self.mode == "s":
-            self.rx1, self.rx2 = x1, x2
-            self.ry1 = y1
-            self.ry2 = max(y1 + 10, min(self.disp_h, y2 + dy))
+            self.ox1, self.ox2 = x1, x2
+            self.oy1 = y1
+            self.oy2 = max(y1 + 16, min(self.orig_h, y2 + d_oy))
         elif self.mode == "w":
-            self.rx1 = min(x2 - 10, max(0, x1 + dx))
-            self.ry1, self.ry2 = y1, y2
-            self.rx2 = x2
+            self.ox1 = min(x2 - 16, max(0, x1 + d_ox))
+            self.oy1, self.oy2 = y1, y2
+            self.ox2 = x2
         elif self.mode == "e":
-            self.rx1 = x1
-            self.ry1, self.ry2 = y1, y2
-            self.rx2 = max(x1 + 10, min(self.disp_w, x2 + dx))
+            self.ox1 = x1
+            self.oy1, self.oy2 = y1, y2
+            self.ox2 = max(x1 + 16, min(self.orig_w, x2 + d_ox))
 
         self._draw_overlay()
 
     def _on_release(self, event):
-        x1, y1 = min(self.rx1, self.rx2), min(self.ry1, self.ry2)
-        x2, y2 = max(self.rx1, self.rx2), max(self.ry1, self.ry2)
+        x1, y1 = min(self.ox1, self.ox2), min(self.oy1, self.oy2)
+        x2, y2 = max(self.ox1, self.ox2), max(self.oy1, self.oy2)
         if (x2 - x1) < 16 or (y2 - y1) < 16:
             self._reset_full()
         else:
-            self.rx1, self.ry1, self.rx2, self.ry2 = x1, y1, x2, y2
+            self.ox1, self.oy1, self.ox2, self.oy2 = x1, y1, x2, y2
             self._draw_overlay()
+        self.mode = None
 
     def _draw_overlay(self):
         self.canvas.delete("overlay")
-        x1, y1 = min(self.rx1, self.rx2), min(self.ry1, self.ry2)
-        x2, y2 = max(self.rx1, self.rx2), max(self.ry1, self.ry2)
+        rx1, ry1, rx2, ry2 = self._get_display_rect()
+        im_x1 = self.off_x
+        im_y1 = self.off_y
+        im_x2 = self.off_x + self.disp_w
+        im_y2 = self.off_y + self.disp_h
 
-        # Semi-transparent shaded strips outside the crop box
+        # Semi-transparent shaded strips outside the crop box (clamped to image bounds)
         fill_color = "#000000"
         stipple = "gray50"
-        if y1 > 0:
-            self.canvas.create_rectangle(0, 0, self.disp_w, y1, fill=fill_color, stipple=stipple, width=0, tags="overlay")
-        if y2 < self.disp_h:
-            self.canvas.create_rectangle(0, y2, self.disp_w, self.disp_h, fill=fill_color, stipple=stipple, width=0, tags="overlay")
-        if x1 > 0:
-            self.canvas.create_rectangle(0, y1, x1, y2, fill=fill_color, stipple=stipple, width=0, tags="overlay")
-        if x2 < self.disp_w:
-            self.canvas.create_rectangle(x2, y1, self.disp_w, y2, fill=fill_color, stipple=stipple, width=0, tags="overlay")
+        if ry1 > im_y1:
+            self.canvas.create_rectangle(im_x1, im_y1, im_x2, ry1, fill=fill_color, stipple=stipple, width=0, tags="overlay")
+        if ry2 < im_y2:
+            self.canvas.create_rectangle(im_x1, ry2, im_x2, im_y2, fill=fill_color, stipple=stipple, width=0, tags="overlay")
+        if rx1 > im_x1:
+            self.canvas.create_rectangle(im_x1, ry1, rx1, ry2, fill=fill_color, stipple=stipple, width=0, tags="overlay")
+        if rx2 < im_x2:
+            self.canvas.create_rectangle(rx2, ry1, im_x2, ry2, fill=fill_color, stipple=stipple, width=0, tags="overlay")
 
         # Crop box border
-        self.canvas.create_rectangle(x1, y1, x2, y2, outline="#00b4d8", width=2, tags="overlay")
+        self.canvas.create_rectangle(rx1, ry1, rx2, ry2, outline="#00b4d8", width=2, tags="overlay")
 
         # Handles
         handles = self._get_handles()
-        hs = 4
+        hs = 5
         for hx, hy in handles.values():
             self.canvas.create_rectangle(hx - hs, hy - hs, hx + hs, hy + hs, fill="#ffffff", outline="#00b4d8", width=1.5, tags="overlay")
 
@@ -1297,27 +1351,22 @@ class VisualCropDialog(tk.Toplevel):
         if orig_crop:
             cw, ch, cx, cy = orig_crop
             asp = cw / float(ch) if ch > 0 else 0
-            self.lbl_info.config(text="Crop: %d × %d at (+%d, +%d) — Aspect: %.2f:1" % (cw, ch, cx, cy, asp))
+            self.lbl_info.config(text="Crop: %d × %d at (+%d, +%d) — Aspect: %.2f:1 [Window resizable for higher precision]" % (cw, ch, cx, cy, asp))
         else:
-            self.lbl_info.config(text="Full Frame: %d × %d (no crop)" % (self.orig_w, self.orig_h))
+            self.lbl_info.config(text="Full Frame: %d × %d (no crop) [Window resizable for higher precision]" % (self.orig_w, self.orig_h))
 
     def _reset_full(self):
-        self.rx1, self.ry1 = 0, 0
-        self.rx2, self.ry2 = self.disp_w, self.disp_h
+        self.ox1, self.oy1 = 0, 0
+        self.ox2, self.oy2 = self.orig_w, self.orig_h
         self._draw_overlay()
 
     def get_orig_crop(self):
-        x1, y1 = min(self.rx1, self.rx2), min(self.ry1, self.ry2)
-        x2, y2 = max(self.rx1, self.rx2), max(self.ry1, self.ry2)
-        ox = int(x1 / self.scale)
-        oy = int(y1 / self.scale)
-        ow = int((x2 - x1) / self.scale)
-        oh = int((y2 - y1) / self.scale)
-
-        ox = max(0, min(self.orig_w - 1, ox))
-        oy = max(0, min(self.orig_h - 1, oy))
-        ow = min(self.orig_w - ox, ow)
-        oh = min(self.orig_h - oy, oh)
+        x1, y1 = min(self.ox1, self.ox2), min(self.oy1, self.oy2)
+        x2, y2 = max(self.ox1, self.ox2), max(self.oy1, self.oy2)
+        ow = x2 - x1
+        oh = y2 - y1
+        ox = x1
+        oy = y1
 
         if ow >= self.orig_w - 4 and oh >= self.orig_h - 4 and ox <= 2 and oy <= 2:
             return None

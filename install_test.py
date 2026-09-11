@@ -316,7 +316,7 @@ def main():
           err == "success" and (vc == "" or vc is None), "video-crop=%s" % vc)
 
     # -------------------------------------------------------------------------
-    # 8. Interactive visual crop test: VisualCropDialog drag & apply
+    # 8. Interactive visual crop test: VisualCropDialog drag, resize & scale
     # -------------------------------------------------------------------------
     snap_test = os.path.join(BASE, "testmedia", "frame_sb_split25.jpg")
     applied_crop = []
@@ -325,12 +325,20 @@ def main():
     root.update()
     check("visual crop: dialog created with source image", dlg.orig_w == 1920 and dlg.orig_h == 720)
     init_c = dlg.get_orig_crop()
-    check("visual crop: initial crop box matches existing crop", init_c is not None and abs(init_c[0] - 1280) <= 2 and abs(init_c[1] - 540) <= 2)
+    check("visual crop: initial crop box matches existing crop", init_c == (1280, 540, 0, 90), "crop=%s" % str(init_c))
+
+    # Test dynamic viewport scaling: simulate window resize to 1400x800
+    old_scale = dlg.scale
+    dlg._on_canvas_configure(type("Event", (), {"width": 1400, "height": 800})())
+    root.update()
+    check("visual crop: viewport scales dynamically with window resize", dlg.scale != old_scale and dlg.disp_w > 0 and dlg.disp_h > 0)
+    check("visual crop: original crop coordinates preserved exactly after window resize",
+          dlg.get_orig_crop() == (1280, 540, 0, 90), "crop=%s" % str(dlg.get_orig_crop()))
 
     # Apply crop
     dlg._apply()
     root.update()
-    check("visual crop: apply invokes on_apply callback with rect", len(applied_crop) == 1 and applied_crop[0] is not None)
+    check("visual crop: apply invokes on_apply callback with rect", len(applied_crop) == 1 and applied_crop[0] == (1280, 540, 0, 90))
 
     # Apply the visual crop to live player A
     app_obj._crop_apply("A", applied_crop[0])
