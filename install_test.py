@@ -287,6 +287,32 @@ def main():
         check("embed pip: child pane has WS_CHILD style",
               bool(child_st & WS_CHILD), "child_st=%s" % hex(child_st))
 
+        # Test embedded PiP edge reaching & 1-pixel fine-tune move
+        csz = app_obj._client_size(pa.hwnd)
+        cw, ch = csz
+        # Move all the way right
+        for _ in range(35):
+            app_obj._pip_move(1, 0)
+        x_r, y_r, w_r, h_r, mx_r, my_r = app_obj._pip_calc_rect(cw, ch)
+        check("embed pip: pane can reach 100% right edge", x_r == mx_r, "x=%d, max_x=%d" % (x_r, mx_r))
+
+        # Move all the way bottom
+        for _ in range(35):
+            app_obj._pip_move(0, 1)
+        x_b, y_b, w_b, h_b, mx_b, my_b = app_obj._pip_calc_rect(cw, ch)
+        check("embed pip: pane can reach 100% bottom edge", y_b == my_b, "y=%d, max_y=%d" % (y_b, my_b))
+
+        # Move all the way left & top
+        for _ in range(35):
+            app_obj._pip_move(-1, -1)
+        x_lt, y_lt, w_lt, h_lt, mx_lt, my_lt = app_obj._pip_calc_rect(cw, ch)
+        check("embed pip: pane can reach top-left edge (0,0)", x_lt == 0 and y_lt == 0, "x=%d, y=%d" % (x_lt, y_lt))
+
+        # Test Shift fine-tune 1px move
+        app_obj._pip_move(1, 0, fine=True) # 1 pixel right
+        x_fine, _, _, _, _, _ = app_obj._pip_calc_rect(cw, ch)
+        check("embed pip: shift fine-tune moves by exactly 1 pixel", x_fine == 1, "x=%d" % x_fine)
+
         # Undock
         app_obj._undock_pip_int()
         root.update()

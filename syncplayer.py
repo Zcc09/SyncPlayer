@@ -1769,14 +1769,15 @@ class SyncApp:
         pip_pos.pack(side="left", padx=(12, 0))
         ttk.Label(pip_pos, text="PiP move:", style="Dim.TLabel").pack(side="left")
         self._pip_xy_btns = []
-        for txt, dx, dy, tip in (("◀", -1, 0, "Move the embedded PiP pane LEFT"),
-                                 ("▲", 0, -1, "Move the embedded PiP pane UP"),
-                                 ("▼", 0, 1, "Move the embedded PiP pane DOWN"),
-                                 ("▶", 1, 0, "Move the embedded PiP pane RIGHT")):
+        for txt, dx, dy, tip in (("◀", -1, 0, "Move embedded PiP LEFT (Hold Shift for 1px fine-tune)"),
+                                 ("▲", 0, -1, "Move embedded PiP UP (Hold Shift for 1px fine-tune)"),
+                                 ("▼", 0, 1, "Move embedded PiP DOWN (Hold Shift for 1px fine-tune)"),
+                                 ("▶", 1, 0, "Move embedded PiP RIGHT (Hold Shift for 1px fine-tune)")):
             b = ttk.Button(pip_pos, text=txt, width=3,
-                           command=lambda dx=dx, dy=dy: self._pip_move(dx, dy))
+                           command=lambda dx=dx, dy=dy: self._pip_move(dx, dy, fine=False))
             b.pack(side="left", padx=(1, 0))
             Tooltip(b, tip)
+            b.bind("<Shift-Button-1>", lambda e, dx=dx, dy=dy: (self._pip_move(dx, dy, fine=True), "break")[1])
             self._pip_xy_btns.append(b)
             self._ctrls.append(b)
         # PiP size: scale the embedded pane bigger/smaller
@@ -1876,10 +1877,14 @@ class SyncApp:
         self.state_lbl.pack(fill="x")
 
         self.root.bind("<space>", lambda e: self._toggle_play())
-        self.root.bind("<Left>", lambda e: None if self._pip_nudge(-5, 0) else self._jump(-self._get_jump_sec()))
-        self.root.bind("<Right>", lambda e: None if self._pip_nudge(5, 0) else self._jump(self._get_jump_sec()))
-        self.root.bind("<Up>", lambda e: self._pip_nudge(0, -5))
-        self.root.bind("<Down>", lambda e: self._pip_nudge(0, 5))
+        self.root.bind("<Left>", lambda e: None if self._pip_nudge(-15, 0) else self._jump(-self._get_jump_sec()))
+        self.root.bind("<Right>", lambda e: None if self._pip_nudge(15, 0) else self._jump(self._get_jump_sec()))
+        self.root.bind("<Up>", lambda e: self._pip_nudge(0, -15))
+        self.root.bind("<Down>", lambda e: self._pip_nudge(0, 15))
+        self.root.bind("<Shift-Left>", lambda e: self._pip_nudge(-1, 0))
+        self.root.bind("<Shift-Right>", lambda e: self._pip_nudge(1, 0))
+        self.root.bind("<Shift-Up>", lambda e: self._pip_nudge(0, -1))
+        self.root.bind("<Shift-Down>", lambda e: self._pip_nudge(0, 1))
         self.root.bind("<bracketleft>", lambda e: self._step_frame(self._last_active, back=True))
         self.root.bind("<bracketright>", lambda e: self._step_frame(self._last_active, back=False))
         self.root.bind("<Escape>", lambda e: self._undock_pip_int() if self.pip_int else None)
@@ -3154,6 +3159,30 @@ class SyncApp:
         self._status_pin = time.monotonic() + 3.0
         self.status_lbl.config(text="Integrated PiP off - video restored to its own window.")
 
+    def _pip_calc_rect(self, cw, ch):
+        """Calculate the exact (x, y, w, h) in pixels for the embedded pane.
+        Guarantees that the pane can always reach all 4 edges (left x=0, top y=0,
+        right x=cw-w, bottom y=ch-h) regardless of scaling, cropping, or aspect ratio."""
+        w = max(60, int(self._pip_int_size[0] * cw))
+        h = max(34, int(self._pip_int_size[1] * ch))
+        asp = self._pip_int_asp
+        if asp and asp > 0:
+            h = max(34, int(w / asp))
+            maxh = max(34, int(0.98 * ch))
+            if h > maxh:
+                h = maxh
+                w = max(60, int(h * asp))
+            maxw = max(60, int(0.98 * cw))
+            if w > maxw:
+                w = maxw
+                h = max(34, int(w / asp))
+
+        max_x = max(0, cw - w)
+        max_y = max(0, ch - h)
+        x = max(0, min(max_x, int(round(self._pip_int_pos[0] * max_x))))
+        y = max(0, min(max_y, int(round(self._pip_int_pos[1] * max_y))))
+        return x, y, w, h, max_x, max_y
+
     def _pip_update_pane(self, force=False):
         """Update the position of the embedded child pane inside the host client area."""
         if not (self.pip_int and self._pip_int_hwnd):
@@ -3173,56 +3202,47 @@ class SyncApp:
         if not csz or csz[0] <= 0 or csz[1] <= 0:
             return
         cw, ch = csz
-        # Coordinates are relative to host's client area directly (true Win32 child window)
-        x = int(self._pip_int_pos[0] * cw)
-        y = int(self._pip_int_pos[1] * ch)
-        w = max(60, int(self._pip_int_size[0] * cw))
-        h = max(34, int(self._pip_int_size[1] * ch))
-        asp = self._pip_int_asp
-        if asp:
-            h = int(w / asp)
-            maxh = int(0.92 * ch)
-            if h > maxh:
-                h = maxh
-                w = max(60, int(h * asp))
-        if self._pip_move_run:
-            return
-        self._pip_move_run = True
-
-        def _place():
-            try:
-                hwnd = self._pip_int_hwnd
-                if hwnd:
-                    u.SetWindowPos(hwnd, 0, x, y, w, h, 0x0004 | 0x0020)
-            finally:
-                self._pip_move_run = False
-        threading.Thread(target=_place, daemon=True).start()
+        x, y, w, h, max_x, max_y = self._pip_calc_rect(cw, ch)
+        hwnd = self._pip_int_hwnd
+        if hwnd:
+            u.SetWindowPos(hwnd, 0, x, y, w, h, 0x0004 | 0x0020)
 
     def _pip_resize(self, direction):
         """PiP size buttons (+/- keys): grow/shrink the embedded pane
-        (12% per press, clamped to 8%..95% of the host feed), keeping it
-        inside the host."""
+        (10% per press, clamped to 8%..96% of the host feed)."""
         if not self.pip_int:
             return False
-        f = 1.12 if direction > 0 else (1.0 / 1.12)
+        f = 1.10 if direction > 0 else (1.0 / 1.10)
         s = self._pip_int_size
-        s[0] = min(0.95, max(0.08, s[0] * f))
-        s[1] = min(0.95, max(0.08, s[1] * f))
-        self._pip_int_pos[0] = min(1.0 - s[0], max(0.0, self._pip_int_pos[0]))
-        self._pip_int_pos[1] = min(1.0 - s[1], max(0.0, self._pip_int_pos[1]))
+        s[0] = min(0.96, max(0.08, s[0] * f))
+        s[1] = min(0.96, max(0.08, s[1] * f))
         self._pip_update_pane(force=True)
         return True
 
-    def _pip_move(self, dx, dy):
-        """Panel X/Y arrows: nudge the pane 4% of the host feed per press."""
+    def _pip_move(self, dx, dy, fine=False):
+        """Panel X/Y arrows: move the pane inside the host video feed.
+        If fine=True (or Shift held), moves pixel-by-pixel (1 px).
+        Otherwise moves by 16 px. Can move right up to all 4 edges."""
         if not self.pip_int:
             return False
-        step = 0.04
-        self._pip_int_pos[0] = min(1.0 - self._pip_int_size[0],
-                                   max(0.0, self._pip_int_pos[0] + step * dx))
-        self._pip_int_pos[1] = min(1.0 - self._pip_int_size[1],
-                                   max(0.0, self._pip_int_pos[1] + step * dy))
+        host = self.players.get(self._pip_int_host) if self._pip_int_host else None
+        csz = self._client_size(host.hwnd) if (host and host.hwnd) else None
+        if not csz or csz[0] <= 0 or csz[1] <= 0:
+            return False
+        cw, ch = csz
+        x, y, w, h, max_x, max_y = self._pip_calc_rect(cw, ch)
+
+        step_px = 1 if fine else max(12, int(0.035 * max(max_x, max_y, 100)))
+        nx = max(0, min(max_x, x + dx * step_px))
+        ny = max(0, min(max_y, y + dy * step_px))
+
+        self._pip_int_pos[0] = (nx / max_x) if max_x > 0 else 0.0
+        self._pip_int_pos[1] = (ny / max_y) if max_y > 0 else 0.0
         self._pip_update_pane(force=True)
+
+        mode_str = "1px fine" if fine else "%dpx" % step_px
+        self._status_pin = time.monotonic() + 1.5
+        self.status_lbl.config(text="PiP pos: (%d, %d) [%s step]" % (nx, ny, mode_str))
         return True
 
     def _pip_nudge(self, dx, dy):
@@ -3233,10 +3253,14 @@ class SyncApp:
         csz = self._client_size(host.hwnd) if (host and host.hwnd) else None
         if not csz or csz[0] <= 0 or csz[1] <= 0:
             return False
-        self._pip_int_pos[0] = min(1.0 - self._pip_int_size[0],
-                                   max(0.0, self._pip_int_pos[0] + dx / csz[0]))
-        self._pip_int_pos[1] = min(1.0 - self._pip_int_size[1],
-                                   max(0.0, self._pip_int_pos[1] + dy / csz[1]))
+        cw, ch = csz
+        x, y, w, h, max_x, max_y = self._pip_calc_rect(cw, ch)
+
+        nx = max(0, min(max_x, x + dx))
+        ny = max(0, min(max_y, y + dy))
+
+        self._pip_int_pos[0] = (nx / max_x) if max_x > 0 else 0.0
+        self._pip_int_pos[1] = (ny / max_y) if max_y > 0 else 0.0
         self._pip_update_pane(force=True)
         return True
 
