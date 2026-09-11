@@ -91,7 +91,7 @@ def t_installer():
             state = json.load(open(meta))
         except Exception:
             pass
-    check("install: install.json app_version", state.get("app_version") == "1.5.0",
+    check("install: install.json app_version", state.get("app_version") == "1.5.1",
           state.get("app_version"))
     check("install: install.json platform is linux", state.get("platform") == "linux",
           state.get("platform"))

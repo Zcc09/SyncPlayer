@@ -485,6 +485,12 @@ class WindowBackend(object):
     def set_borderless(self, h, on):
         return False
 
+    def is_frameless(self, h):
+        """True/False when the backend can tell whether a window currently has
+        no decorations, or None when it cannot. Callers use this to re-assert a
+        decoration state without flickering the window every poll tick."""
+        return None
+
     def set_ontop(self, h, on):
         return False
 
@@ -508,6 +514,7 @@ class Win32Backend(WindowBackend):
     SWP_STYLE = 0x0001 | 0x0002 | 0x0004 | 0x0020   # NOSIZE|NOMOVE|NOZORDER|FRAMECHANGED
     SWP_MOVE = 0x0004 | 0x0010                      # NOZORDER|NOACTIVATE
     WS_CAPTION = 0x00C00000
+    WS_THICKFRAME = 0x00040000
     WS_POPUP = 0x80000000
     WS_VISIBLE = 0x10000000
     WS_CLIPSIBLINGS = 0x04000000
@@ -632,6 +639,23 @@ class Win32Backend(WindowBackend):
             return True
         except Exception:
             return False
+
+    def is_frameless(self, h):
+        """Frameless = no caption AND no resize frame. mpv re-applies its own
+        window style asynchronously when `border` flips (OR-ing sysmenu /
+        thickframe back in), which is exactly the drift this detects.
+        Returns None when the handle is invalid or the style cannot be read, so
+        callers never act on a bogus "looks frameless" answer (a failed style
+        read is 0, which would otherwise read as frameless)."""
+        try:
+            if not self.valid(h):
+                return None
+            st = (self.u.GetWindowLongPtrW(h, -16) or 0) & 0xFFFFFFFF
+            if st == 0:
+                return None
+            return (st & (self.WS_CAPTION | self.WS_THICKFRAME)) == 0
+        except Exception:
+            return None
 
     def embed(self, child, host):
         try:
@@ -1067,6 +1091,19 @@ class X11Backend(WindowBackend):
 
     def set_borderless(self, h, on):
         return self._motif(h, 0 if on else 1)
+
+    def is_frameless(self, h):
+        """_MOTIF_WM_HINTS decorations == 0 means no titlebar/border.
+        None when the window is gone (never report a stale handle as frameless)."""
+        try:
+            if self._attrs(h) is None:
+                return None
+            _t, fmt, vals, _n = self._prop(h, "_MOTIF_WM_HINTS", 5)
+            if fmt != 32 or len(vals) < 3:
+                return False            # no hint set -> window manager default
+            return int(vals[2]) == 0
+        except Exception:
+            return None
 
     def set_ontop(self, h, on):
         """EWMH _NET_WM_STATE_ABOVE via a client message to the root window."""

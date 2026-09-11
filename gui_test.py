@@ -494,8 +494,18 @@ check("pip: ontop command sent to mpv",
 check("pip: state off", not app.pip["A"])
 check("pip: ontop-off command sent to mpv",
       ("A", {"command": ["set_property", "ontop", "no"]}) in _cmd_log, "log=%s" % _cmd_log)
+# `set_property border yes` is asynchronous in mpv, and mpv re-applies its own
+# window style when it lands - so give it a moment (and the poll) before
+# reading the frame back, exactly like a human looking at the window.
+def _caption_back():
+    h = app.players["A"].hwnd
+    if not h:
+        return False
+    st = (u.GetWindowLongPtrW(h, -16) or 0) & 0xFFFFFFFF
+    return (st & 0x00C00000) != 0
+ok_cap = wait_until(_caption_back, 6)
 st2 = (u.GetWindowLongPtrW(app.players["A"].hwnd, -16) or 0) & 0xFFFFFFFF
-check("pip: caption restored", (st2 & 0x00C00000) != 0)
+check("pip: caption restored", ok_cap, "style=%08X" % st2)
 
 # --------------------------- 11d. help window + tracks + pause-all buttons --
 def _vals(w):
@@ -638,61 +648,109 @@ check("ipip: undock restores window-dragging",
 app._toggle_lock()
 check("ipip: lock released after PiP tests", not app.sync_locked)
 
-# --------------------- 11f. PiP black-bar removal (crop) -------------------
+# --------------------- 11f. crop is USER-DRIVEN ONLY ----------------------
+# Auto-cropping (black-bar probing) was removed on purpose: the app must never
+# change the framing by itself, in any window mode. detect_crop_rect() remains
+# as a standalone utility (and is what a future "suggest crop" would use), but
+# nothing in the app calls it automatically any more.
 BARSRC = os.path.join(BASE, "testmedia", "bars.mp4")   # 1280x540 in 1280x720
 crop = sp.detect_crop_rect(BARSRC, duration=6.0)
-check("crop: detect_crop_rect finds the letterbox (1280x540+0+90)", crop == (1280, 540, 0, 90),
-      "crop=%r" % (crop,))
+check("crop: detect_crop_rect still finds the letterbox (1280x540+0+90)",
+      crop == (1280, 540, 0, 90), "crop=%r" % (crop,))
 crop2 = sp.detect_crop_rect(MOVIE, duration=12.0)
 check("crop: bar-free source returns None", crop2 is None, "crop=%r" % (crop2,))
+check("crop: the removed auto-crop plumbing is gone (no cache/preheat)",
+      not hasattr(app, "_crop_cache") and not hasattr(app, "_crop_busy")
+      and not hasattr(app, "_crop_preheat"))
 
-# two-window PiP engages the crop and clears it on exit
-app._crop_cache[app._srcs["B"]] = (1280, 540, 0, 90)
+# (1) entering PiP must NOT crop anything by itself - even for a source that
+#     really does have letterbox bars baked in (A plays MOVIE, bar-free, so
+#     also point B at the bar clip to make the check meaningful)
+for _tag in ("A", "B"):
+    app._manual_crop[_tag] = None
+app._crop_clear()
+pump(0.6)
 app._toggle_pip("B")
-pump(0.8)
-e, vc = app.players["B"].get_property("video-crop", timeout=3.0)
-check("crop: two-window PiP applies video-crop", e == "success" and vc == "1280x540+0+90",
-      "vc=%r" % (vc,))
-app._toggle_pip("B")
-pump(0.8)
-e, vc = app.players["B"].get_property("video-crop", timeout=3.0)
-check("crop: PiP off clears video-crop", e == "success" and vc in ("", None), "vc=%r" % (vc,))
-
-# embedded PiP: pane refits to the cropped aspect (needs Sync Lock)
-# A = multi.mkv (640x360) - seed a crop that FITS it: 640x270+0+45 (2.37:1)
-app._toggle_lock()
-app._crop_cache[app._srcs["A"]] = (640, 270, 0, 45)
-app._toggle_pip_int("A")
 pump(1.2)
-e, vc = app.players["A"].get_property("video-crop", timeout=3.0)
-check("crop: embedded PiP applies video-crop", e == "success" and vc == "640x270+0+45",
+e, vc = app.players["B"].get_property("video-crop", timeout=3.0)
+check("crop: entering PiP does NOT auto-crop", e == "success" and vc in ("", None),
       "vc=%r" % (vc,))
-ok = app._pip_int_asp is not None and abs(app._pip_int_asp - 640.0 / 270.0) < 0.05
-check("crop: embedded pane aspect follows the crop", ok, "asp=%r" % (app._pip_int_asp,))
+app._toggle_pip("B")
+pump(0.8)
+
+# (2) the crop the USER asks for is applied, survives the PiP switch, and is
+#     only removed by Clear
+app._crop_tag = "B"
+app._crop_nudge("bottom", 1)          # user clicks Crop: Bottom +
+pump(0.6)
+_user_rect = app._manual_crop.get("B")
+check("crop: user nudge records a manual crop", _user_rect is not None,
+      "manual=%r" % (_user_rect,))
+app._toggle_pip("B")
+pump(1.0)
+e, vc = app.players["B"].get_property("video-crop", timeout=3.0)
+check("crop: the USER's crop survives entering PiP",
+      e == "success" and vc not in ("", None), "vc=%r" % (vc,))
+app._toggle_pip("B")
+pump(1.0)
+e, vc2 = app.players["B"].get_property("video-crop", timeout=3.0)
+check("crop: the USER's crop is KEPT after PiP off (only Clear removes it)",
+      e == "success" and vc2 not in ("", None), "vc=%r" % (vc2,))
+app._crop_clear()                     # the ✖ Clear button
+pump(0.8)
+e, vc3 = app.players["B"].get_property("video-crop", timeout=3.0)
+check("crop: Clear returns the video to full resolution",
+      e == "success" and vc3 in ("", None) and app._manual_crop.get("B") is None,
+      "vc=%r" % (vc3,))
+
+# (3) embedded PiP: the pane refits to the USER's cropped aspect
+app._toggle_lock()
+app._crop_tag = "A"
+app._manual_crop["A"] = None
+app._crop_nudge("bottom", 1)          # a crop that always fits A's real video
+pump(0.6)
+_rect_a = app._manual_crop.get("A")
+app._toggle_pip_int("A")
+pump(1.4)
+e, vc = app.players["A"].get_property("video-crop", timeout=3.0)
+check("crop: embedded PiP applies the USER's crop",
+      e == "success" and vc not in ("", None), "vc=%r manual=%r" % (vc, _rect_a))
+_ok_asp = app._pip_int_asp is not None and _rect_a and \
+    abs(app._pip_int_asp - (_rect_a[0] / float(_rect_a[1]))) < 0.05
+check("crop: embedded pane aspect follows the user's crop", _ok_asp,
+      "asp=%r expected=%r" % (app._pip_int_asp,
+                              (_rect_a[0] / float(_rect_a[1])) if _rect_a else None))
 hr = wt.RECT(); pr = wt.RECT()
 u.GetWindowRect(app.players["B"].hwnd, ctypes.byref(hr))
 u.GetWindowRect(app._pip_int_hwnd, ctypes.byref(pr))
 pw, ph = pr.right - pr.left, pr.bottom - pr.top
 ratio = pw / float(ph) if ph else 0
+_want = (_rect_a[0] / float(_rect_a[1])) if _rect_a else 0
 check("crop: pane rect is wide (no letterbox) - %dx%d ratio=%.3f" % (pw, ph, ratio),
-      abs(ratio - 640.0 / 270.0) < 0.15)
+      _want and abs(ratio - _want) < 0.15)
 app._toggle_pip_int("A")
-pump(0.8)
+pump(1.0)
 e, vc = app.players["A"].get_property("video-crop", timeout=3.0)
-check("crop: undock clears video-crop", e == "success" and vc in ("", None), "vc=%r" % (vc,))
-check("crop: undock resets pane aspect", app._pip_int_asp is None)
+check("crop: the USER's crop is kept after undock",
+      e == "success" and vc not in ("", None), "vc=%r" % (vc,))
+check("crop: undock resets the embedded pane aspect", app._pip_int_asp is None,
+      "asp=%r" % (app._pip_int_asp,))
 
-# guard: an over-sized crop rect (stale detection on a smaller file) is
-# refused by the app and evicted, instead of silently ignored by mpv
-app._crop_cache[app._srcs["A"]] = (1280, 540, 0, 90)
+# guard: a saved user crop that no longer fits the file (the clip was swapped
+# for a smaller one) is refused outright instead of being silently ignored
+app._crop_clear()
+pump(0.6)
+app._manual_crop["A"] = (4096, 2160, 0, 0)
 app._toggle_pip_int("A")
-pump(1.2)
+pump(1.4)
 e, vc = app.players["A"].get_property("video-crop", timeout=3.0)
-check("crop: oversized rect refused (guard)", e == "success" and vc in ("", None),
-      "vc=%r" % (vc,))
-check("crop: oversized rect evicted from cache", app._crop_cache.get(app._srcs["A"]) is None)
+check("crop: user crop that does not fit is refused (guard)",
+      e == "success" and vc in ("", None), "vc=%r" % (vc,))
 app._toggle_pip_int("A")
 pump(0.8)
+app._manual_crop["A"] = None
+app._crop_clear()
+pump(0.4)
 app._toggle_lock()
 check("crop: lock released after crop PiP tests", not app.sync_locked)
 

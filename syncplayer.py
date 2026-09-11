@@ -57,7 +57,7 @@ from tkinter import ttk, filedialog, messagebox
 import sp_plat as plat   # cross-platform: paths, mpv IPC, window control
 
 APP_NAME = "SyncPlayer"
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.5.1"
 
 
 class MpvNotFoundError(Exception):
@@ -1384,6 +1384,11 @@ class SyncApp:
         self._lbl_status_cache = ""    # last status text
         self.pip = {"A": False, "B": False}   # picture-in-picture state
         self._pip_saved = {"A": None, "B": None}   # original window styles/decorations
+        # mpv re-applies its OWN window style asynchronously when `border`
+        # flips (PiP on/off, embed/undock), which can clobber the frame change
+        # we just made. For a short window after each toggle the poll re-checks
+        # the decorations and re-asserts ours only if they actually drifted.
+        self._pip_settle = {"A": 0.0, "B": 0.0}
         self.pip_int = False          # integrated PiP (embedded pane) state
         self._pip_int_tag = None      # which video is the embedded pane
         self._pip_int_pos = [0.60, 0.60]   # pane top-left, fraction of host
@@ -1395,12 +1400,9 @@ class SyncApp:
         self._pip_rect_saved = {"A": None, "B": None}  # pre-embed geometry
         self._pip_crop_saved = {"A": None, "B": None}  # pre-crop window rects
         self._srcs = {"A": None, "B": None}   # resolved sources per player
-        self._crop_cache = {}      # source path -> (w, h, x, y) or None
-        self._crop_busy = set()    # sources with a detection run in flight
         self._pip_int_asp = None   # embedded pane aspect override (cropped)
         self._crop_tag = "A"            # which video the manual crop controls
-        self._manual_crop = {"A": None, "B": None}   # user crop (persists across PiP)
-        self._crop_auto_pending = None   # (tag, rect|None) worker->main handoff for Auto
+        self._manual_crop = {"A": None, "B": None}   # user crop - THIS SESSION ONLY
         self._status_pin = 0.0   # until this monotonic time the poll must NOT rewrite the status bar
         self._yt_subs = {"A": [], "B": []}     # yt-dlp subtitle options per video
         self._yt_sub_lock = {"A": False, "B": False}  # yt subtitle download in flight
@@ -2323,13 +2325,16 @@ class SyncApp:
         if self.pip_int:
             self._undock_pip_int()
         wb = _wb()
+        now = time.monotonic()
         for tag in ("A", "B"):
             p = self.players.get(tag)
             if p and p.running:
                 p.cmd({"command": ["set_property", "ontop", "no"]})
                 p.cmd({"command": ["set_property", "border", "yes"]})
                 p.cmd({"command": ["set_property", "window-dragging", "yes"]})
+                self._pip_settle[tag] = now + 1.2   # survive mpv's re-style
                 if p.hwnd:
+                    wb.set_ontop(p.hwnd, False)
                     wb.restore_style(p.hwnd, self._pip_saved.get(tag))
                     self._pip_saved[tag] = None
             self.pip[tag] = False
@@ -2631,29 +2636,10 @@ class SyncApp:
             return pos
         return None
 
-    # -- PiP black-bar removal -------------------------------------------
-    def _crop_preheat(self, tag, src):
-        """Background detection of baked-in letterbox/pillarbox bars for a
-        source. Caches the rect per path; applies it live if PiP is on."""
-        if src in self._crop_cache or src in self._crop_busy:
-            return
-        if not src or src.startswith(("http://", "https://")):
-            self._crop_cache[src or ""] = None
-            return
-        self._crop_busy.add(src)
-        try:
-            rect = detect_crop_rect(src, self.last_dur.get(tag))
-        except Exception:
-            rect = None
-        self._crop_cache[src] = rect
-        self._crop_busy.discard(src)
-        if rect and (self.pip.get(tag) or
-                     (self.pip_int and self._pip_int_tag == tag)):
-            self._pip_crop_apply(tag, rect)
-
+    # -- PiP crop (user-driven only) --------------------------------------
     def _pip_crop_apply(self, tag, rect):
-        """Apply a detected bar-crop to a PiP player and (embedded mode)
-        re-fit the pane to the cropped video's display aspect."""
+        """Apply the USER's crop to a PiP player and (embedded mode) re-fit the
+        pane to the cropped video's display aspect."""
         p = self.players.get(tag)
         if not (p and p.running):
             return
@@ -2667,17 +2653,14 @@ class SyncApp:
                 asp = (float(w) * float(par)) / float(h)
         except Exception:
             pass
-        # Guard: mpv silently ignores an out-of-bounds video-crop
-        # (property stays empty) - e.g. a cached detection left over
-        # after the file was swapped for a smaller one. Drop the bad
-        # entry and fit the pane to the video's own aspect instead.
+        # Guard: mpv silently ignores an out-of-bounds video-crop (the property
+        # just stays empty) - e.g. a saved crop left over after the file was
+        # swapped for a smaller one. Fit the pane to the video's own aspect
+        # instead of applying a crop that cannot work.
         if isinstance(vp, dict):
             vw = max(float(vp.get("dw") or 0), float(vp.get("w") or 0))
             vh = max(float(vp.get("dh") or 0), float(vp.get("h") or 0))
             if vw > 0 and vh > 0 and (w + x > vw + 3 or h + y > vh + 3):
-                src = self._srcs.get(tag)
-                if src and self._crop_cache.get(src) == rect:
-                    self._crop_cache.pop(src, None)
                 if self.pip_int and self._pip_int_tag == tag:
                     threading.Thread(target=self._pip_asp_from_video,
                                      args=(tag,), daemon=True).start()
@@ -2706,31 +2689,31 @@ class SyncApp:
         _wb().place(p.hwnd, r[0], r[1], r[2], h)
 
     def _pip_crop_on(self, tag):
-        """PiP engage hook: reapply this player's saved crop (manual first,
-        else the auto-detected bars) so it survives the free-window <-> PiP
-        switch; a cache miss starts the probe."""
+        """PiP engage hook: reapply ONLY the crop the user asked for, so it
+        survives the free-window <-> PiP switch. Black-bar auto-cropping was
+        removed on purpose: entering PiP (or the pane swapping sides) must
+        never change the framing by itself. With no user crop, all that is left
+        to do is fit the embedded pane to the video's own aspect."""
         p = self.players.get(tag)
         manual = self._manual_crop.get(tag)
         if manual and p and p.running:
             self._pip_crop_apply(tag, manual)
             return
-        src = self._srcs.get(tag)
-        if src and src not in self._crop_cache and src not in self._crop_busy:
-            threading.Thread(target=self._crop_preheat,
-                             args=(tag, src), daemon=True).start()
-        rect = self._crop_cache.get(src) if src else None
-        if rect:
-            self._pip_crop_apply(tag, rect)
-        elif self.pip_int and self._pip_int_tag == tag:
+        if self.pip_int and self._pip_int_tag == tag:
             threading.Thread(target=self._pip_asp_from_video,
                              args=(tag,), daemon=True).start()
 
     def _pip_crop_off(self, tag):
-        """PiP-mode-off hook. A MANUAL crop (set with the Crop panel) is app
-        state that PERSISTS across the free-window <-> PiP switch, so it is
-        reapplied rather than cleared. Only an AUTO crop (no manual rect yet)
-        is lost here, and the pre-crop window shape is restored."""
+        """PiP-mode-off hook.
+
+        A MANUAL crop (set from the Crop panel) is app state that PERSISTS
+        across the free-window <-> PiP switch, so it is reapplied rather than
+        cleared - only `Clear` (or a restart) removes it. The embedded-pane
+        aspect override is dropped here either way, because it is only valid
+        while the pane is a child window of the host.
+        """
         p = self.players.get(tag)
+        self._pip_int_asp = None
         manual = self._manual_crop.get(tag)
         if manual and p and p.running:
             self._pip_crop_apply(tag, manual)
@@ -2742,7 +2725,6 @@ class SyncApp:
             _wb().place(p.hwnd, saved[0], saved[1],
                         max(60, saved[2]), max(34, saved[3]))
             self._pip_crop_saved[tag] = None
-        self._pip_int_asp = None
 
     def _cur_crop(self, tag):
         """Return the player's current video-crop rect (w,h,x,y) or None."""
@@ -3012,6 +2994,31 @@ class SyncApp:
             if w > 0 and h > 0:
                 self._set_pip_asp(w / h)
 
+    def _settle_pip_window(self, tag):
+        """Re-assert this player's window decorations if they drifted.
+
+        mpv applies the `border` property asynchronously and rewrites the OS
+        window style when it lands, which can undo the frameless/framed change
+        we made immediately after issuing the command (observed as a stray
+        sysmenu/thickframe sneaking back into a "frameless" PiP window). Rather
+        than blocking, the poll calls this for a short window after every
+        toggle and rewrites only when the decorations actually drifted."""
+        p = self.players.get(tag)
+        if not (p and p.running and p.hwnd):
+            return
+        wb = _wb()
+        want_frameless = bool(self.pip.get(tag) or
+                              (self.pip_int and self._pip_int_tag == tag))
+        cur = wb.is_frameless(p.hwnd)
+        if cur is None or cur == want_frameless:
+            return                       # backend cannot tell, or already correct
+        if want_frameless:
+            wb.set_borderless(p.hwnd, True)
+            wb.set_ontop(p.hwnd, True)
+        else:
+            wb.set_ontop(p.hwnd, False)
+            wb.restore_style(p.hwnd, self._pip_saved.get(tag))
+
     def _toggle_pip(self, tag):
         """Picture-in-picture for THIS video: all borders completely removed,
         pure video feed with zero top sliver, always on top. Can be toggled
@@ -3025,6 +3032,7 @@ class SyncApp:
                 text="Integrated PiP is active - exit PIP MODE first.")
             return
         wb = _wb()
+        self._pip_settle[tag] = time.monotonic() + 1.2   # survive mpv's re-style
         if not self.pip.get(tag):
             p.cmd({"command": ["set_property", "ontop", "yes"]})
             p.cmd({"command": ["set_property", "border", "no"]})
@@ -3094,6 +3102,7 @@ class SyncApp:
         using SetParent. With WS_CLIPCHILDREN on the host and WS_CHILD on the pane,
         the video feeds render together in ONE window rather than separate windows."""
         wb = _wb()
+        self._pip_settle[tag] = time.monotonic() + 1.2   # survive mpv's re-style
         self._pip_rect_saved[tag] = wb.get_rect(pane.hwnd)
         st = wb.save_style(pane.hwnd)
         if st:
@@ -3120,6 +3129,12 @@ class SyncApp:
         tag = self._pip_int_tag
         p = self.players.get(tag) if tag else None
         wb = _wb()
+        # clear the embedded state BEFORE the crop/geometry teardown so those
+        # paths know the pane is no longer a child window (otherwise the pane
+        # aspect override is re-set here and survives the undock)
+        self.pip_int = False
+        if tag:
+            self._pip_settle[tag] = time.monotonic() + 1.2   # survive mpv's re-style
         if p and p.running and p.hwnd:
             wb.unembed(p.hwnd)                      # detach from the host window
             p.cmd({"command": ["set_property", "border", "yes"]})
@@ -3131,7 +3146,6 @@ class SyncApp:
             p.cmd({"command": ["set_property", "ontop", "no"]})
             p.cmd({"command": ["set_property", "window-dragging", "yes"]})
             self._pip_crop_off(tag)
-        self.pip_int = False
         self._pip_int_tag = None
         self._pip_int_host = None
         self._pip_int_hwnd = None
@@ -3606,6 +3620,13 @@ class SyncApp:
                 self._pip_update_pane()
             except Exception:
                 pass
+        _now = time.monotonic()
+        for _t in ("A", "B"):
+            if self._pip_settle[_t] > _now:
+                try:                     # mpv may have re-styled the window
+                    self._settle_pip_window(_t)
+                except Exception:
+                    pass
         self._sync_tick()
         # Exactly ONE pending poll timer, whoever calls _poll(). A direct call
         # (tests, scripts, a stray code path) must not stack an extra timer:

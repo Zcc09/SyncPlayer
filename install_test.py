@@ -125,8 +125,8 @@ def main():
     ij = os.path.join(install_dir, "install.json")
 
     check("install: SyncPlayer.exe present", os.path.isfile(app))
-    check("install: app version is 1.5.0",
-          get_exe_version(app) == "1.5.0", str(get_exe_version(app)))
+    check("install: app version is 1.5.1",
+          get_exe_version(app) == "1.5.1", str(get_exe_version(app)))
     check("install: bundled mpv.exe present", os.path.isfile(mpv))
     check("install: bundled yt-dlp.exe present", os.path.isfile(ytdl))
     check("install: updater present", os.path.isfile(updater))
@@ -136,7 +136,7 @@ def main():
             state = json.load(open(ij))
         except Exception:
             pass
-    check("install: install.json app_version", state.get("app_version") == "1.5.0")
+    check("install: install.json app_version", state.get("app_version") == "1.5.1")
     check("install: install.json mpv_version", state.get("mpv_version") == "0.41.0")
 
     # -------------------------------------------------------------------------

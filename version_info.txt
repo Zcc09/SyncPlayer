@@ -1,8 +1,8 @@
 # UTF-8
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(1, 5, 0, 0),
-    prodvers=(1, 5, 0, 0),
+    filevers=(1, 5, 1, 0),
+    prodvers=(1, 5, 1, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -18,11 +18,11 @@ VSVersionInfo(
           [
             StringStruct('CompanyName', ''),
             StringStruct('FileDescription', 'SyncPlayer - dual-video synchronized player (mpv)'),
-            StringStruct('FileVersion', '1.5.0.0'),
+            StringStruct('FileVersion', '1.5.1.0'),
             StringStruct('InternalName', 'SyncPlayer'),
             StringStruct('OriginalFilename', 'SyncPlayer.exe'),
             StringStruct('ProductName', 'SyncPlayer'),
-            StringStruct('ProductVersion', '1.5.0.0')
+            StringStruct('ProductVersion', '1.5.1.0')
           ]
         )
       ]

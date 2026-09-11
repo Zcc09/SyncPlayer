@@ -179,7 +179,7 @@ MPVVER="$(mpv --version 2>/dev/null | head -1 | awk '{print $2}' || echo unknown
 PYVER="$(python3 -c 'import sys;print("%d.%d.%d"%sys.version_info[:3])' 2>/dev/null || echo unknown)"
 cat > "$PREFIX/install.json" <<EOF
 {
-  "app_version": "1.5.0",
+  "app_version": "1.5.1",
   "platform": "linux",
   "install_dir": "$PREFIX",
   "python": "$PYVER",
