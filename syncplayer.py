@@ -47,6 +47,11 @@ try:
     _HAS_DND = True
 except Exception:
     _HAS_DND = False
+try:
+    from PIL import Image, ImageTk
+    _HAS_PIL = True
+except Exception:
+    _HAS_PIL = False
 from tkinter import ttk, filedialog, messagebox
 
 APP_NAME = "SyncPlayer"
@@ -1070,6 +1075,261 @@ class Tooltip:
             self.tip = None
 
 
+class VisualCropDialog(tk.Toplevel):
+    """Interactive visual cropping popup: displays a freeze-frame of the video
+    where the user can draw, drag, and resize a crop box with the mouse."""
+    def __init__(self, parent, image_path, initial_crop=None, video_name="Video", on_apply=None):
+        super().__init__(parent)
+        self.title("Visual Crop — %s" % video_name)
+        self.transient(parent)
+        self.grab_set()
+        self.configure(bg="#1f232b")
+
+        self.on_apply = on_apply
+        self.orig_img = Image.open(image_path)
+        self.orig_w, self.orig_h = self.orig_img.size
+
+        # Fit comfortably on screen (max 880x520)
+        max_w, max_h = 880, 520
+        scale_w = max_w / float(self.orig_w) if self.orig_w > 0 else 1.0
+        scale_h = max_h / float(self.orig_h) if self.orig_h > 0 else 1.0
+        self.scale = min(1.0, scale_w, scale_h)
+        self.disp_w = max(160, int(self.orig_w * self.scale))
+        self.disp_h = max(120, int(self.orig_h * self.scale))
+
+        resample = getattr(Image, "Resampling", Image).LANCZOS
+        self.disp_img = self.orig_img.resize((self.disp_w, self.disp_h), resample)
+        self.photo = ImageTk.PhotoImage(self.disp_img)
+
+        # Header info
+        hdr = ttk.Frame(self)
+        hdr.pack(fill="x", padx=12, pady=(10, 4))
+        self.lbl_info = ttk.Label(hdr, text="Drag to select or resize the crop box", font=("Segoe UI", 9))
+        self.lbl_info.pack(side="left")
+
+        # Canvas
+        self.canvas = tk.Canvas(self, width=self.disp_w, height=self.disp_h,
+                                bg="#111317", highlightthickness=1,
+                                highlightbackground="#333740")
+        self.canvas.pack(padx=12, pady=4)
+        self.canvas.create_image(0, 0, anchor="nw", image=self.photo)
+
+        # Initial crop rect in display coords
+        if initial_crop and len(initial_crop) == 4:
+            cw, ch, cx, cy = initial_crop
+            self.rx1 = int(cx * self.scale)
+            self.ry1 = int(cy * self.scale)
+            self.rx2 = int((cx + cw) * self.scale)
+            self.ry2 = int((cy + ch) * self.scale)
+        else:
+            self.rx1, self.ry1 = 0, 0
+            self.rx2, self.ry2 = self.disp_w, self.disp_h
+
+        # Interaction state
+        self.mode = None
+        self.start_x = 0
+        self.start_y = 0
+        self.drag_start_box = (0, 0, 0, 0)
+
+        self.canvas.bind("<ButtonPress-1>", self._on_press)
+        self.canvas.bind("<B1-Motion>", self._on_drag)
+        self.canvas.bind("<ButtonRelease-1>", self._on_release)
+        self.canvas.bind("<Motion>", self._on_hover)
+
+        # Button bar
+        btn_bar = ttk.Frame(self)
+        btn_bar.pack(fill="x", padx=12, pady=(8, 12))
+
+        btn_apply = ttk.Button(btn_bar, text="✔ Apply Crop", width=14, command=self._apply)
+        btn_apply.pack(side="left", padx=(0, 6))
+
+        btn_reset = ttk.Button(btn_bar, text="Full Frame (Reset)", width=16, command=self._reset_full)
+        btn_reset.pack(side="left", padx=6)
+
+        btn_cancel = ttk.Button(btn_bar, text="Cancel", width=10, command=self.destroy)
+        btn_cancel.pack(side="right", padx=(6, 0))
+
+        self.bind("<Return>", lambda e: self._apply())
+        self.bind("<Escape>", lambda e: self.destroy())
+
+        self._draw_overlay()
+
+    def _get_handles(self):
+        x1, y1 = min(self.rx1, self.rx2), min(self.ry1, self.ry2)
+        x2, y2 = max(self.rx1, self.rx2), max(self.ry1, self.ry2)
+        mx = (x1 + x2) // 2
+        my = (y1 + y2) // 2
+        return {
+            "nw": (x1, y1), "n": (mx, y1), "ne": (x2, y1),
+            "w": (x1, my),                  "e": (x2, my),
+            "sw": (x1, y2), "s": (mx, y2), "se": (x2, y2)
+        }
+
+    def _hit_test(self, x, y):
+        tol = 8
+        handles = self._get_handles()
+        for name, (hx, hy) in handles.items():
+            if abs(x - hx) <= tol and abs(y - hy) <= tol:
+                return name
+        x1, y1 = min(self.rx1, self.rx2), min(self.ry1, self.ry2)
+        x2, y2 = max(self.rx1, self.rx2), max(self.ry1, self.ry2)
+        if x1 < x < x2 and y1 < y < y2:
+            return "move"
+        return "new"
+
+    def _on_hover(self, event):
+        hit = self._hit_test(event.x, event.y)
+        cursor_map = {
+            "nw": "size_nw_se", "se": "size_nw_se",
+            "ne": "size_ne_sw", "sw": "size_ne_sw",
+            "n": "size_ns", "s": "size_ns",
+            "w": "size_we", "e": "size_we",
+            "move": "fleur",
+            "new": "crosshair"
+        }
+        self.canvas.config(cursor=cursor_map.get(hit, "crosshair"))
+
+    def _on_press(self, event):
+        self.start_x = max(0, min(self.disp_w, event.x))
+        self.start_y = max(0, min(self.disp_h, event.y))
+        self.drag_start_box = (self.rx1, self.ry1, self.rx2, self.ry2)
+        self.mode = self._hit_test(self.start_x, self.start_y)
+        if self.mode == "new":
+            self.rx1 = self.start_x
+            self.ry1 = self.start_y
+            self.rx2 = self.start_x
+            self.ry2 = self.start_y
+            self._draw_overlay()
+
+    def _on_drag(self, event):
+        cx = max(0, min(self.disp_w, event.x))
+        cy = max(0, min(self.disp_h, event.y))
+        dx = cx - self.start_x
+        dy = cy - self.start_y
+        ox1, oy1, ox2, oy2 = self.drag_start_box
+        x1, y1 = min(ox1, ox2), min(oy1, oy2)
+        x2, y2 = max(ox1, ox2), max(oy1, oy2)
+
+        if self.mode == "new":
+            self.rx2 = cx
+            self.ry2 = cy
+        elif self.mode == "move":
+            bw = x2 - x1
+            bh = y2 - y1
+            nx1 = max(0, min(self.disp_w - bw, x1 + dx))
+            ny1 = max(0, min(self.disp_h - bh, y1 + dy))
+            self.rx1, self.ry1 = nx1, ny1
+            self.rx2, self.ry2 = nx1 + bw, ny1 + bh
+        elif self.mode == "nw":
+            self.rx1 = min(x2 - 10, max(0, x1 + dx))
+            self.ry1 = min(y2 - 10, max(0, y1 + dy))
+            self.rx2, self.ry2 = x2, y2
+        elif self.mode == "se":
+            self.rx1, self.ry1 = x1, y1
+            self.rx2 = max(x1 + 10, min(self.disp_w, x2 + dx))
+            self.ry2 = max(y1 + 10, min(self.disp_h, y2 + dy))
+        elif self.mode == "ne":
+            self.rx1 = x1
+            self.ry1 = min(y2 - 10, max(0, y1 + dy))
+            self.rx2 = max(x1 + 10, min(self.disp_w, x2 + dx))
+            self.ry2 = y2
+        elif self.mode == "sw":
+            self.rx1 = min(x2 - 10, max(0, x1 + dx))
+            self.ry1 = y1
+            self.rx2 = x2
+            self.ry2 = max(y1 + 10, min(self.disp_h, y2 + dy))
+        elif self.mode == "n":
+            self.rx1, self.rx2 = x1, x2
+            self.ry1 = min(y2 - 10, max(0, y1 + dy))
+            self.ry2 = y2
+        elif self.mode == "s":
+            self.rx1, self.rx2 = x1, x2
+            self.ry1 = y1
+            self.ry2 = max(y1 + 10, min(self.disp_h, y2 + dy))
+        elif self.mode == "w":
+            self.rx1 = min(x2 - 10, max(0, x1 + dx))
+            self.ry1, self.ry2 = y1, y2
+            self.rx2 = x2
+        elif self.mode == "e":
+            self.rx1 = x1
+            self.ry1, self.ry2 = y1, y2
+            self.rx2 = max(x1 + 10, min(self.disp_w, x2 + dx))
+
+        self._draw_overlay()
+
+    def _on_release(self, event):
+        x1, y1 = min(self.rx1, self.rx2), min(self.ry1, self.ry2)
+        x2, y2 = max(self.rx1, self.rx2), max(self.ry1, self.ry2)
+        if (x2 - x1) < 16 or (y2 - y1) < 16:
+            self._reset_full()
+        else:
+            self.rx1, self.ry1, self.rx2, self.ry2 = x1, y1, x2, y2
+            self._draw_overlay()
+
+    def _draw_overlay(self):
+        self.canvas.delete("overlay")
+        x1, y1 = min(self.rx1, self.rx2), min(self.ry1, self.ry2)
+        x2, y2 = max(self.rx1, self.rx2), max(self.ry1, self.ry2)
+
+        # Semi-transparent shaded strips outside the crop box
+        fill_color = "#000000"
+        stipple = "gray50"
+        if y1 > 0:
+            self.canvas.create_rectangle(0, 0, self.disp_w, y1, fill=fill_color, stipple=stipple, width=0, tags="overlay")
+        if y2 < self.disp_h:
+            self.canvas.create_rectangle(0, y2, self.disp_w, self.disp_h, fill=fill_color, stipple=stipple, width=0, tags="overlay")
+        if x1 > 0:
+            self.canvas.create_rectangle(0, y1, x1, y2, fill=fill_color, stipple=stipple, width=0, tags="overlay")
+        if x2 < self.disp_w:
+            self.canvas.create_rectangle(x2, y1, self.disp_w, y2, fill=fill_color, stipple=stipple, width=0, tags="overlay")
+
+        # Crop box border
+        self.canvas.create_rectangle(x1, y1, x2, y2, outline="#00b4d8", width=2, tags="overlay")
+
+        # Handles
+        handles = self._get_handles()
+        hs = 4
+        for hx, hy in handles.values():
+            self.canvas.create_rectangle(hx - hs, hy - hs, hx + hs, hy + hs, fill="#ffffff", outline="#00b4d8", width=1.5, tags="overlay")
+
+        # Update info label
+        orig_crop = self.get_orig_crop()
+        if orig_crop:
+            cw, ch, cx, cy = orig_crop
+            asp = cw / float(ch) if ch > 0 else 0
+            self.lbl_info.config(text="Crop: %d × %d at (+%d, +%d) — Aspect: %.2f:1" % (cw, ch, cx, cy, asp))
+        else:
+            self.lbl_info.config(text="Full Frame: %d × %d (no crop)" % (self.orig_w, self.orig_h))
+
+    def _reset_full(self):
+        self.rx1, self.ry1 = 0, 0
+        self.rx2, self.ry2 = self.disp_w, self.disp_h
+        self._draw_overlay()
+
+    def get_orig_crop(self):
+        x1, y1 = min(self.rx1, self.rx2), min(self.ry1, self.ry2)
+        x2, y2 = max(self.rx1, self.rx2), max(self.ry1, self.ry2)
+        ox = int(x1 / self.scale)
+        oy = int(y1 / self.scale)
+        ow = int((x2 - x1) / self.scale)
+        oh = int((y2 - y1) / self.scale)
+
+        ox = max(0, min(self.orig_w - 1, ox))
+        oy = max(0, min(self.orig_h - 1, oy))
+        ow = min(self.orig_w - ox, ow)
+        oh = min(self.orig_h - oy, oh)
+
+        if ow >= self.orig_w - 4 and oh >= self.orig_h - 4 and ox <= 2 and oy <= 2:
+            return None
+        return (ow, oh, ox, oy)
+
+    def _apply(self):
+        crop = self.get_orig_crop()
+        if self.on_apply:
+            self.on_apply(crop)
+        self.destroy()
+
+
 class SyncApp:
     def __init__(self, root):
         self.root = root
@@ -1463,8 +1723,12 @@ class SyncApp:
             self._crop_tag_btns[tag] = b
             self._ctrls.append(b)
         self._crop_tag_btns["A"].state(["pressed"])
+        b = ttk.Button(crow, text="✂ Visual Crop", width=13, command=self._crop_interactive)
+        b.pack(side="left", padx=(8, 0))
+        Tooltip(b, "Interactive visual crop: drag a box on a video frame snapshot.")
+        self._ctrls.append(b)
         b = ttk.Button(crow, text="\u2716 Clear", width=8, command=self._crop_clear)
-        b.pack(side="left", padx=(10, 0))
+        b.pack(side="left", padx=(6, 0))
         Tooltip(b, "Remove crop and return the video to its full resolution.")
         self._ctrls.append(b)
         erow = ttk.Frame(crop)
@@ -2412,36 +2676,66 @@ class SyncApp:
             return
         self._crop_apply(tag, (int(w), int(h), int(x), int(y)))
 
-    def _crop_auto(self):
-        """Auto-detect the bars on the current source and apply the crop.
-        Re-probes EVERY time (a stale 'no bars' cache from Start would make
-        the button look dead), and the result becomes the persisted manual
-        crop so it survives free-window <-> PiP switches. Feedback is pinned
-        so the ~30 Hz poll can't clobber it before the user reads it."""
-        tag = self._crop_tag
-        src = self._srcs.get(tag)
-        name = "Movie" if tag == "A" else "Reaction"
-        if not (src and self.players.get(tag) and self.players[tag].running):
-            self.status_lbl.config(text="Start playback first, then Auto-crop.")
+    def _crop_interactive(self):
+        """Interactive visual crop: freeze-frame snapshot popup where the user
+        can click and drag a crop box directly on the picture with the mouse."""
+        if not _HAS_PIL:
+            messagebox.showinfo(APP_NAME, "Pillow is required for the visual crop tool.")
             return
-        self._crop_busy.discard(src)          # ignore any stale busy flag
-        self._crop_auto_pending = None        # worker -> main-loop handoff
+        tag = self._crop_tag
+        p = self.players.get(tag)
+        if not (p and p.running):
+            self.status_lbl.config(text="Start playback first, then crop.")
+            return
+
+        name = "Movie" if tag == "A" else "Reaction"
         self._status_pin = time.monotonic() + 3.0
-        self.status_lbl.config(
-            text="Auto-cropping the %s video (probing for black bars)..." % name)
+        self.status_lbl.config(text="Capturing frame from %s for visual crop..." % name)
+        self.root.update_idletasks()
 
-        def _work():
+        snap_path = os.path.join(SHOT_DIR, "_crop_frame_%s_%d.png" % (tag, int(time.time())))
+        if os.path.isfile(snap_path):
             try:
-                sp_rect = detect_crop_rect(src, self.last_dur.get(tag))
+                os.remove(snap_path)
             except Exception:
-                sp_rect = None
-            self._crop_cache[src] = sp_rect
-            self._crop_busy.discard(src)
-            # hand the result to the main loop - tkinter widgets must only be
-            # touched from the main thread
-            self._crop_auto_pending = (tag, sp_rect)
+                pass
 
-        threading.Thread(target=_work, daemon=True).start()
+        # Temporarily clear video-crop in mpv so the snapshot captures the full uncropped frame
+        cur_crop = self._manual_crop.get(tag)
+        if cur_crop:
+            p.cmd({"command": ["set_property", "video-crop", ""]})
+
+        p.screenshot(snap_path)
+
+        for _ in range(30):
+            if os.path.isfile(snap_path) and os.path.getsize(snap_path) > 1000:
+                break
+            time.sleep(0.08)
+
+        # Restore previous crop in mpv while dialog is open
+        if cur_crop:
+            p.cmd({"command": ["set_property", "video-crop", "%dx%d+%d+%d" % cur_crop]})
+
+        if not (os.path.isfile(snap_path) and os.path.getsize(snap_path) > 1000):
+            self.status_lbl.config(text="Could not capture frame from %s." % name)
+            return
+
+        def on_apply(rect):
+            if rect:
+                self._crop_apply(tag, rect)
+            else:
+                self._crop_clear()
+
+        try:
+            dlg = VisualCropDialog(self.root, snap_path, initial_crop=cur_crop,
+                                   video_name=name, on_apply=on_apply)
+            dlg.wait_window()
+        finally:
+            try:
+                if os.path.isfile(snap_path):
+                    os.remove(snap_path)
+            except Exception:
+                pass
 
     def _crop_clear(self):
         """Remove the crop on current video and return it to full resolution/aspect."""

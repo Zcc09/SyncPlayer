@@ -103,14 +103,13 @@ together for the whole runtime.**
 - **🌐 YouTube subtitles**: for a URL source, the Tracks picker also lists
   the video's **uploaded subtitles AND auto-generated (ASR) captions**
   (fetched via yt-dlp); picking one downloads it and attaches it live.
-- **⬛ Manual crop**: a dedicated *Crop* section lets you kill baked-in
-  black bars by hand — per-video **Top/Bottom/Left/Right** − / + nudges
-  (8 px per press), **⭯ Auto** (re-run detection) and **✖ Clear**. Works
-  on the regular window (not just PiP), and the crop **PERSISTS across
-  the free-window ↔ PiP switch** (it's app state, reapplied on re-engage
-  and on reload, until you Clear it). Auto re-probes every press (a stale
-  "no bars" result is ignored) and announces its outcome on the status
-  line (kept long enough to read).
+- **⬛ Visual & Manual crop**: a dedicated *Crop* section lets you kill baked-in
+  black bars with ease — click **✂ Visual Crop** to open an interactive snapshot
+  popup of the current video frame where you can simply drag a box with the mouse,
+  resize handles, and click Apply (or hit Enter). Fine-tuning buttons (Top/Bottom/Left/Right
+  8 px nudges) and **✖ Clear** are also available. The crop is remembered during
+  the **active session** (survives normal window ↔ PiP switches), and **Clear**
+  immediately restores the video to its exact full original resolution and aspect ratio.
 - **🎯 Editable timecode**: the master seek row has a **Go-to** box — type
   `90`, `83:45` or `1:23:45` and hit Enter to jump both videos there
   (no scrubbing). The time labels show **HH:MM:SS** once a video is over

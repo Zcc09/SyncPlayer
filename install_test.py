@@ -315,6 +315,37 @@ def main():
     check("crop: clear resets mpv video-crop to empty",
           err == "success" and (vc == "" or vc is None), "video-crop=%s" % vc)
 
+    # -------------------------------------------------------------------------
+    # 8. Interactive visual crop test: VisualCropDialog drag & apply
+    # -------------------------------------------------------------------------
+    snap_test = os.path.join(BASE, "testmedia", "frame_sb_split25.jpg")
+    applied_crop = []
+    dlg = sp.VisualCropDialog(root, snap_test, initial_crop=(1280, 540, 0, 90),
+                              video_name="Movie", on_apply=lambda c: applied_crop.append(c))
+    root.update()
+    check("visual crop: dialog created with source image", dlg.orig_w == 1920 and dlg.orig_h == 720)
+    init_c = dlg.get_orig_crop()
+    check("visual crop: initial crop box matches existing crop", init_c is not None and abs(init_c[0] - 1280) <= 2 and abs(init_c[1] - 540) <= 2)
+
+    # Apply crop
+    dlg._apply()
+    root.update()
+    check("visual crop: apply invokes on_apply callback with rect", len(applied_crop) == 1 and applied_crop[0] is not None)
+
+    # Apply the visual crop to live player A
+    app_obj._crop_apply("A", applied_crop[0])
+    root.update()
+    time.sleep(0.2)
+    err, vc = pa.get_property("video-crop")
+    check("visual crop: mpv video-crop property set from visual tool", err == "success" and bool(vc), "video-crop=%s" % vc)
+
+    # Clear again to restore full resolution
+    app_obj._crop_clear()
+    root.update()
+    time.sleep(0.2)
+    err, vc = pa.get_property("video-crop")
+    check("visual crop: clear restores uncropped video feed", err == "success" and (vc == "" or vc is None))
+
     app_obj._stop()
     root.destroy()
     kill_mpv()
