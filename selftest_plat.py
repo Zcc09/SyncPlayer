@@ -236,11 +236,35 @@ def t_window_backend():
         return
     sw, sh = wb.screen_size()
     check("window backend: screen size is sane", sw > 100 and sh > 100, (sw, sh))
-    # invalid handles must never raise
+    # invalid handles must never raise, and must answer with a bool (a None here
+    # would silently disable callers' "did it work?" branches)
     check("window backend: invalid handle is handled",
           wb.get_rect(1) is None and wb.valid(1) is False)
-    check("window backend: decoration on invalid handle is safe",
-          wb.set_borderless(1, True) is False or True)
+    _res = []
+    try:
+        _res = [wb.set_borderless(1, True), wb.set_ontop(1, True),
+                wb.restore_style(1, None), wb.place(1, 0, 0, 10, 10),
+                wb.get_rect(1), wb.client_size(1), wb.parent_of(1),
+                wb.is_frameless(1)]
+    except Exception as _e:            # noqa: BLE001
+        _res = [repr(_e)]
+    check("window backend: decoration/geometry calls on an invalid handle never raise",
+          not any(isinstance(x, str) for x in _res), _res)
+
+    # Regression: restoring a saved decoration state crashed on a Win32 style
+    # int ("object of type 'int' has no len()") because the X11 backend assumed
+    # the motif-hints list. _pip_saved starts life as None and Win32 hands back
+    # ints, so restore_style must accept every shape save_style() can return.
+    _bad = []
+    for _style in (None, 0, 1, 0x94CF0000, [2, 0, 0, 0, 0], (2, 0, 1, 0, 0), "junk"):
+        try:
+            _r = wb.restore_style(1, _style)
+            if not isinstance(_r, bool):
+                _bad.append((_style, "returned %r" % (_r,)))
+        except Exception as _e:        # noqa: BLE001
+            _bad.append((_style, repr(_e)))
+    check("window backend: restore_style tolerates every saved-style shape",
+          not _bad, _bad[:2])
 
 
 # ------------------------------------------------------------- diagnose -----
