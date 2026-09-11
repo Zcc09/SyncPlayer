@@ -434,12 +434,13 @@ def yt_subtitle_repo(url):
     """List YouTube subtitles (auto + uploaded) for a URL via the yt-dlp CLI."""
     if not is_youtube(url):
         return []
-    ytdl = shutil.which("yt-dlp")
+    ytdl = find_ytdl() or shutil.which("yt-dlp")
     if not ytdl:
         return []
     try:
         out = subprocess.run(
-            [ytdl, "--list-subs", "--no-warnings", "--no-playlist",
+            [ytdl, "--extractor-args", "youtube:player_client=android",
+             "--list-subs", "--no-warnings", "--no-playlist",
              "--skip-download", url],
             capture_output=True, text=True, timeout=180)
         if out.returncode != 0:
@@ -451,7 +452,7 @@ def yt_subtitle_repo(url):
 
 def resolve_url(url):
     """Non-YouTube URLs: resolve a direct stream URL via yt-dlp (best-effort)."""
-    ytdl = shutil.which("yt-dlp")
+    ytdl = find_ytdl() or shutil.which("yt-dlp")
     if not ytdl:
         return url
     try:
@@ -691,6 +692,15 @@ class MpvDriver:
                 ]
         if ytdl_bin:
             args.append("--script-opts=ytdl_hook-ytdl_path=%s" % ytdl_bin)
+        if is_youtube(src) or src.startswith("http"):
+            args.extend([
+                "--ytdl-raw-options=extractor-args=youtube:player_client=android",
+                "--cache=yes",
+                "--demuxer-max-bytes=150M",
+                "--demuxer-readahead-secs=30",
+                "--network-timeout=30",
+                "--stream-buffer-size=2MiB",
+            ])
         args.extend([
                 "--force-window=yes",
                 "--title=%s" % title,
@@ -2047,7 +2057,11 @@ class SyncApp:
                 p.quit()
                 time.sleep(0.15)
         self.btn_play.config(state="disabled")
-        self.status_lbl.config(text="Starting…")
+        self._retried = {"A": False, "B": False}
+        if is_youtube(a) or is_youtube(b) or a.startswith("http") or b.startswith("http"):
+            self.status_lbl.config(text="Connecting to stream & buffering... please wait a moment...")
+        else:
+            self.status_lbl.config(text="Starting…")
         self.root.update_idletasks()
 
         # Decide how each source is fed to mpv.
@@ -2134,6 +2148,23 @@ class SyncApp:
         except Exception:
             pass
 
+    def _retry_player(self, tag, src):
+        """Auto-retry starting a streaming player that needed a little more time to download."""
+        if not self.started:
+            return
+        name = "Movie" if tag == "A" else "Reaction"
+        p = self.players.get(tag)
+        if p and p.running:
+            return
+        try:
+            self.players[tag] = MpvDriver(src, tag, on_pause=self._on_player_pause,
+                                          on_exit=self._on_exit, start_paused=self.paused)
+            self._status_pin = time.monotonic() + 4.0
+            self.status_lbl.config(
+                text="Reconnected %s (YouTube stream). Buffering feed..." % name)
+        except Exception:
+            self._on_player_exit(tag)
+
     def _arrange_windows(self):
         threading.Thread(target=self._arrange_thread, daemon=True).start()
 
@@ -2158,6 +2189,16 @@ class SyncApp:
             src = self._srcs.get(tag, "")
             is_yt = is_youtube(src) or src.startswith("http")
             self._status_pin = time.monotonic() + 10.0
+            if is_yt and not getattr(self, "_retried", {}).get(tag, False):
+                if not hasattr(self, "_retried"):
+                    self._retried = {}
+                self._retried[tag] = True
+                self._status_pin = time.monotonic() + 4.0
+                self.status_lbl.config(
+                    text="Buffering %s (YouTube stream)... downloading a little first before playback..." % name)
+                self.root.after(1200, lambda t=tag, s=src: self._retry_player(t, s))
+                return
+
             if is_yt:
                 self.status_lbl.config(
                     text="%s (YouTube stream) failed or closed. %s paused & kept open." % (name, other_name))
@@ -2956,13 +2997,14 @@ class SyncApp:
         try:
             lbl = sub.get("label") or sub.get("lang") or "subtitle"
             self.status_lbl.config(text="Downloading %s subtitle for %s..." % (lbl, name))
-            ytdl = shutil.which("yt-dlp")
+            ytdl = find_ytdl() or shutil.which("yt-dlp")
             if not ytdl:
                 return
             outdir = os.path.join(tempfile.gettempdir(), "syncplayer_subs")
             os.makedirs(outdir, exist_ok=True)
             tmpl = os.path.join(outdir, "%(id)s.%(ext)s")
-            args = [ytdl, "--skip-download",
+            args = [ytdl, "--extractor-args", "youtube:player_client=android",
+                    "--skip-download",
                     "--write-auto-subs" if sub.get("auto") else "--write-subs",
                     "--subs-langs", sub["lang"], "--subs-format", "vtt",
                     "--no-warnings", "--no-playlist", "--output", tmpl, src]

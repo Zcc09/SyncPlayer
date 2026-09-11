@@ -49,7 +49,7 @@ def check(name, cond, extra=""):
 def run(cmd, timeout=60, env=None):
     try:
         r = subprocess.run(cmd, capture_output=True, text=True,
-                           timeout=timeout, env=env,
+                           errors="replace", timeout=timeout, env=env,
                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         return r.returncode, (r.stdout or "") + (r.stderr or "")
     except subprocess.TimeoutExpired:
@@ -158,8 +158,9 @@ def main():
     check("run: bundled mpv plays local file", rc == 0, out.strip()[:100])
 
     rc, out = run([mpv, "--no-config", "--vo=null", "--no-audio",
-                   "--frames=10", "--ytdl=yes", YOUTUBE_URL], timeout=120,
-                  env=env)
+                   "--frames=10", "--ytdl=yes",
+                   "--ytdl-raw-options=extractor-args=youtube:player_client=android",
+                   YOUTUBE_URL], timeout=120, env=env)
     check("run: bundled mpv plays a YouTube link (yt-dlp)",
           rc == 0, out.strip()[:120])
 
@@ -210,8 +211,8 @@ def main():
     # Start playback: A is valid local movie, B is invalid YouTube URL
     app_obj._start()
 
-    # Poll for 4 seconds: B will fail/exit, but A must stay alive!
-    for _ in range(40):
+    # Poll for 6.5 seconds: B will fail/exit, auto-retry once, then A stays alive!
+    for _ in range(65):
         app_obj._poll()
         root.update()
         time.sleep(0.1)
