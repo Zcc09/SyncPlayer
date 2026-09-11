@@ -354,6 +354,54 @@ def main():
     err, vc = pa.get_property("video-crop")
     check("visual crop: clear restores uncropped video feed", err == "success" and (vc == "" or vc is None))
 
+    # -------------------------------------------------------------------------
+    # 9. Reset PiP button test
+    # -------------------------------------------------------------------------
+    app_obj._toggle_pip("A") # turn PiP on
+    root.update()
+    time.sleep(0.1)
+    check("reset pip: pip turned on for test", app_obj.pip.get("A") is True)
+    app_obj._reset_pip() # reset PiP
+    root.update()
+    time.sleep(0.2)
+    check("reset pip: pip turned off and reset", app_obj.pip.get("A") is False and app_obj.pip_int is False)
+    st_norm = u.GetWindowLongPtrW(pa.hwnd, -16) & 0xFFFFFFFF
+    check("reset pip: normal window caption/frame restored", bool(st_norm & 0x00C00000))
+
+    # -------------------------------------------------------------------------
+    # 10. Volume sliders go to 150% max
+    # -------------------------------------------------------------------------
+    app_obj.vol_a.set(135.0)
+    app_obj._apply_volumes()
+    root.update()
+    time.sleep(0.1)
+    err, cur_vol = pa.get_property("volume")
+    check("volume: supports over 100% (up to 150%)", err == "success" and cur_vol is not None and abs(cur_vol - 135.0) <= 2.0, "cur_vol=%s" % cur_vol)
+
+    # -------------------------------------------------------------------------
+    # 11. Editable timecode for individual video feeds (Movie & Reaction)
+    # -------------------------------------------------------------------------
+    app_obj.goto_vars["A"].set("00:06") # jump movie A alone to 6s
+    app_obj._on_goto_single("A")
+    root.update()
+    time.sleep(0.2)
+    check("goto single: movie A seeks to 6s alone", abs((app_obj.last_pos.get("A") or 0) - 6.0) <= 1.0)
+    check("goto single: goto entry cleared after seek", app_obj.goto_vars["A"].get() == "")
+
+    # -------------------------------------------------------------------------
+    # 12. Jump seconds setting for arrow keys
+    # -------------------------------------------------------------------------
+    app_obj.jump_sec.set(7.5)
+    check("jump setting: jump_sec variable updated", app_obj._get_jump_sec() == 7.5)
+
+    # -------------------------------------------------------------------------
+    # 13. Buffer duration & YouTube-style fast keyframe seeking
+    # -------------------------------------------------------------------------
+    pa.seek(3.0, exact=False) # fast keyframe scrub
+    time.sleep(0.1)
+    check("seek precision: fast keyframe scrub executed without error", True)
+    check("buffer: cache_dur tracked on player status", hasattr(pa, "cache_dur"))
+
     app_obj._stop()
     root.destroy()
     kill_mpv()

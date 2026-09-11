@@ -75,7 +75,7 @@ else:
 os.makedirs(SHOT_DIR, exist_ok=True)
 
 STATUS_PREFIX = "SYNCSTATUS|"
-STATUS_APPEND = "|${sub-id}|${aid}"   # appended to the term status line
+STATUS_APPEND = "|${sub-id}|${aid}|${demuxer-cache-duration}"   # includes stream buffer duration
 YOUTUBE_HOSTS = ("youtube.com", "youtu.be", "music.youtube.com")
 
 LUA_SCRIPT = """
@@ -687,6 +687,7 @@ class MpvDriver:
                 "--hwdec=safe",
                 "--fs=no",
                 "--ytdl=yes",
+                "--volume-max=150",
                 ]
         if ytdl_bin:
             args.append("--script-opts=ytdl_hook-ytdl_path=%s" % ytdl_bin)
@@ -891,6 +892,15 @@ class MpvDriver:
                 self.sub_id = self._to_int_or_none(parts[7])
             if len(parts) > 8:
                 self.audio_id = self._to_int_or_none(parts[8])
+            if len(parts) > 9:
+                try:
+                    cval = parts[9].strip()
+                    self.cache_dur = float(cval) if cval not in ("", "nan", "-nan") else 0.0
+                except Exception:
+                    self.cache_dur = 0.0
+            else:
+                self.cache_dur = 0.0
+            rec["cache_dur"] = self.cache_dur
             self.q.put(("status", rec))
         except Exception:
             pass
@@ -981,25 +991,22 @@ class MpvDriver:
         self.paused = not self.paused
         self.cmd({"command": ["cycle", "pause"]})
 
-    def seek(self, pos, absolute=True):
-        # Seeking out of the --keep-open EOF hold leaves mpv PAUSED (verified
-        # empirically; resuming BEFORE the seek races the keep-open state and
-        # the seek never lands). Land the seek first, then resume: mpv
-        # processes pipe commands in order, so playback starts at `pos`.
+    def seek(self, pos, absolute=True, exact=True):
         self.last_seek_ts = time.monotonic()
-        hold = self.at_end or self._eof_hold   # parked in the EOF hold?
-        self.at_end = False   # seeking leaves the end; eof-reached reset is racy
+        hold = self.at_end or self._eof_hold
+        self.at_end = False
+        mode = "exact" if exact else "keyframes"
         if hold:
             if absolute:
-                self.cmd({"command": ["seek", max(0.0, pos), "absolute+exact"]})
+                self.cmd({"command": ["seek", max(0.0, pos), "absolute+" + mode]})
             else:
-                self.cmd({"command": ["seek", pos, "relative+exact"]})
+                self.cmd({"command": ["seek", pos, "relative+" + mode]})
             self.set_pause(False)
             return
         if absolute:
-            self.cmd({"command": ["seek", max(0.0, pos), "absolute+exact"]})
+            self.cmd({"command": ["seek", max(0.0, pos), "absolute+" + mode]})
         else:
-            self.cmd({"command": ["seek", pos, "relative+exact"]})
+            self.cmd({"command": ["seek", pos, "relative+" + mode]})
 
     def screenshot(self, path):
         self.cmd({"command": ["screenshot-to-file", path, "video"]})
@@ -1388,12 +1395,16 @@ class SyncApp:
         self.sync_off = 0.0          # reaction's offset vs the movie (can be ±)
         self.last_pos = {"A": None, "B": None}
         self.last_dur = {"A": None, "B": None}
+        self.cache_dur = {"A": 0.0, "B": 0.0}
         self.dragging_seek_a = False
         self.dragging_seek_b = False
         self.dragging_seek_m = False
         self._seek_a_val = None
         self._seek_b_val = None
         self._seek_m_val = None
+        self._scrub_ts = 0.0
+        self.jump_sec = tk.DoubleVar(value=5.0)
+        self.goto_vars = {"A": tk.StringVar(), "B": tk.StringVar()}
         self.dragging_vol = [False, False]
         self.dragging_master = False
         self._ctrls = []
@@ -1594,6 +1605,12 @@ class SyncApp:
             b.pack(side="left", padx=(4, 0))
             Tooltip(b, tip)
             self._ctrls.append(b)
+        ttk.Label(sp, text="Jump:").pack(side="left", padx=(12, 4))
+        self.jump_entry = ttk.Entry(sp, textvariable=self.jump_sec, width=4, justify="center")
+        self.jump_entry.pack(side="left")
+        Tooltip(self.jump_entry, "Arrow key jump distance in seconds (customizable).")
+        ttk.Label(sp, text="s").pack(side="left", padx=(2, 0))
+        self._ctrls.append(self.jump_entry)
 
         # ---- timelines ------------------------------------------------------
         tl = ttk.LabelFrame(body, text=" Timelines ", padding=(8, 4))
@@ -1621,7 +1638,19 @@ class SyncApp:
             nbtn.pack(side="left", padx=(0, 4))
             Tooltip(nbtn, "Play/pause THIS video only - the other one keeps going (handy before you lock the sync).")
             self._ctrls.append(nbtn)
-            lbl = ttk.Label(row, text="00:00 / --:--", width=20, anchor="e")
+            if tag:
+                gt_frame = ttk.Frame(row)
+                gt_frame.pack(side="right", padx=(4, 2))
+                ge = ttk.Entry(gt_frame, textvariable=self.goto_vars[tag], width=8)
+                ge.pack(side="left")
+                ge.bind("<Return>", lambda e, t=tag: self._on_goto_single(t))
+                Tooltip(ge, "Jump %s alone to typed time: seconds, MM:SS, or HH:MM:SS." % label.rstrip(":"))
+                gb = ttk.Button(gt_frame, text="Go", width=3,
+                                command=lambda t=tag: self._on_goto_single(t))
+                gb.pack(side="left", padx=(2, 0))
+                Tooltip(gb, "Jump %s alone to the typed timecode." % label.rstrip(":"))
+                self._ctrls.extend([ge, gb])
+            lbl = ttk.Label(row, text="00:00 / --:--", width=24, anchor="e")
             lbl.pack(side="right")
             self._ctrls.append(slider)
             Tooltip(slider, tip)
@@ -1711,6 +1740,10 @@ class SyncApp:
         b.pack(side="left")
         Tooltip(b, "Put the two video windows next to each other on the screen.")
         self._ctrls.append(b)
+        b_rst = ttk.Button(win, text="↺ Reset PiP", width=11, command=self._reset_pip)
+        b_rst.pack(side="left", padx=(4, 0))
+        Tooltip(b_rst, "Reset all windows: exit any PiP mode and restore both video windows with normal borders side by side.")
+        self._ctrls.append(b_rst)
         self.btn_pip_a = ttk.Button(win, text="⧉ PiP Movie", width=12,
                                     command=lambda: self._toggle_pip("A"))
         self.btn_pip_a.pack(side="left", padx=(6, 0))
@@ -1803,7 +1836,7 @@ class SyncApp:
             f = ttk.LabelFrame(vol, text=" %s " % label, padding=6)
             f.grid(row=0, column=i, sticky="ew", padx=(0, 8))
             vol.columnconfigure(i, weight=1)
-            s = ttk.Scale(f, from_=0, to=100, variable=var,
+            s = ttk.Scale(f, from_=0, to=150, variable=var,
                           command=lambda v, j=idx: self._on_vol_drag(j))
             s.pack(fill="x")
             s.bind("<ButtonRelease-1>", lambda e, j=idx: self._on_vol_release(j))
@@ -1825,7 +1858,7 @@ class SyncApp:
         fm = ttk.LabelFrame(vol, text=" Master volume ", padding=6)
         fm.grid(row=0, column=2, sticky="ew")
         vol.columnconfigure(2, weight=1)
-        s2 = ttk.Scale(fm, from_=0, to=100, variable=self.vol_m,
+        s2 = ttk.Scale(fm, from_=0, to=150, variable=self.vol_m,
                        command=lambda v: self._on_master_drag())
         s2.pack(fill="x")
         s2.bind("<ButtonRelease-1>", lambda e: setattr(self, "dragging_master", False))
@@ -1843,8 +1876,8 @@ class SyncApp:
         self.state_lbl.pack(fill="x")
 
         self.root.bind("<space>", lambda e: self._toggle_play())
-        self.root.bind("<Left>", lambda e: None if self._pip_nudge(-5, 0) else self._jump(-5))
-        self.root.bind("<Right>", lambda e: None if self._pip_nudge(5, 0) else self._jump(5))
+        self.root.bind("<Left>", lambda e: None if self._pip_nudge(-5, 0) else self._jump(-self._get_jump_sec()))
+        self.root.bind("<Right>", lambda e: None if self._pip_nudge(5, 0) else self._jump(self._get_jump_sec()))
         self.root.bind("<Up>", lambda e: self._pip_nudge(0, -5))
         self.root.bind("<Down>", lambda e: self._pip_nudge(0, 5))
         self.root.bind("<bracketleft>", lambda e: self._step_frame(self._last_active, back=True))
@@ -2233,6 +2266,68 @@ class SyncApp:
         for t in ("A", "B"):
             if self.last_pos[t] is not None:
                 self._commit_seek(t, max(0.0, self.last_pos[t] + delta))
+
+    def _get_jump_sec(self):
+        try:
+            val = float(self.jump_sec.get())
+            if val > 0:
+                return val
+        except Exception:
+            pass
+        return 5.0
+
+    def _on_goto_single(self, tag):
+        """Jump THIS video alone to typed timecode, adjusting sync offset so other stays put."""
+        if not self.started:
+            return
+        p = self.players.get(tag)
+        if not (p and p.running):
+            return
+        txt = self.goto_vars[tag].get().strip()
+        if not txt:
+            return
+        pos = MpvDriver._to_seconds(txt)
+        name = "Movie" if tag == "A" else "Reaction"
+        if pos is None or pos < 0:
+            self.status_lbl.config(text="Enter a timecode for %s like 1:23:45, 83:45 or 90." % name)
+            return
+        dur = self.last_dur.get(tag)
+        if dur:
+            pos = max(0.0, min(pos, dur))
+        p.seek(pos, exact=True)
+        self._commit_seek(tag, pos)
+        now = time.monotonic()
+        other_tag = "B" if tag == "A" else "A"
+        other_pos = self._est_pos(other_tag, now)
+        if other_pos is not None:
+            if tag == "A":
+                self.sync_off = other_pos - pos
+            else:
+                self.sync_off = pos - other_pos
+        self.goto_vars[tag].set("")
+        self._status_pin = time.monotonic() + 3.0
+        self.status_lbl.config(text="Seek %s to %s." % (name, self._fmt(pos, dur)))
+
+    def _reset_pip(self):
+        """Reset all video windows back to normal bordered windows side by side."""
+        if self.pip_int:
+            self._undock_pip_int()
+        u = ctypes.windll.user32
+        for tag in ("A", "B"):
+            p = self.players.get(tag)
+            if p and p.running:
+                p.cmd({"command": ["set_property", "ontop", "no"]})
+                p.cmd({"command": ["set_property", "border", "yes"]})
+                p.cmd({"command": ["set_property", "window-dragging", "yes"]})
+                if p.hwnd:
+                    saved = self._pip_saved.get(tag) or (0x10000000 | 0x00CF0000)
+                    u.SetWindowLongPtrW(p.hwnd, -16, saved if saved < 0x80000000 else saved - 0x100000000)
+                    u.SetWindowPos(p.hwnd, 0, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0004 | 0x0020)
+                    self._pip_saved[tag] = None
+            self.pip[tag] = False
+        self._arrange_windows()
+        self._status_pin = time.monotonic() + 3.0
+        self.status_lbl.config(text="Reset PiP: both video windows restored with normal borders.")
 
     def _on_goto(self):
         """Jump both videos to a typed timecode (seconds / MM:SS / HH:MM:SS)."""
@@ -3192,28 +3287,53 @@ class SyncApp:
                 text="Sync unlocked \u2014 Movie / Reaction bars adjust one video at a time.")
 
     def _on_seek_a_drag(self, v):
-        # ttk.Scale fires the command callback even for PROGRAMMATIC .set()
-        # calls (verified empirically). The poll loop sets _prog_set while it
-        # updates the bars, so a dragged bar keeps its position and the flag
-        # only sticks on real user input.
         if self._prog_set or self.sync_locked:
             return
         self._last_active = "A"
         self.dragging_seek_a = True
-        self._seek_a_val = float(v)
+        pos = float(v)
+        self._seek_a_val = pos
+        dur = self.last_dur.get("A") or 600
+        self.lbl_a.config(text=self._fmt(pos, dur))
+        now = time.monotonic()
+        if now - self._scrub_ts > 0.08:
+            self._scrub_ts = now
+            p = self.players.get("A")
+            if p and p.running:
+                p.seek(pos, exact=False)
 
     def _on_seek_b_drag(self, v):
         if self._prog_set or self.sync_locked:
             return
         self._last_active = "B"
         self.dragging_seek_b = True
-        self._seek_b_val = float(v)
+        pos = float(v)
+        self._seek_b_val = pos
+        dur = self.last_dur.get("B") or 600
+        self.lbl_b.config(text=self._fmt(pos, dur))
+        now = time.monotonic()
+        if now - self._scrub_ts > 0.08:
+            self._scrub_ts = now
+            p = self.players.get("B")
+            if p and p.running:
+                p.seek(pos, exact=False)
 
     def _on_seek_m_drag(self, v):
         if self._prog_set or not self.sync_locked:
             return
         self.dragging_seek_m = True
-        self._seek_m_val = float(v)
+        pos = float(v)
+        self._seek_m_val = pos
+        m_dur = max(self.last_dur.get("A") or 0, self.last_dur.get("B") or 0) or 600
+        self.lbl_m.config(text=self._fmt(pos, m_dur))
+        now = time.monotonic()
+        if now - self._scrub_ts > 0.08:
+            self._scrub_ts = now
+            for t, off_key in (("A", None), ("B", "B")):
+                p = self.players.get(t)
+                if p and p.running:
+                    spos = pos if off_key is None else pos + self.sync_off
+                    p.seek(max(0.0, spos), exact=False)
 
     def _on_seek_a_release(self):
         self.dragging_seek_a = False
@@ -3453,6 +3573,8 @@ class SyncApp:
                         self._status_time[t] = now
                     if rec["duration"]:
                         self.last_dur[t] = rec["duration"]
+                    if "cache_dur" in rec:
+                        self.cache_dur[t] = rec["cache_dur"]
                     # The status line's eof field is mpv's own eof-reached
                     # (~1 Hz). Make it authoritative BOTH ways: a stale
                     # "yes" must not latch at_end after a restart, or a real
@@ -3575,9 +3697,13 @@ class SyncApp:
         finally:
             self._prog_set = False
 
-        # ---- labels (re-render only when the text changed) ------------------
-        ma = self._fmt(ra, self.last_dur["A"])
-        rb_fmt = self._fmt(rb, self.last_dur["B"])
+        # ---- labels (with stream buffer indicator) --------------------------
+        buf_a = self.cache_dur.get("A", 0.0)
+        buf_b = self.cache_dur.get("B", 0.0)
+        ma_base = self._fmt(ra, self.last_dur["A"])
+        ma = ("%s  [Buf: %ds]" % (ma_base, int(buf_a))) if (buf_a > 1.0) else ma_base
+        rb_base = self._fmt(rb, self.last_dur["B"])
+        rb_fmt = ("%s  [Buf: %ds]" % (rb_base, int(buf_b))) if (buf_b > 1.0) else rb_base
         mm = self._fmt(ra if ra is not None else rb, self.last_dur["A"] or self.last_dur["B"])
         if self._lbl_cache.get("A") != ma:
             self.lbl_a.config(text=ma)
@@ -3630,6 +3756,7 @@ class SyncApp:
             self.vol_b.set(float(c.get("vol_b", 100.0)))
             self.vol_m.set(float(c.get("vol_m", 100.0)))
             self.speed.set(float(c.get("speed", 1.0)))
+            self.jump_sec.set(float(c.get("jump_sec", 5.0)))
         except Exception:
             pass
 
@@ -3643,6 +3770,7 @@ class SyncApp:
                     "vol_b": self.vol_b.get(),
                     "vol_m": self.vol_m.get(),
                     "speed": self.speed.get(),
+                    "jump_sec": self.jump_sec.get(),
                 }, f, indent=2)
         except Exception:
             pass
