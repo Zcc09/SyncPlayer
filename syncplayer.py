@@ -57,7 +57,7 @@ from tkinter import ttk, filedialog, messagebox
 import sp_plat as plat   # cross-platform: paths, mpv IPC, window control
 
 APP_NAME = "SyncPlayer"
-APP_VERSION = "1.6.1"
+APP_VERSION = "1.6.2"
 
 
 class MpvNotFoundError(Exception):
@@ -508,6 +508,10 @@ def clamp(v, lo, hi):
 # --audio-pitch-correction the pitch is preserved, so the correction is
 # inaudible; anything larger than MICRO_MAX_DRIFT is still a seek, because
 # trimming a big gap at a few percent would take minutes.
+# smallest embedded pane the +/- buttons may reach (matches the floors in
+# _pip_calc_rect); move_child's default 160x120 is for the host windows
+MIN_PANE_W, MIN_PANE_H = 60, 34
+
 MICRO_DEADBAND = 0.06         # s: inside this the two feeds count as aligned
 MICRO_MAX_DRIFT = 0.8         # s: above this, seek instead of trimming
 MICRO_MAX_PCT = 0.05         # cap the rate change at +-5%
@@ -3301,7 +3305,9 @@ class SyncApp:
         x, y, w, h, max_x, max_y = self._pip_calc_rect(cw, ch)
         hwnd = self._pip_int_hwnd
         if hwnd:
-            _wb().move_child(hwnd, x, y, w, h)
+            # the pane gets its own floor: place()'s 160x120 default is meant for
+            # the host windows and used to override this pane's smaller geometry
+            _wb().move_child(hwnd, x, y, w, h, MIN_PANE_W, MIN_PANE_H)
 
     def _pip_resize(self, direction):
         """PiP size buttons (+/- keys): grow/shrink the embedded pane
@@ -4214,9 +4220,17 @@ def _uninstall_targets():
     """Everything the Windows Setup can create for this installation."""
     exe_dir = (os.path.dirname(os.path.abspath(sys.executable))
                if getattr(sys, "frozen", False) else BASE)
+    # Setup records the Start Menu folder the user chose, and that is the one to
+    # remove - assuming the default name would leave a custom folder behind.
+    folder = APP_NAME
+    try:
+        with io.open(os.path.join(exe_dir, "install.json"), encoding="utf-8") as f:
+            folder = (json.load(f) or {}).get("startmenu_folder") or APP_NAME
+    except Exception:
+        pass
     lnks = [os.path.join(os.path.expanduser("~"), "Desktop", APP_NAME + ".lnk")]
     sm = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"),
-                      "Microsoft", "Windows", "Start Menu", "Programs", APP_NAME)
+                      "Microsoft", "Windows", "Start Menu", "Programs", folder)
     try:
         lnks += [os.path.join(sm, n) for n in os.listdir(sm)]
     except Exception:

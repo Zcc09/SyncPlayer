@@ -163,6 +163,42 @@ def resolve_payloads():
     return src_exe, src_mpv, src_updater
 
 
+def _protected_reason(path):
+    """Why Setup should not write into this folder, or None when it is fine.
+
+    Windows refuses these without elevation, and failing halfway through a 120 MB
+    copy with a raw OSError is not something an installer should do.
+    """
+    p = os.path.abspath(path).lower().rstrip("\\/")
+    drive, tail = os.path.splitdrive(p)
+    home = os.path.expanduser("~").lower().rstrip("\\/")
+    for base in (os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)"),
+                 os.environ.get("ProgramData"), os.environ.get("SystemRoot"),
+                 os.environ.get("ProgramW6432")):
+        b = base.lower().rstrip("\\/")
+        if base and (p == b or p.startswith(b + "\\")):
+            return ("Setup cannot install %s into a protected system folder:\n\n%s\n\n"
+                    "Choose a folder inside your user profile instead - the default\n"
+                    "(%%LOCALAPPDATA%%\\Programs\\%s) needs no administrator rights."
+                    % (APP_NAME, path, APP_NAME))
+    if p == home:
+        return ("Please choose a folder for %s rather than your profile root:\n\n%s"
+                % (APP_NAME, path))
+    if tail in ("", "\\", "/"):
+        return ("Please choose a folder for %s rather than a drive root:\n\n%s"
+                % (APP_NAME, path))
+    return None
+
+
+def _bytes_text(mb):
+    """Human units: installers show a 1.5 TB drive as GB/TB, not 1556377 MB."""
+    if mb >= 1024 * 1024:
+        return "%.1f TB" % (mb / (1024.0 * 1024.0))
+    if mb >= 1024:
+        return "%.1f GB" % (mb / 1024.0)
+    return "%.1f MB" % mb
+
+
 def payload_mb(src):
     """Approximate unpacked size of the payload, for the space check."""
     total = 0
@@ -202,6 +238,7 @@ class Options(object):
         self.updater = True          # "Check for Updates"
         self.desktop_shortcut = True
         self.startmenu_shortcut = True
+        self.startmenu_folder = APP_NAME     # Start Menu folder the user picked
         self.launch = True
 
     def describe(self):
@@ -268,6 +305,8 @@ def do_install(opts, src, progress=None):
         "ytdlp_installed": bool(opts.ytdlp and os.path.isfile(ytdlp_exe)),
         "updater_installed": bool(updater_path),
         "install_dir": install_dir,
+        "startmenu_folder": (opts.startmenu_folder if opts.startmenu_shortcut
+                             else ""),
         "installed_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
     with open(os.path.join(install_dir, "install.json"), "w",
@@ -276,13 +315,14 @@ def do_install(opts, src, progress=None):
     return state, app_path, updater_path
 
 
-def startmenu_dir():
+def startmenu_dir(folder=None):
     return os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"),
-                        "Microsoft", "Windows", "Start Menu", "Programs", APP_NAME)
+                        "Microsoft", "Windows", "Start Menu", "Programs",
+                        folder or APP_NAME)
 
 
 def make_shortcuts(app_path, install_dir, updater_path, desktop=True,
-                   startmenu=True):
+                   startmenu=True, startmenu_folder=None):
     made = []
     if desktop:
         if create_shortcut(os.path.join(os.path.expanduser("~"), "Desktop",
@@ -290,7 +330,7 @@ def make_shortcuts(app_path, install_dir, updater_path, desktop=True,
                            app_path, install_dir):
             made.append("desktop")
     if startmenu:
-        sm = startmenu_dir()
+        sm = startmenu_dir(startmenu_folder)
         if create_shortcut(os.path.join(sm, APP_NAME + ".lnk"),
                            app_path, install_dir):
             made.append("startmenu")
@@ -302,32 +342,6 @@ def make_shortcuts(app_path, install_dir, updater_path, desktop=True,
                            app_path, install_dir, args="--uninstall"):
             made.append("startmenu-uninstall")
     return made
-
-
-def remove_shortcuts():
-    """Delete the shortcuts the installer can create (used by --uninstall)."""
-    removed = []
-    lnks = [os.path.join(os.path.expanduser("~"), "Desktop", APP_NAME + ".lnk")]
-    sm = startmenu_dir()
-    try:
-        for n in os.listdir(sm):
-            lnks.append(os.path.join(sm, n))
-    except Exception:
-        pass
-    for p in lnks:
-        try:
-            if os.path.isfile(p):
-                os.remove(p)
-                removed.append(p)
-        except Exception:
-            pass
-    try:
-        if os.path.isdir(sm) and not os.listdir(sm):
-            os.rmdir(sm)
-            removed.append(sm)
-    except Exception:
-        pass
-    return removed
 
 
 # --------------------------------------------------------- Add/Remove entry --
@@ -404,6 +418,12 @@ def parse_options(argv):
                        ("--no-startmenu-shortcut", "startmenu_shortcut")):
         if flag in argv:
             setattr(opts, attr, False)
+    if "--startmenu-folder" in argv:
+        try:
+            i = argv.index("--startmenu-folder")
+            opts.startmenu_folder = argv[i + 1]
+        except Exception:
+            pass
     if "--no-launch" in argv:
         opts.launch = False
     if "--launch" in argv:
@@ -428,7 +448,8 @@ def _cli_main(opts, as_json=False):
         return 1
     state["shortcuts"] = make_shortcuts(
         app_path, opts.install_dir, updater_path,
-        desktop=opts.desktop_shortcut, startmenu=opts.startmenu_shortcut)
+        desktop=opts.desktop_shortcut, startmenu=opts.startmenu_shortcut,
+        startmenu_folder=opts.startmenu_folder)
     state["uninstall_registered"] = register_uninstall(
         opts.install_dir, app_path, state["app_version"])
     state["components"] = opts.describe()
@@ -450,90 +471,445 @@ def _cli_main(opts, as_json=False):
 
 # ---------------------------------------------------------------------------
 # wizard
+#
+# A conventional Windows setup wizard: fixed-size window, white content area,
+# page title + description in the header, and Back / Next / Cancel in the footer
+# in the order every other installer puts them. ttk's native theme is left alone
+# so buttons, entries and the progress bar are the system ones, and the page flow
+# is the usual one:
+#
+#   Welcome -> [License] -> Destination -> Start Menu -> Tasks -> Ready to
+#   Install -> Installing -> Finish
 # ---------------------------------------------------------------------------
-BG = "#1f232b"
-FG = "#e8e8ea"
-DIM = "#9aa0a8"
-ACCENT = "#4a9eff"
+WIZ_W, WIZ_H = 500, 366
+
+
+def _find_asset(name):
+    """icon.png / LICENSE beside the script or inside the onefile payload."""
+    cands = []
+    for base in (getattr(sys, "_MEIPASS", None),
+                 os.path.dirname(os.path.abspath(__file__)),
+                 os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else None):
+        if base:
+            p = os.path.join(base, name)
+            if os.path.isfile(p):
+                return p
+    return None
 
 
 class Wizard(object):
-    """A small multi-page installer: Welcome -> Destination -> Components ->
-    Progress -> Finish, with Back/Next, validation and a progress bar."""
-
-    PAGES = ("welcome", "dest", "components", "progress", "finish")
+    """Welcome -> [License] -> Destination -> Start Menu -> Tasks -> Ready ->
+    Installing -> Finish (the License page only appears when one is shipped)."""
 
     def __init__(self, root, opts):
         import tkinter as tk
-        from tkinter import ttk
-        self.tk = tk
-        self.ttk = ttk
-        self.root = root
-        self.opts = opts
+        from tkinter import ttk, font as tkfont
+        self.tk, self.ttk, self.tkfont = tk, ttk, tkfont
+        self.root, self.opts = root, opts
         self.page = 0
         self.error = None
         self.state = None
         self.app_path = None
         self.queue = []
+        self._poll_id = None
+        self.src = resolve_payloads()
+        self.version = get_exe_version(self.src[0]) or ""
 
-        root.title("%s Setup" % APP_NAME)
-        root.geometry("580x460")
-        root.resizable(False, False)
-        root.configure(bg=BG)
+        self.BG = "#f0f0f0"          # window face
+        self.PANEL = "#ffffff"       # content area
+        self.FG = "#1a1a1a"
+        self.DIM = "#4d4d4d"
+        self.ACCENT = "#0a3d91"      # group-box headings
+
+        base = tkfont.nametofont("TkDefaultFont")
+        self.F_SUB = base.copy()
+        self.F_TITLE = base.copy()
+        self.F_TITLE.configure(size=base.cget("size") + 2, weight="bold")
+        self.F_HEAD = base.copy()
+        self.F_HEAD.configure(weight="bold")
+        self.F_MONO = None
         try:
-            root.lift()
-            root.attributes("-topmost", True)
-            root.after(400, lambda: root.attributes("-topmost", False))
-            root.focus_force()
+            self.F_MONO = tkfont.nametofont("TkFixedFont").copy()
         except Exception:
             pass
 
-        # header
-        self.head = tk.Frame(root, bg=BG)
-        self.head.pack(fill="x", padx=18, pady=(16, 0))
-        self.title_var = tk.StringVar(value="")
-        self.sub_var = tk.StringVar(value="")
-        tk.Label(self.head, textvariable=self.title_var, fg=FG, bg=BG,
-                 font=("Segoe UI", 13, "bold"), anchor="w").pack(fill="x")
-        tk.Label(self.head, textvariable=self.sub_var, fg=DIM, bg=BG,
-                 font=("Segoe UI", 9), anchor="w", justify="left",
-                 wraplength=540).pack(fill="x", pady=(2, 0))
+        # ttk widgets paint the theme's background, which would show as grey
+        # patches on the white content area - give them a white-bodied style
+        style = ttk.Style()
+        for base in ("TCheckbutton", "TRadiobutton", "TLabel", "TFrame",
+                     "TSeparator"):
+            try:
+                style.configure("Body." + base, background=self.PANEL)
+                style.map("Body." + base,
+                          background=[("active", self.PANEL),
+                                      ("disabled", self.PANEL)])
+            except Exception:
+                pass
+        try:
+            style.configure("Body.TEntry", fieldbackground="#ffffff")
+        except Exception:
+            pass
 
-        ttk.Separator(root).pack(fill="x", padx=18, pady=(10, 0))
+        self.license_text = self._read_license()
+        self.PAGES = tuple(["welcome"] + (["license"] if self.license_text else [])
+                           + ["dest", "startmenu", "tasks", "ready", "installing",
+                              "finish"])
 
-        # body
-        self.body = tk.Frame(root, bg=BG)
-        self.body.pack(fill="both", expand=True, padx=18, pady=8)
+        root.title("Setup - %s%s" % (APP_NAME, (" " + self.version) if self.version else ""))
+        root.resizable(False, False)
+        root.configure(bg=self.BG)
+        self._set_icon()
+        root.protocol("WM_DELETE_WINDOW", self.cancel)
+        root.bind("<Return>", lambda e: self._default())
+        root.bind("<Escape>", lambda e: self.cancel())
+        # whoever destroys the window, our progress poll must not outlive it
+        root.bind("<Destroy>", self._on_destroy)
 
-        # footer
-        foot = tk.Frame(root, bg=BG)
-        foot.pack(fill="x", padx=18, pady=(4, 14))
-        self.step_var = tk.StringVar(value="")
-        tk.Label(foot, textvariable=self.step_var, fg=DIM, bg=BG,
-                 font=("Segoe UI", 8)).pack(side="left")
-        self.btn_next = ttk.Button(foot, text="Next  >", width=12,
-                                   command=self.next)
-        self.btn_next.pack(side="right")
-        self.btn_back = ttk.Button(foot, text="<  Back", width=10,
-                                   command=self.back)
+        # The footer is packed FIRST (side=bottom) so a tall page can never
+        # push Back / Next / Cancel out of the window.
+        foot = tk.Frame(root, bg=self.BG)
+        foot.pack(side="bottom", fill="x", padx=12, pady=(0, 10))
+        self.foot_rule = ttk.Separator(root)
+        self.foot_rule.pack(side="bottom", fill="x", pady=(6, 0))
+        self.btn_cancel = ttk.Button(foot, text="Cancel", width=10, command=self.cancel)
+        self.btn_cancel.pack(side="right")
+        self.btn_next = ttk.Button(foot, text="Next >", width=10, command=self.next)
+        self.btn_next.pack(side="right", padx=(0, 8))
+        self.btn_back = ttk.Button(foot, text="< Back", width=10, command=self.back)
         self.btn_back.pack(side="right", padx=(0, 8))
-        self.btn_cancel = ttk.Button(foot, text="Cancel", width=10,
-                                     command=self.cancel)
-        self.btn_cancel.pack(side="right", padx=(0, 8))
+
+        head = tk.Frame(root, bg=self.PANEL)
+        head.pack(side="top", fill="x")
+        self.head_icon = self._load_icon(head)
+        self.head_icon_pad = 34 if self.head_icon is not None else 0
+        if self.head_icon is None:
+            tk.Frame(head, bg=self.PANEL, height=44, width=28).pack(side="left",
+                                                                    padx=(16, 12))
+        ht = tk.Frame(head, bg=self.PANEL)
+        ht.pack(side="left", fill="both", expand=True, pady=(12, 10))
+        self.hdr_title = tk.Label(ht, text="", bg=self.PANEL, fg=self.FG,
+                                  anchor="w", font=self.F_TITLE)
+        self.hdr_title.pack(fill="x")
+        self.hdr_sub = tk.Label(ht, text="", bg=self.PANEL, fg=self.DIM, anchor="w",
+                                justify="left", font=self.F_SUB,
+                                wraplength=WIZ_W - 110)
+        self.hdr_sub.pack(fill="x", pady=(1, 0))
+        ttk.Separator(root).pack(fill="x")
+
+        self.body = tk.Frame(root, bg=self.PANEL)
+        self.body.pack(side="top", fill="both", expand=True, padx=16, pady=(10, 4))
 
         self.frames = {}
         self._build_welcome()
+        if self.license_text:
+            self._build_license()
         self._build_dest()
-        self._build_components()
-        self._build_progress()
+        self._build_startmenu()
+        self._build_tasks()
+        self._build_ready()
+        self._build_installing()
         self._build_finish()
+
+        # Fit the window to the tallest page rather than guessing a height: a
+        # page that needs more room than the others must not clip its controls.
+        need = WIZ_H
+        for n, f in self.frames.items():
+            f.pack(fill="both", expand=True)
+            root.update_idletasks()
+            need = max(need, f.winfo_reqheight() + self._chrome_height())
+            f.pack_forget()
+        w, h = WIZ_W, need
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        root.geometry("%dx%d+%d+%d" % (w, h, max(0, (sw - w) // 2),
+                                       max(0, (sh - h) // 3)))
         self.show(0)
 
-    # -- page shells ---------------------------------------------------------
-    def _new_page(self, name):
-        f = self.tk.Frame(self.body, bg=BG)
+    def _chrome_height(self):
+        """Header + footer + padding the body does not include."""
+        try:
+            return (self.hdr_title.winfo_reqheight() + self.hdr_sub.winfo_reqheight()
+                    + self.btn_next.winfo_reqheight()
+                    + getattr(self, "head_icon_pad", 34) + 40)
+        except Exception:
+            return 120
+
+    # -- helpers -------------------------------------------------------------
+    def _read_license(self):
+        """The project's own licence text, when there is one to show."""
+        for name in ("LICENSE", "LICENSE.txt", "LICENSE.md", "COPYING"):
+            p = _find_asset(name)
+            if p:
+                try:
+                    with open(p, encoding="utf-8", errors="replace") as f:
+                        return f.read().strip()
+                except Exception:
+                    pass
+        return ""
+
+    def _set_icon(self):
+        """Window icon: the exe's own icon when frozen, icon.ico from source."""
+        try:
+            ico = _find_asset("icon.ico")
+            if ico:
+                self.root.iconbitmap(default=ico)
+            elif getattr(sys, "frozen", False):
+                self.root.iconbitmap(default=sys.executable)
+        except Exception:
+            pass
+
+    def _load_icon(self, parent):
+        """32x32 header icon (Tk 8.6 reads PNG without extra deps)."""
+        p = _find_asset("icon.png")
+        if not p:
+            return None
+        try:
+            img = self.tk.PhotoImage(file=p)
+            if img.width() > 32:
+                img = img.subsample(max(1, int(round(img.width() / 32.0))))
+            lbl = self.tk.Label(parent, image=img, bg=self.PANEL)
+            lbl.pack(side="left", padx=(16, 12), pady=(12, 10))
+            return img
+        except Exception:
+            return None
+
+    def _page(self, name):
+        f = self.tk.Frame(self.body, bg=self.PANEL)
         self.frames[name] = f
         return f
+
+    def _group(self, parent, title, pady=(6, 10)):
+        """Etched group box with a bold caption, like the Windows wizards use."""
+        box = self.tk.Frame(parent, bg=self.PANEL)
+        box.pack(fill="x", pady=pady)
+        self.tk.Label(box, text=" " + title + " ", bg=self.PANEL, fg=self.ACCENT,
+                      font=self.F_HEAD, anchor="w").pack(fill="x")
+        inner = self.tk.Frame(box, bg=self.PANEL, highlightthickness=1,
+                              highlightbackground="#c8c8c8")
+        inner.pack(fill="x", pady=(2, 0))
+        return inner
+
+    def _check(self, parent, var, text, hint="", state="normal"):
+        row = self.tk.Frame(parent, bg=self.PANEL)
+        row.pack(fill="x", padx=8, pady=2)
+        cb = self.ttk.Checkbutton(row, text=text, variable=var, onvalue=True,
+                                  offvalue=False, state=state,
+                                  style="Body.TCheckbutton")
+        cb.pack(side="left")
+        if hint:
+            self.tk.Label(row, text=hint.strip(), bg=self.PANEL, fg=self.DIM,
+                          font=self.F_SUB).pack(side="left")
+        return cb
+
+    def _hint(self, parent, text, pady=(0, 8)):
+        self.tk.Label(parent, text=text, bg=self.PANEL, fg=self.FG, anchor="w",
+                      justify="left", wraplength=WIZ_W - 70,
+                      font=self.F_SUB).pack(fill="x", pady=pady)
+
+    # -- pages ---------------------------------------------------------------
+    def _build_welcome(self):
+        tk = self.tk
+        f = self._page("welcome")
+        left = WIZ_W - 110
+        box = tk.Frame(f, bg=self.PANEL)
+        box.pack(fill="both", expand=True)
+        tk.Label(box, text="This will install %s%s on your computer."
+                           % (APP_NAME, (" " + self.version) if self.version else ""),
+                 bg=self.PANEL, fg=self.FG, anchor="nw", justify="left",
+                 wraplength=left, font=self.F_SUB).pack(fill="x", pady=(2, 10))
+        tk.Label(box, text="It is recommended that you close all other applications "
+                           "before continuing.", bg=self.PANEL, fg=self.FG,
+                 anchor="nw", justify="left", wraplength=left,
+                 font=self.F_SUB).pack(fill="x", pady=(0, 10))
+        if self.opts.existing[0] and self.opts.existing[1]:
+            tk.Label(box, text="%s %s is already installed in %s - Setup will update "
+                               "that copy in place."
+                               % (APP_NAME, self.opts.existing[0], self.opts.existing[1]),
+                     bg=self.PANEL, fg=self.DIM, anchor="nw", justify="left",
+                     wraplength=left, font=self.F_SUB).pack(fill="x", pady=(0, 10))
+        tk.Label(box, text="Click Next to continue, or Cancel to exit Setup.",
+                 bg=self.PANEL, fg=self.FG, anchor="nw", justify="left",
+                 wraplength=left, font=self.F_SUB).pack(fill="x")
+
+    def _build_license(self):
+        tk = self.tk
+        f = self._page("license")
+        self._hint(f, "Please read the following important information before "
+                      "continuing.")
+        wrap = tk.Frame(f, bg=self.PANEL)
+        wrap.pack(fill="both", expand=True)
+        txt = tk.Text(wrap, height=9, wrap="word", relief="solid", bd=1,
+                      bg="#ffffff", fg=self.FG, font=self.F_MONO or self.F_SUB)
+        sb = self.ttk.Scrollbar(wrap, orient="vertical", command=txt.yview)
+        txt.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        txt.pack(side="left", fill="both", expand=True)
+        txt.insert("1.0", self.license_text)
+        txt.configure(state="disabled")
+        self.var_accept = tk.BooleanVar(value=False)
+        row = tk.Frame(f, bg=self.PANEL)
+        row.pack(fill="x", pady=(8, 0))
+        self.ttk.Radiobutton(row, text="I accept the agreement", value=True,
+                             variable=self.var_accept, style="Body.TRadiobutton",
+                             command=self._refresh_buttons).pack(anchor="w")
+        self.ttk.Radiobutton(row, text="I do not accept the agreement", value=False,
+                             variable=self.var_accept, style="Body.TRadiobutton",
+                             command=self._refresh_buttons).pack(anchor="w")
+
+    def _build_dest(self):
+        tk = self.tk
+        f = self._page("dest")
+        self._hint(f, "Setup will install %s in the following folder.\n\n"
+                      "To install in a different folder, click Browse and select "
+                      "another folder." % APP_NAME)
+        inner = self._group(f, "Destination Folder")
+        row = tk.Frame(inner, bg=self.PANEL)
+        row.pack(fill="x", padx=8, pady=8)
+        self.dir_var = tk.StringVar(value=self.opts.install_dir)
+        self.ttk.Entry(row, textvariable=self.dir_var, width=44).pack(
+            side="left", ipady=2)
+        self.ttk.Button(row, text="Browse...", width=10,
+                        command=self.browse).pack(side="left", padx=(8, 0))
+        sp = tk.Frame(f, bg=self.PANEL)
+        sp.pack(fill="x", pady=(2, 0))
+        self.space_req = tk.StringVar(value="")
+        self.space_av = tk.StringVar(value="")
+        tk.Label(sp, textvariable=self.space_req, bg=self.PANEL, fg=self.DIM,
+                 anchor="e", font=self.F_SUB).pack(fill="x")
+        tk.Label(sp, textvariable=self.space_av, bg=self.PANEL, fg=self.DIM,
+                 anchor="e", font=self.F_SUB).pack(fill="x")
+        self.dir_var.trace_add("write", lambda *a: self._update_space())
+        self._update_space()
+
+    def _update_space(self):
+        need = payload_mb(self.src)
+        self.space_req.set("Space required: %s" % _bytes_text(need))
+        free = free_mb(self.dir_var.get().strip() or ".")
+        self.space_av.set("Space available: %s"
+                          % (_bytes_text(free) if free is not None else "unknown"))
+
+    def browse(self):
+        from tkinter import filedialog
+        d = filedialog.askdirectory(title="Select the folder to install %s in"
+                                         % APP_NAME,
+                                    initialdir=self.dir_var.get() or None)
+        if d:
+            self.dir_var.set(os.path.abspath(d))
+
+    def _build_startmenu(self):
+        tk = self.tk
+        f = self._page("startmenu")
+        self._hint(f, "Setup will add program shortcuts to the Start Menu folder "
+                      "listed below.\n\nTo use a different folder, enter it below.")
+        inner = self._group(f, "Start Menu Folder")
+        row = tk.Frame(inner, bg=self.PANEL)
+        row.pack(fill="x", padx=8, pady=8)
+        self.smf_var = tk.StringVar(value=self.opts.startmenu_folder or APP_NAME)
+        self.smf_entry = self.ttk.Entry(row, textvariable=self.smf_var, width=44)
+        self.smf_entry.pack(side="left", ipady=2)
+        self.var_no_startmenu = tk.BooleanVar(value=not self.opts.startmenu_shortcut)
+        self._check(f, self.var_no_startmenu,
+                    "Don't create a Start Menu folder",
+                    state="normal").configure(command=self._toggle_smf)
+        self._toggle_smf()
+
+    def _toggle_smf(self):
+        if getattr(self, "smf_entry", None) is None:
+            return
+        self.smf_entry.configure(
+            state="disabled" if self.var_no_startmenu.get() else "normal")
+
+    def _build_tasks(self):
+        tk = self.tk
+        f = self._page("tasks")
+        self.var_app = tk.BooleanVar(value=True)
+        self.var_mpv = tk.BooleanVar(value=self.opts.mpv)
+        self.var_ytdlp = tk.BooleanVar(value=self.opts.ytdlp)
+        self.var_updater = tk.BooleanVar(value=self.opts.updater)
+        self.var_desktop = tk.BooleanVar(value=self.opts.desktop_shortcut)
+        self.var_launch = tk.BooleanVar(value=self.opts.launch)
+
+        inner = self._group(f, "Components")
+        self._check(inner, self.var_app, "%s application" % APP_NAME,
+                    " - required", state="disabled")
+        self._check(inner, self.var_mpv, "mpv video player %s" % MPV_RELEASE_VERSION,
+                    " - recommended, plays the two video feeds")
+        self._check(inner, self.var_ytdlp, "yt-dlp",
+                    " - YouTube and other URL sources")
+        self._check(inner, self.var_updater, "Update checker",
+                    " - %s - Check for Updates" % APP_NAME)
+        tk.Frame(inner, bg=self.PANEL, height=6).pack()
+
+        inner2 = self._group(f, "Shortcuts")
+        self._check(inner2, self.var_desktop, "Create a desktop icon")
+        tk.Frame(inner2, bg=self.PANEL, height=6).pack()
+
+    def _build_ready(self):
+        tk = self.tk
+        f = self._page("ready")
+        self.ready_var = tk.StringVar(value="")
+        tk.Label(f, textvariable=self.ready_var, bg=self.PANEL, fg=self.FG, anchor="nw",
+                 justify="left", wraplength=WIZ_W - 70,
+                 font=self.F_SUB).pack(fill="x", pady=(0, 10))
+        self._hint(f, "Click Install to continue with the installation, or click Back "
+                      "if you want to review or change any settings.", pady=(0, 0))
+
+    def _build_installing(self):
+        tk = self.tk
+        f = self._page("installing")
+        self._hint(f, "Please wait while Setup installs %s on your computer."
+                      % APP_NAME, pady=(0, 6))
+        self.bar = self.ttk.Progressbar(f, maximum=100, mode="determinate",
+                                        length=WIZ_W - 70)
+        self.bar.pack(fill="x", pady=(0, 6))
+        self.status_var = tk.StringVar(value="Preparing...")
+        tk.Label(f, textvariable=self.status_var, bg=self.PANEL, fg=self.FG, anchor="w",
+                 font=self.F_SUB).pack(fill="x", pady=(0, 6))
+        wrap = tk.Frame(f, bg=self.PANEL)
+        wrap.pack(fill="both", expand=True)
+        self.log = tk.Text(wrap, height=6, relief="solid", bd=1, bg="#ffffff",
+                           fg=self.DIM, wrap="none",
+                           font=self.F_MONO or self.F_SUB)
+        sb = self.ttk.Scrollbar(wrap, orient="vertical", command=self.log.yview)
+        self.log.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self.log.pack(side="left", fill="both", expand=True)
+        self.log.configure(state="disabled")
+
+    def _build_finish(self):
+        tk = self.tk
+        f = self._page("finish")
+        self.done_var = tk.StringVar(value="")
+        tk.Label(f, textvariable=self.done_var, bg=self.PANEL, fg=self.FG, anchor="nw",
+                 justify="left", wraplength=WIZ_W - 70,
+                 font=self.F_SUB).pack(fill="x", pady=(2, 10))
+        self.var_launch_ci = tk.BooleanVar(value=self.opts.launch)
+        self._check(f, self.var_launch_ci, "Launch %s" % APP_NAME)
+
+    # -- navigation ----------------------------------------------------------
+    def _headers(self):
+        return {
+            "welcome": ("Welcome to the %s Setup Wizard" % APP_NAME,
+                        "This part of Setup will guide you through the installation "
+                        "of %s." % APP_NAME),
+            "license": ("License Agreement",
+                        "Please read the following important information before "
+                        "continuing."),
+            "dest": ("Select Destination Location",
+                     "Where should %s be installed?" % APP_NAME),
+            "startmenu": ("Select Start Menu Folder",
+                          "Where should Setup place the program's shortcuts?"),
+            "tasks": ("Select Additional Tasks",
+                      "Which additional tasks should be performed?"),
+            "ready": ("Ready to Install",
+                      "Setup is now ready to begin installing %s on your computer."
+                      % APP_NAME),
+            "installing": ("Installing",
+                           "Please wait while Setup installs %s on your computer."
+                           % APP_NAME),
+            "finish": ("Completing the %s Setup Wizard" % APP_NAME,
+                       "Setup has finished installing %s on your computer."
+                       % APP_NAME),
+        }
 
     def show(self, idx):
         self.page = max(0, min(len(self.PAGES) - 1, idx))
@@ -543,205 +919,34 @@ class Wizard(object):
                 f.pack(fill="both", expand=True)
             else:
                 f.pack_forget()
-        self.step_var.set("Step %d of 4" % min(self.page + 1, 4))
-        titles = {
-            "welcome": ("Welcome to the %s setup" % APP_NAME,
-                        "This wizard installs %s and the video player it needs on "
-                        "your computer." % APP_NAME),
-            "dest": ("Choose where to install",
-                     "Setup will install %s into the folder below. "
-                     "The default needs no administrator rights." % APP_NAME),
-            "components": ("Choose what to install",
-                           "Everything is selected by default. Uncheck anything "
-                           "you do not want; %s needs a player to show video."
-                           % APP_NAME),
-            "progress": ("Installing", "Please wait while Setup copies the files."),
-            "finish": ("Setup complete", "Setup finished installing %s." % APP_NAME),
-        }
-        t, s = titles[name]
-        self.title_var.set(t)
-        self.sub_var.set(s)
-        last = (name == "finish")
-        self.btn_next.config(text="Finish" if last else "Next  >",
-                             state="disabled" if name == "progress" else "normal")
-        self.btn_back.config(state="disabled" if name in ("progress", "finish")
-                             or self.page == 0 else "normal")
-        self.btn_cancel.config(state="disabled" if last or name == "progress"
+        title, sub = self._headers()[name]
+        self.hdr_title.config(text=title)
+        self.hdr_sub.config(text=sub)
+        self._refresh_buttons()
+
+    def _refresh_buttons(self):
+        name = self.PAGES[self.page]
+        if name == "finish":
+            self.btn_next.config(text="Finish", state="normal")
+        elif name == "ready":
+            self.btn_next.config(text="Install", state="normal")
+        elif name == "installing":
+            self.btn_next.config(text="Install", state="disabled")
+        else:
+            self.btn_next.config(text="Next >", state="normal")
+        if name == "license" and not self.var_accept.get():
+            self.btn_next.config(state="disabled")
+        self.btn_back.config(state="normal" if self.page > 0
+                             and name not in ("installing", "finish") else "disabled")
+        self.btn_cancel.config(state="disabled" if name in ("installing", "finish")
                                else "normal")
 
-    # -- pages ---------------------------------------------------------------
-    def _build_welcome(self):
-        tk = self.tk
-        f = self._new_page("welcome")
-        src = resolve_payloads()
-        mb = payload_mb(src)
-        app_ver = get_exe_version(src[0]) or "?"
-        box = tk.Frame(f, bg="#262b34", highlightthickness=1,
-                       highlightbackground="#39404b")
-        box.pack(fill="both", expand=True, pady=(4, 8))
-        lines = [
-            "%s %s   -   two videos, two windows, one clock" % (APP_NAME, app_ver),
-            "",
-            "Setup will install:",
-            "    -  %s itself (the control panel + sync engine)" % APP_NAME,
-            "    -  mpv %s, the video player that renders the two feeds" % MPV_RELEASE_VERSION,
-            "    -  yt-dlp, so pasted YouTube / URL sources work out of the box",
-            "    -  the %s update checker" % APP_NAME,
-            "",
-            "About %d MB of files are copied. You can change what gets installed"
-            % int(mb + 0.5),
-            "on the next pages.",
-        ]
-        tk.Label(box, text="\n".join(lines), fg=FG, bg="#262b34",
-                 justify="left", anchor="nw", font=("Segoe UI", 9),
-                 wraplength=520).pack(fill="both", expand=True, padx=14, pady=12)
-        if self.opts.existing[0] and self.opts.existing[1]:
-            lines += ["",
-                      "%s %s is already installed in:" % (APP_NAME, self.opts.existing[0]),
-                      "    " + self.opts.existing[1],
-                      "Setup will update that copy in place."]
-        tk.Label(f, text="Click Next to continue.", fg=DIM, bg=BG,
-                 anchor="w", font=("Segoe UI", 9)).pack(fill="x")
+    def _default(self):
+        """Enter presses the default button (Next / Install / Finish)."""
+        if str(self.btn_next.cget("state")) == "disabled":
+            return
+        self.next()
 
-    def _build_dest(self):
-        tk = self.tk
-        f = self._new_page("dest")
-        tk.Label(f, text="Install %s to:" % APP_NAME, fg=FG, bg=BG,
-                 anchor="w", font=("Segoe UI", 9)).pack(fill="x", pady=(6, 4))
-        row = tk.Frame(f, bg=BG)
-        row.pack(fill="x")
-        self.dir_var = tk.StringVar(value=self.opts.install_dir)
-        self.dir_entry = self.ttk.Entry(row, textvariable=self.dir_var, width=58)
-        self.dir_entry.pack(side="left", ipady=3)
-        self.ttk.Button(row, text="Browse...", width=10,
-                        command=self.browse).pack(side="left", padx=(6, 0))
-        self.disk_var = tk.StringVar(value="")
-        tk.Label(f, textvariable=self.disk_var, fg=DIM, bg=BG, anchor="w",
-                 font=("Segoe UI", 8)).pack(fill="x", pady=(4, 0))
-        tk.Label(f, text="SyncPlayer is installed for the current user only, so "
-                         "no administrator rights are needed. Config and "
-                         "screenshots are kept in your own profile, not here.",
-                 fg=DIM, bg=BG, anchor="w", justify="left", wraplength=520,
-                 font=("Segoe UI", 8)).pack(fill="x", pady=(10, 0))
-        if self.opts.existing[0] and self.opts.existing[1]:
-            tk.Label(f, text="Updating the existing install (%s)" % self.opts.existing[1],
-                     fg=ACCENT, bg=BG, anchor="w", wrap=True,
-                     font=("Segoe UI", 8)).pack(fill="x", pady=(6, 0))
-        self.dir_var.trace_add("write", lambda *a: self._update_disk())
-        self._update_disk()
-
-    def _update_disk(self):
-        d = os.path.abspath(self.dir_var.get().strip() or ".")
-        free = free_mb(d)
-        txt = ""
-        if free is not None:
-            txt = "Free space: %.0f MB (Setup needs about %d MB)" % (free, REQUIRED_MB)
-            if free < REQUIRED_MB:
-                txt += "   -  not enough room here"
-        self.disk_var.set(txt)
-
-    def browse(self):
-        from tkinter import filedialog
-        d = filedialog.askdirectory(title="Where should %s be installed?" % APP_NAME,
-                                    initialdir=self.dir_var.get() or None)
-        if d:
-            self.dir_var.set(os.path.abspath(d))
-
-    def _build_components(self):
-        tk = self.tk
-        f = self._new_page("components")
-        self.var_app = tk.BooleanVar(value=True)
-        self.var_mpv = tk.BooleanVar(value=self.opts.mpv)
-        self.var_ytdlp = tk.BooleanVar(value=self.opts.ytdlp)
-        self.var_updater = tk.BooleanVar(value=self.opts.updater)
-        self.var_desktop = tk.BooleanVar(value=self.opts.desktop_shortcut)
-        self.var_startmenu = tk.BooleanVar(value=self.opts.startmenu_shortcut)
-        self.var_launch = tk.BooleanVar(value=self.opts.launch)
-
-        def group(title):
-            box = tk.Frame(f, bg="#262b34", highlightthickness=1,
-                           highlightbackground="#39404b")
-            box.pack(fill="x", pady=(2, 8))
-            tk.Label(box, text=title, fg=FG, bg="#262b34", anchor="w",
-                     font=("Segoe UI", 9, "bold")).pack(fill="x", padx=12,
-                                                        pady=(8, 2))
-            return box
-
-        def item(box, var, text, hint="", state="normal"):
-            r = tk.Frame(box, bg="#262b34")
-            r.pack(fill="x", padx=12, pady=1)
-            cb = tk.Checkbutton(r, text=text, variable=var, onvalue=True,
-                                offvalue=False, bg="#262b34", fg=FG,
-                                activebackground="#262b34",
-                                activeforeground=FG, selectcolor="#11151b",
-                                anchor="w", font=("Segoe UI", 9),
-                                highlightthickness=0, bd=0)
-            cb.pack(side="left")
-            if state == "disabled":
-                cb.config(state="disabled")
-            if hint:
-                tk.Label(r, text=hint, fg=DIM, bg="#262b34",
-                         font=("Segoe UI", 8)).pack(side="left", padx=(8, 0))
-            return cb
-
-        box = group("Components")
-        item(box, self.var_app, "%s application" % APP_NAME,
-             "(required)", state="disabled")
-        item(box, self.var_mpv, "mpv video player %s" % MPV_RELEASE_VERSION,
-             "(recommended - plays the video windows)")
-        self.cb_ytdlp = item(box, self.var_ytdlp, "yt-dlp",
-                             "(YouTube / URL sources)")
-        item(box, self.var_updater, "Update checker",
-             "(%s - Check for Updates)" % APP_NAME)
-        tk.Frame(box, bg="#262b34", height=6).pack()
-
-        box2 = group("Shortcuts")
-        item(box2, self.var_desktop, "Create a Desktop shortcut")
-        item(box2, self.var_startmenu, "Create a Start Menu entry")
-        tk.Frame(box2, bg="#262b34", height=6).pack()
-
-        box3 = group("Finish")
-        item(box3, self.var_launch, "Launch %s when Setup closes" % APP_NAME)
-        tk.Frame(box3, bg="#262b34", height=6).pack()
-
-    def _build_progress(self):
-        tk = self.tk
-        f = self._new_page("progress")
-        self.prog_status = tk.StringVar(value="Preparing...")
-        tk.Label(f, textvariable=self.prog_status, fg=FG, bg=BG, anchor="w",
-                 font=("Segoe UI", 9)).pack(fill="x", pady=(10, 6))
-        self.bar = self.ttk.Progressbar(f, maximum=100, mode="determinate")
-        self.bar.pack(fill="x", pady=4)
-        self.prog_detail = tk.StringVar(value="")
-        tk.Label(f, textvariable=self.prog_detail, fg=DIM, bg=BG, anchor="w",
-                 font=("Segoe UI", 8)).pack(fill="x", pady=(2, 8))
-        self.log = tk.Text(f, height=8, bg="#171b21", fg=DIM, bd=0,
-                           highlightthickness=0, font=("Consolas", 8),
-                           wrap="none")
-        self.log.pack(fill="both", expand=True)
-        self.log.configure(state="disabled")
-
-    def _build_finish(self):
-        tk = self.tk
-        f = self._new_page("finish")
-        self.done_var = tk.StringVar(value="")
-        box = tk.Frame(f, bg="#262b34", highlightthickness=1,
-                       highlightbackground="#39404b")
-        box.pack(fill="both", expand=True, pady=(4, 8))
-        tk.Label(box, textvariable=self.done_var, fg=FG, bg="#262b34",
-                 justify="left", anchor="nw", font=("Segoe UI", 9),
-                 wraplength=520).pack(fill="both", expand=True, padx=14, pady=12)
-        self.btn_open = self.ttk.Button(f, text="Open the install folder",
-                                        command=self._open_folder)
-        self.btn_open.pack(anchor="w")
-
-    def _open_folder(self):
-        try:
-            os.startfile(self.opts.install_dir)
-        except Exception:
-            pass
-
-    # -- navigation ----------------------------------------------------------
     def back(self):
         if self.page > 0:
             self.show(self.page - 1)
@@ -749,50 +954,103 @@ class Wizard(object):
     def next(self):
         name = self.PAGES[self.page]
         if name == "welcome":
-            self.show(1)
+            self.show(self.page + 1)
+        elif name == "license":
+            self.show(self.page + 1)
         elif name == "dest":
             d = os.path.abspath(self.dir_var.get().strip())
             if not d or len(d) < 4 or d.endswith(":\\"):
                 from tkinter import messagebox
-                messagebox.showwarning(APP_NAME + " Setup",
-                                       "Please choose a folder to install into.")
+                messagebox.showwarning("Setup", "Please choose a folder to install into.")
                 return
-            low = d.lower()
-            if low.startswith(("c:\\windows", "c:\\program files\\windows")):
+            why = _protected_reason(d)
+            if why:
                 from tkinter import messagebox
-                messagebox.showwarning(APP_NAME + " Setup",
-                                       "That is a system folder - please pick another one.")
+                messagebox.showwarning("Setup", why)
                 return
+            try:                    # a read-only folder would fail mid-copy
+                os.makedirs(d, exist_ok=True)
+                probe = os.path.join(d, ".sp-write-test")
+                with open(probe, "w"):
+                    pass
+                os.remove(probe)
+            except Exception as e:
+                from tkinter import messagebox
+                messagebox.showerror("Setup",
+                                     "Setup cannot write to that folder:\n\n%s\n\n%s"
+                                     % (d, e))
+                return
+            self.opts.install_dir = d
             free = free_mb(d)
-            if free is not None and free < REQUIRED_MB:
+            if free is not None and free < payload_mb(self.src) + 20:
                 from tkinter import messagebox
                 if not messagebox.askyesno(
-                        APP_NAME + " Setup",
-                        "Only %.0f MB free in that location. Setup needs about "
-                        "%d MB.\n\nInstall anyway?" % (free, REQUIRED_MB)):
+                        "Setup",
+                        "There may not be enough space in that folder.\n\n"
+                        "Setup needs about %.0f MB and only %.0f MB is free.\n\n"
+                        "Continue anyway?" % (payload_mb(self.src) + 20, free)):
                     return
-            self.opts.install_dir = d
-            self.show(2)
-        elif name == "components":
+            self._update_space()
+            self.show(self.page + 1)
+        elif name == "startmenu":
+            if not self.var_no_startmenu.get() and not self.smf_var.get().strip():
+                from tkinter import messagebox
+                messagebox.showwarning("Setup",
+                                       "Enter a Start Menu folder name, or tick "
+                                       "'Don't create a Start Menu folder'.")
+                return
+            self.opts.startmenu_folder = self.smf_var.get().strip() or APP_NAME
+            self.opts.startmenu_shortcut = not self.var_no_startmenu.get()
+            self.show(self.page + 1)
+        elif name == "tasks":
             self.opts.mpv = bool(self.var_mpv.get())
             self.opts.ytdlp = bool(self.var_ytdlp.get())
             self.opts.updater = bool(self.var_updater.get())
             self.opts.desktop_shortcut = bool(self.var_desktop.get())
-            self.opts.startmenu_shortcut = bool(self.var_startmenu.get())
             self.opts.launch = bool(self.var_launch.get())
-            if not self.opts.mpv and not self.opts.ytdlp:
-                pass        # fine: a system mpv is used when present
-            self.show(3)
+            self._fill_ready()
+            self.show(self.page + 1)
+        elif name == "ready":
+            self.show(self.page + 1)
             self.start_install()
         elif name == "finish":
+            self._stop_poll()
             self.root.destroy()
+
+    def _fill_ready(self):
+        comps = [APP_NAME]
+        if self.opts.mpv:
+            comps.append("mpv %s" % MPV_RELEASE_VERSION)
+        if self.opts.ytdlp:
+            comps.append("yt-dlp")
+        if self.opts.updater:
+            comps.append("update checker")
+        tasks = []
+        if self.opts.desktop_shortcut:
+            tasks.append("Create a desktop icon")
+        if self.opts.startmenu_shortcut:
+            tasks.append("Start Menu folder '%s'" % (self.opts.startmenu_folder or APP_NAME))
+        else:
+            tasks.append("No Start Menu folder")
+        self.ready_var.set(
+            "Destination location:\n    %s\n\nComponents to install:\n    %s\n\n"
+            "Additional shortcuts:\n    %s"
+            % (self.opts.install_dir, ", ".join(comps), ", ".join(tasks)))
 
     def cancel(self):
         from tkinter import messagebox
-        if messagebox.askyesno("%s Setup" % APP_NAME,
-                               "Cancel %s Setup?" % APP_NAME):
+        name = self.PAGES[self.page]
+        if name == "installing":
+            return                                  # cancel is disabled while installing
+        if name == "finish":
+            return
+        if messagebox.askyesno("Setup",
+                               "Setup is not complete. If you exit now, %s will not "
+                               "be installed.\n\nExit Setup?" % APP_NAME):
+            self._stop_poll()
             self.root.destroy()
 
+    # -- install -------------------------------------------------------------
     def _log(self, text):
         try:
             self.log.configure(state="normal")
@@ -803,47 +1061,64 @@ class Wizard(object):
             pass
 
     def start_install(self):
-        t = threading.Thread(target=self._worker, daemon=True)
-        t.start()
-        self.root.after(80, self._poll)
+        import threading
+        threading.Thread(target=self._worker, daemon=True).start()
+        self._poll_id = self.root.after(80, self._poll)
+
+    def _on_destroy(self, event=None):
+        """A destroyed window must not leave a pending progress poll behind
+        (Tk would log "invalid command name ..._poll" afterwards)."""
+        if event is None or getattr(event, "widget", None) is self.root:
+            self._stop_poll()
+
+    def _stop_poll(self):
+        """Cancel a pending progress poll (called before the window goes away)."""
+        if getattr(self, "_poll_id", None) is not None:
+            try:
+                self.root.after_cancel(self._poll_id)
+            except Exception:
+                pass
+            self._poll_id = None
 
     def _poll(self):
+        self._poll_id = None
         while self.queue:
             kind, payload = self.queue.pop(0)
             if kind == "pct":
                 pct, text = payload
                 self.bar["value"] = pct
-                self.prog_status.set(text)
+                self.status_var.set(text)
                 self._log("%3d%%  %s" % (pct, text))
-            elif kind == "detail":
-                self.prog_detail.set(payload)
             elif kind == "done":
                 self.bar["value"] = 100
                 self._finish_ok(payload)
             elif kind == "error":
                 from tkinter import messagebox
                 self.error = payload
-                self.prog_status.set("Setup failed.")
+                self.status_var.set("Setup failed.")
                 self._log("ERROR: %s" % payload)
-                self.btn_next.config(state="disabled")
-                self.btn_cancel.config(state="normal", text="Close")
-                self.btn_cancel.config(command=self.root.destroy)
-                messagebox.showerror("%s Setup" % APP_NAME,
-                                     "Setup could not finish:\n\n%s" % payload)
-        if self.root.winfo_exists():
-            if self.PAGES[self.page] == "progress" and not self.error:
-                self.root.after(80, self._poll)
+                messagebox.showerror("Setup",
+                                     "Setup could not finish:\n\n%s\n\nNothing else "
+                                     "was changed." % payload)
+                self.btn_cancel.config(state="normal", text="Close",
+                                       command=self.root.destroy)
+        try:
+            if self.root.winfo_exists() and self.PAGES[self.page] == "installing" \
+                    and not self.error:
+                self._poll_id = self.root.after(80, self._poll)
+        except Exception:
+            pass
 
     def _worker(self):
         try:
-            src = resolve_payloads()
+            src = self.src
             if not os.path.isfile(src[0]):
-                self.queue.append(("error", "SyncPlayer.exe is missing from the "
-                                            "Setup payload."))
+                self.queue.append(("error", "SyncPlayer.exe is missing from the Setup "
+                                            "payload."))
                 return
             if self.opts.mpv and not os.path.isdir(src[1]):
-                self.queue.append(("error", "the mpv payload is missing from "
-                                            "Setup - rebuild the installer."))
+                self.queue.append(("error", "The mpv payload is missing from Setup - "
+                                            "rebuild the installer."))
                 return
             self.queue.append(("pct", (3, "Preparing...")))
             _close_running()
@@ -857,41 +1132,34 @@ class Wizard(object):
                 made = make_shortcuts(
                     app_path, self.opts.install_dir, updater_path,
                     desktop=self.opts.desktop_shortcut,
-                    startmenu=self.opts.startmenu_shortcut)
+                    startmenu=self.opts.startmenu_shortcut,
+                    startmenu_folder=self.opts.startmenu_folder)
             state["shortcuts"] = made
             self.queue.append(("pct", (93, "Adding to Add/Remove Programs...")))
             state["uninstall_registered"] = register_uninstall(
                 self.opts.install_dir, app_path, state["app_version"])
-            self.queue.append(("pct", (100, "Done.")))
+            self.queue.append(("pct", (100, "Finished.")))
             self.queue.append(("done", state))
         except Exception as e:
             self.queue.append(("error", "%s" % e))
 
     def _finish_ok(self, state):
+        self._stop_poll()
         self.state = state
         comps = ["%s %s" % (APP_NAME, state.get("app_version"))]
         if state.get("mpv_installed"):
             comps.append("mpv %s" % state.get("mpv_version"))
         if state.get("ytdlp_installed"):
-            comps.append("yt-dlp %s" % (state.get("ytdlp_version")))
+            comps.append("yt-dlp %s" % state.get("ytdlp_version"))
         if state.get("updater_installed"):
             comps.append("update checker")
-        lines = [
-            "Installed:  " + ", ".join(comps),
-            "Location:   " + state.get("install_dir", ""),
-            "Shortcuts:  " + (", ".join(state.get("shortcuts") or []) or "none"),
-            "Add/Remove Programs entry: %s" % ("yes" if state.get("uninstall_registered") else "no"),
-            "",
-            "Run it from the Desktop or Start Menu, or from:",
-            "    " + state.get("install_dir", ""),
-            "",
-            "To remove it later, use Apps & Features in Windows Settings, or the",
-            "Uninstall shortcut in the Start Menu.",
-        ]
-        self.done_var.set("\n".join(lines))
-        self.prog_status.set("Setup complete.")
-        self.show(4)
-        if self.opts.launch and self.app_path:
+        self.done_var.set(
+            "Installed:  %s\n"
+            "Location:   %s\n\n"
+            "The application may be launched by selecting the installed icons."
+            % (", ".join(comps), state.get("install_dir", "")))
+        self.show(self.PAGES.index("finish"))
+        if self.var_launch_ci.get() and self.app_path:
             try:
                 subprocess.Popen([self.app_path])
             except Exception:
@@ -900,15 +1168,7 @@ class Wizard(object):
 
 def _gui_main(opts):
     import tkinter as tk
-    from tkinter import ttk
     root = tk.Tk()
-    try:
-        style = ttk.Style()
-        style.theme_use("clam")
-        style.configure("TButton", padding=(8, 3))
-        style.configure("TEntry", fieldbackground="#171b21", foreground=FG)
-    except Exception:
-        pass
     Wizard(root, opts)
     root.mainloop()
 

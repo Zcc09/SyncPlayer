@@ -466,10 +466,10 @@ class WindowBackend(object):
     def client_size(self, h):
         return None
 
-    def place(self, h, x, y, w, hh):
+    def place(self, h, x, y, w, hh, min_w=160, min_h=120):
         return False
 
-    def move_child(self, h, x, y, w, hh):
+    def move_child(self, h, x, y, w, hh, min_w=160, min_h=120):
         return False
 
     def valid(self, h):
@@ -579,15 +579,16 @@ class Win32Backend(WindowBackend):
         except Exception:
             return None
 
-    def place(self, h, x, y, w, hh):
+    def place(self, h, x, y, w, hh, min_w=160, min_h=120):
         try:
-            self.u.SetWindowPos(h, 0, x, y, max(160, w), max(120, hh), self.SWP_MOVE)
+            self.u.SetWindowPos(h, 0, x, y, max(min_w, w), max(min_h, hh),
+                                self.SWP_MOVE)
             return True
         except Exception:
             return False
 
-    def move_child(self, h, x, y, w, hh):
-        return self.place(h, x, y, w, hh)
+    def move_child(self, h, x, y, w, hh, min_w=160, min_h=120):
+        return self.place(h, x, y, w, hh, min_w, min_h)
 
     def valid(self, h):
         try:
@@ -1031,10 +1032,10 @@ class X11Backend(WindowBackend):
             return None
         return (r[2], r[3])
 
-    def place(self, h, x, y, w, hh):
+    def place(self, h, x, y, w, hh, min_w=160, min_h=120):
         try:
             self.x.XMoveResizeWindow(self.dpy, h, int(x), int(y),
-                                     max(160, int(w)), max(120, int(hh)))
+                                     max(min_w, int(w)), max(min_h, int(hh)))
             self.x.XFlush(self.dpy)
             return True
         except Exception:
