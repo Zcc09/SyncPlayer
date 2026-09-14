@@ -57,7 +57,7 @@ from tkinter import ttk, filedialog, messagebox
 import sp_plat as plat   # cross-platform: paths, mpv IPC, window control
 
 APP_NAME = "SyncPlayer"
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.6.1"
 
 
 class MpvNotFoundError(Exception):
@@ -4305,17 +4305,34 @@ def _run_uninstall(silent=False):
         return 1
     exe_dir, lnks, sm = _uninstall_targets()
     managed = _is_managed_install(exe_dir)
+    if not managed:
+        # Nothing here belongs to us: no install.json next to the exe means this
+        # is a bare copy (a downloaded exe, or one run from a folder Setup never
+        # created). The shortcuts at the global Desktop/Start-Menu paths belong
+        # to whatever DID install SyncPlayer - removing them from here would take
+        # the user's working install apart.
+        print("This copy was not installed by Setup (no install.json next to the "
+              "exe), so nothing was removed: the folder %s is left alone, and no "
+              "shortcuts or Add/Remove entry were touched." % exe_dir)
+        if not silent:
+            try:
+                from tkinter import messagebox
+                messagebox.showinfo(
+                    APP_NAME,
+                    "This copy of %s was not installed by Setup, so there is "
+                    "nothing to uninstall here.\n\nUninstall the installed copy "
+                    "from Apps & Features, or the Start Menu entry, instead."
+                    % APP_NAME)
+            except Exception:
+                pass
+        return 0
     if not silent:
         try:
             from tkinter import messagebox
-            extra = ("" if managed else
-                     "\n\n(This copy was not installed by Setup, so only its "
-                     "shortcuts and menu entry will be removed - the folder "
-                     "%s is left alone.)" % exe_dir)
             if not messagebox.askyesno(
                     APP_NAME,
-                    "Remove %s from this computer?\n\n%s%s\n\nYour saved config "
-                    "and screenshots are kept." % (APP_NAME, exe_dir, extra)):
+                    "Remove %s from this computer?\n\n%s\n\nYour saved config "
+                    "and screenshots are kept." % (APP_NAME, exe_dir)):
                 return 1
         except Exception:
             pass
@@ -4342,11 +4359,8 @@ def _run_uninstall(silent=False):
         removed.append("Add/Remove Programs entry")
     except Exception:
         pass
-    if managed and _spawn_folder_delete(exe_dir):
+    if _spawn_folder_delete(exe_dir):
         removed.append("program folder")
-    if not managed:
-        print("This copy was not installed by Setup (no install.json next "
-              "to the exe), so the folder %s was left alone." % exe_dir)
     print("Uninstalled %s (%s)"
           % (APP_NAME, ", ".join(removed) or "nothing to remove"))
     if not silent:
@@ -4384,14 +4398,24 @@ def main():
         print("SyncPlayer needs a graphical session: no DISPLAY / WAYLAND_DISPLAY set.")
         print("Run it from your desktop, or use --check-env to inspect the environment.")
         return
-    if _HAS_DND:
-        root = TkinterDnD.Tk()
+    # Drag & drop is a bonus: if the tkdnd native library cannot load (blocked
+    # DLL, a build that shipped without it) the app still has to start.
+    dnd_on = _HAS_DND
+    if dnd_on:
+        try:
+            root = TkinterDnD.Tk()
+        except Exception:
+            dnd_on = False
+            root = tk.Tk()
     else:
         root = tk.Tk()
     app = SyncApp(root)
-    if _HAS_DND:
-        root.drop_target_register(DND_FILES)
-        root.dnd_bind("<<Drop>>", app._on_drop)
+    if dnd_on:
+        try:
+            root.drop_target_register(DND_FILES)
+            root.dnd_bind("<<Drop>>", app._on_drop)
+        except Exception:
+            dnd_on = False
     if "--smoke" in sys.argv:  # packaged-exe sanity test: auto-close (cleanly)
         root.after(6000, app._on_close)
     root.mainloop()

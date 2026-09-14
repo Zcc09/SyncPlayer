@@ -97,6 +97,62 @@ def lnk_target(path):
     return out.strip() if rc == 0 else ""
 
 
+def heal_shortcuts():
+    """Restore shortcuts a killed run left aside and delete the test's own.
+
+    Called before the shortcut section: `<name>.sptestbak<pid>` next to the
+    original is a previous run's backup (moved back), and a SyncPlayer shortcut
+    THIS RUN created (its target is under %TEMP% and that temp install is
+    already gone) is the test's own leftover and is deleted - the uninstaller
+    normally takes them with the install. A shortcut pointing at a live install
+    is never touched, so the user's own shortcut is always safe."""
+    healed, swept = [], []
+    temp = os.path.normcase(os.environ.get("TEMP", "") or "\\none")
+    desk = os.path.join(os.path.expanduser("~"), "Desktop")
+    sm = inst.startmenu_dir()
+    for d in (desk, os.path.dirname(sm)):
+        try:
+            names = os.listdir(d)
+        except Exception:
+            continue
+        for n in names:
+            if ".sptestbak" not in n:
+                continue
+            src = os.path.join(d, n)
+            dst = os.path.join(d, n.split(".sptestbak")[0])
+            if not os.path.exists(dst):
+                try:
+                    shutil.move(src, dst)
+                    healed.append(os.path.basename(dst))
+                except Exception:
+                    pass
+    def _dead_test_shortcut(p):
+        """A shortcut this test created: it points into %TEMP%, at a temp install
+        that is gone. A shortcut pointing at a real app is never touched - no
+        clock or mtime reasoning involved, so the user's own shortcut cannot be
+        swept by mistake."""
+        t = lnk_target(p)
+        if not t or not t.lower().startswith(temp):
+            return False
+        return not os.path.exists(t)
+
+    desk_lnk = os.path.join(desk, "SyncPlayer.lnk")
+    if os.path.isfile(desk_lnk) and _dead_test_shortcut(desk_lnk):
+        try:
+            os.remove(desk_lnk)
+            swept.append("Desktop\\SyncPlayer.lnk")
+        except Exception:
+            pass
+    sm_lnk = os.path.join(sm, "SyncPlayer.lnk")
+    if os.path.isfile(sm_lnk) and _dead_test_shortcut(sm_lnk):
+        try:
+            shutil.rmtree(sm, ignore_errors=True)
+            swept.append("Start Menu\\SyncPlayer")
+        except Exception:
+            pass
+    return healed, swept
+
+
 def save_real_shortcuts():
     """Move any REAL SyncPlayer shortcuts aside so the test cannot clobber or
     delete the user's own installation's shortcuts."""
@@ -116,10 +172,28 @@ def save_real_shortcuts():
 
 
 def restore_real_shortcuts(saved):
+    """Put the user's shortcuts back, replacing what the test left behind.
+
+    The test's own installs create shortcuts at the same global paths, so a
+    plain "restore only if missing" would strand the user's copy as a .sptestbak
+    and leave a %TEMP%-pointing shortcut in its place. An occupant counts as
+    ours only when it points into %TEMP% at a temp install that is already gone;
+    anything else is left strictly alone."""
+    temp = os.path.normcase(os.environ.get("TEMP", "") or "\\none")
     for bak, path in saved or []:
         try:
-            if os.path.exists(bak) and not os.path.exists(path):
-                shutil.move(bak, path)
+            if not os.path.exists(bak):
+                continue
+            if os.path.exists(path):
+                tgt = lnk_target(path) if os.path.isfile(path) else ""
+                ours = bool(tgt) and tgt.lower().startswith(temp) and not os.path.exists(tgt)
+                if not ours:
+                    continue          # not ours - leave it exactly as it is
+                if os.path.isdir(path):
+                    shutil.rmtree(path, ignore_errors=True)
+                else:
+                    os.remove(path)
+            shutil.move(bak, path)
         except Exception:
             pass
 
@@ -141,6 +215,22 @@ def get_exe_version(path):
                              (ls >> 16) & 0xFFFF)
     except Exception:
         return None
+
+
+def wait_until(pred, timeout=10.0, interval=0.2):
+    """Poll pred() until it returns true, or give up after timeout seconds."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            if pred():
+                return True
+        except Exception:
+            pass
+        time.sleep(interval)
+    try:
+        return bool(pred())
+    except Exception:
+        return False
 
 
 def sp_procs():
@@ -205,7 +295,7 @@ def main():
 
     check("install: SyncPlayer.exe present", os.path.isfile(app))
     check("install: app version is 1.6.0",
-          get_exe_version(app) == "1.6.0", str(get_exe_version(app)))
+          get_exe_version(app) == "1.6.1", str(get_exe_version(app)))
     check("install: bundled mpv.exe present", os.path.isfile(mpv))
     check("install: bundled yt-dlp.exe present", os.path.isfile(ytdl))
     check("install: updater present", os.path.isfile(updater))
@@ -215,7 +305,7 @@ def main():
             state = json.load(open(ij))
         except Exception:
             pass
-    check("install: install.json app_version", state.get("app_version") == "1.6.0")
+    check("install: install.json app_version", state.get("app_version") == "1.6.1")
     check("install: install.json mpv_version", state.get("mpv_version") == "0.41.0")
 
     # The packaged app must report its own optional pieces: a windowed exe with
@@ -233,7 +323,7 @@ def main():
             env_app = (json.load(open(env_json)) or {}).get("app", {})
         except Exception:
             env_app = {}
-    check("install: packaged app reports its version", env_app.get("version") == "1.6.0",
+    check("install: packaged app reports its version", env_app.get("version") == "1.6.1",
           str(env_app)[:110])
     check("install: packaged app really has drag & drop (tkinterdnd2 bundled)",
           env_app.get("drag_and_drop") is True, str(env_app)[:110])
@@ -269,6 +359,20 @@ def main():
     # 3. Installed app runs TWO videos (local + YouTube link) using bundled mpv
     # -------------------------------------------------------------------------
     kill_mpv()
+    # the app writes here if it dies (the crash hook); the smoke run below must
+    # not add anything. It is also the proof that the packaged build really
+    # initialised drag & drop: TkinterDnD.Tk() + registering the drop target run
+    # on startup, and a missing tkdnd library used to kill the app outright.
+    crash_log = os.path.join(os.path.expanduser("~"), "Pictures", "SyncPlayer",
+                             "syncplayer_crash.txt")
+
+    def crash_size():
+        try:
+            return os.path.getsize(crash_log)
+        except OSError:
+            return 0
+
+    crash_before = crash_size()
     time.sleep(0.3)
     proc = subprocess.Popen([app, "--smoke", MOVIE, YOUTUBE_URL],
                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
@@ -294,6 +398,10 @@ def main():
         proc.kill()
         rc = -1
     check("run: app (--smoke) exits cleanly", rc == 0, "exit=%s" % rc)
+    check("run: packaged app started drag & drop and closed without crashing",
+          crash_size() == crash_before,
+          "crash log grew by %d bytes (see %s)" % (crash_size() - crash_before,
+                                                   crash_log))
     kill_mpv()
 
     # -------------------------------------------------------------------------
@@ -556,7 +664,11 @@ def main():
     pa.seek(3.0, exact=False) # fast keyframe scrub
     time.sleep(0.1)
     check("seek precision: fast keyframe scrub executed without error", True)
-    check("buffer: cache_dur tracked on player status", hasattr(pa, "cache_dur"))
+    # wait for a status line instead of racing it: cache_dur is filled by the
+    # status parser, so a freshly built player does not have it yet
+    ok = wait_until(lambda: pa is not None and hasattr(pa, "cache_dur"), 20)
+    check("buffer: cache_dur tracked on player status", ok,
+          "cache_dur=%s" % getattr(pa, "cache_dur", None))
 
     app_obj._stop()
     root.destroy()
@@ -579,16 +691,32 @@ def main():
               "--uninstall" in str(regvals.get("UninstallString", "")),
               str(regvals.get("UninstallString")))
         check("wizard: Add/Remove entry carries the version",
-              str(regvals.get("DisplayVersion", "")) == "1.6.0",
+              str(regvals.get("DisplayVersion", "")) == "1.6.1",
               str(regvals.get("DisplayVersion")))
     check("wizard: install.json records which components went in",
           bool(state.get("mpv_installed")) and bool(state.get("ytdlp_installed"))
           and bool(state.get("updater_installed")), str(state)[:110])
 
-    # app-only install: every component can be switched off
+    # An install writes its shortcuts to the user's global Desktop/Start-Menu
+    # paths, so move the user's own aside BEFORE running any install - otherwise
+    # the first install overwrites them and there is nothing to restore.
+    healed, swept = heal_shortcuts()
+    if healed or swept:
+        print("  (shortcut housekeeping: restored %s, removed %s)"
+              % (healed or "none", swept or "none"))
+    desk_lnk = os.path.join(os.path.expanduser("~"), "Desktop", "SyncPlayer.lnk")
+    sm_dir = inst.startmenu_dir()
+    # what the user has NOW, before anything is moved or installed
+    user_shortcuts_before = (os.path.isfile(desk_lnk), lnk_target(desk_lnk),
+                             os.path.isdir(sm_dir))
+    saved_lnks = save_real_shortcuts()
+
+    # app-only install: every component can be switched off (--no-shortcuts: this
+    # install is not the one testing shortcut creation, so it must not touch them)
     dir_min = tempfile.mkdtemp(prefix="spdeploy_min_")
     rc, out = run([SETUP_EXE, "--silent", "--install-dir", dir_min, "--no-mpv",
-                   "--no-ytdlp", "--no-updater", "--no-launch"], timeout=200)
+                   "--no-ytdlp", "--no-updater", "--no-shortcuts",
+                   "--no-launch"], timeout=200)
     check("wizard: app-only install exits 0", rc == 0, out.strip()[:110])
     check("wizard: app-only install still installs the app",
           os.path.isfile(os.path.join(dir_min, "SyncPlayer.exe")))
@@ -614,16 +742,13 @@ def main():
     # yt-dlp without mpv must still be discoverable where the app looks for it
     dir_yt = tempfile.mkdtemp(prefix="spdeploy_yt_")
     rc, out = run([SETUP_EXE, "--silent", "--install-dir", dir_yt, "--no-mpv",
-                   "--no-updater", "--no-launch"], timeout=200)
+                   "--no-updater", "--no-shortcuts", "--no-launch"], timeout=200)
     check("wizard: yt-dlp without mpv keeps yt-dlp where the app finds it",
           os.path.isfile(os.path.join(dir_yt, "mpv", "yt-dlp.exe"))
           and not os.path.isfile(os.path.join(dir_yt, "mpv", "mpv.exe")),
           out.strip()[:90])
 
     # a full install WITH shortcuts, into a path of our own choosing
-    saved_lnks = save_real_shortcuts()
-    desk_lnk = os.path.join(os.path.expanduser("~"), "Desktop", "SyncPlayer.lnk")
-    sm_dir = inst.startmenu_dir()
     dir_full = tempfile.mkdtemp(prefix="spdeploy_full_")
     try:
         rc, out = run([SETUP_EXE, "--silent", "--install-dir", dir_full], timeout=240)
@@ -683,10 +808,13 @@ def main():
     finally:
         restore_real_shortcuts(saved_lnks)
 
-    # --- safety: a bare exe must never delete the folder it sits in ----------
+    # --- safety: a copy Setup did not install must touch NOTHING ------------
     dir_bare = tempfile.mkdtemp(prefix="spdeploy_bare_")
     shutil.copy2(os.path.join(install_dir, "SyncPlayer.exe"),
                  os.path.join(dir_bare, "SyncPlayer.exe"))
+    # plant an Add/Remove entry the way a real install would have one
+    inst.register_uninstall(dir_bare, os.path.join(dir_bare, "SyncPlayer.exe"),
+                            "9.9.9")
     rc, out = run([os.path.join(dir_bare, "SyncPlayer.exe"), "--uninstall", "--silent"],
                   timeout=120)
     check("uninstall: refuses to delete a folder Setup did not create",
@@ -694,6 +822,23 @@ def main():
           "survived=%s" % os.path.isdir(dir_bare))
     check("uninstall: and says why", "left alone" in out or "not installed" in out,
           out.strip()[:110])
+    check("uninstall: a bare copy leaves another install's Add/Remove entry alone",
+          (reg_read(inst.UNINSTALL_KEY) or {}).get("DisplayVersion") == "9.9.9",
+          str((reg_read(inst.UNINSTALL_KEY) or {}).get("DisplayVersion")))
+    inst.unregister_uninstall()
+
+    # The test moves the user's shortcuts aside and puts them back: prove it
+    # really did, or a future ordering slip would silently eat them.
+    desk_now, sm_now = os.path.isfile(desk_lnk), os.path.isdir(sm_dir)
+    tgt_now = lnk_target(desk_lnk) if desk_now else ""
+    check("shortcuts: the user's own Desktop shortcut is exactly as it was",
+          desk_now == user_shortcuts_before[0]
+          and (not desk_now
+               or os.path.normcase(tgt_now) == os.path.normcase(user_shortcuts_before[1])),
+          "before=%s after=%s" % (user_shortcuts_before[0], desk_now))
+    check("shortcuts: the user's own Start Menu entry is exactly as it was",
+          sm_now == user_shortcuts_before[2],
+          "before=%s after=%s" % (user_shortcuts_before[2], sm_now))
 
     for d in (dir_min, dir_yt, dir_bare):
         shutil.rmtree(d, ignore_errors=True)
