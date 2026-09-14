@@ -21,6 +21,7 @@ import tempfile
 import time
 
 BASE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, BASE)
 SETUP_EXE = os.path.join(BASE, "dist", "SyncPlayer-Setup.exe")
 APP_EXE = os.path.join(BASE, "dist", "SyncPlayer.exe")
 MOVIE = os.path.join(BASE, "testmedia", "movie.mp4")   # 12 s local file
@@ -28,6 +29,8 @@ REACT = os.path.join(BASE, "testmedia", "react.mp4")   # 10 s local file
 YOUTUBE_URL = os.environ.get("YOUTUBE_URL",
                              "https://www.youtube.com/watch?v=jNQXAC9IVRw")
 INVALID_YT = "https://www.youtube.com/watch?v=invalid_video_does_not_exist_xyz123"
+
+import installer as inst        # noqa: E402  (wizard + registry)
 
 u = ctypes.windll.user32
 
@@ -58,6 +61,69 @@ def run(cmd, timeout=60, env=None):
         return -2, str(e)
 
 
+def reg_read(subkey):
+    """Values of a HKCU key, or None when the key is not there."""
+    try:
+        import winreg
+        k = winreg.OpenKey(winreg.HKEY_CURRENT_USER, subkey)
+    except Exception:
+        return None
+    vals = {}
+    try:
+        i = 0
+        while True:
+            try:
+                n, v, _t = winreg.EnumValue(k, i)
+            except OSError:
+                break
+            vals[n] = v
+            i += 1
+    finally:
+        try:
+            winreg.CloseKey(k)
+        except Exception:
+            pass
+    return vals
+
+
+def lnk_target(path):
+    """TargetPath of a .lnk (via WScript.Shell, the same API that made it)."""
+    if not os.path.isfile(path):
+        return ""
+    ps = ("$ws = New-Object -ComObject WScript.Shell; "
+          "$s = $ws.CreateShortcut('%s'); Write-Output $s.TargetPath" % path)
+    rc, out = run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                  timeout=40)
+    return out.strip() if rc == 0 else ""
+
+
+def save_real_shortcuts():
+    """Move any REAL SyncPlayer shortcuts aside so the test cannot clobber or
+    delete the user's own installation's shortcuts."""
+    saved = []
+    desk = os.path.join(os.path.expanduser("~"), "Desktop", "SyncPlayer.lnk")
+    sm = inst.startmenu_dir()
+    stamp = ".sptestbak%d" % os.getpid()
+    for path in (desk, sm):
+        if os.path.exists(path):
+            bak = path + stamp
+            try:
+                shutil.move(path, bak)
+                saved.append((bak, path))
+            except Exception:
+                pass
+    return saved
+
+
+def restore_real_shortcuts(saved):
+    for bak, path in saved or []:
+        try:
+            if os.path.exists(bak) and not os.path.exists(path):
+                shutil.move(bak, path)
+        except Exception:
+            pass
+
+
 def get_exe_version(path):
     try:
         size = ctypes.windll.version.GetFileVersionInfoSizeW(path, None)
@@ -75,6 +141,19 @@ def get_exe_version(path):
                              (ls >> 16) & 0xFFFF)
     except Exception:
         return None
+
+
+def sp_procs():
+    """Rows for a running SyncPlayer process (empty list when none)."""
+    try:
+        r = subprocess.run(["tasklist", "/FI", "IMAGENAME eq SyncPlayer.exe",
+                            "/FO", "CSV", "/NH"],
+                           capture_output=True, text=True, timeout=25,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        return [l for l in (r.stdout or "").splitlines()
+                if "SyncPlayer.exe" in l and "No tasks" not in l]
+    except Exception:
+        return []
 
 
 def mpv_procs():
@@ -125,8 +204,8 @@ def main():
     ij = os.path.join(install_dir, "install.json")
 
     check("install: SyncPlayer.exe present", os.path.isfile(app))
-    check("install: app version is 1.5.1",
-          get_exe_version(app) == "1.5.1", str(get_exe_version(app)))
+    check("install: app version is 1.6.0",
+          get_exe_version(app) == "1.6.0", str(get_exe_version(app)))
     check("install: bundled mpv.exe present", os.path.isfile(mpv))
     check("install: bundled yt-dlp.exe present", os.path.isfile(ytdl))
     check("install: updater present", os.path.isfile(updater))
@@ -136,8 +215,30 @@ def main():
             state = json.load(open(ij))
         except Exception:
             pass
-    check("install: install.json app_version", state.get("app_version") == "1.5.1")
+    check("install: install.json app_version", state.get("app_version") == "1.6.0")
     check("install: install.json mpv_version", state.get("mpv_version") == "0.41.0")
+
+    # The packaged app must report its own optional pieces: a windowed exe with
+    # no stdout writes the report to a file instead (drag & drop silently going
+    # missing from a release build is exactly the sort of thing to pin down).
+    env_json = os.path.join(tempfile.gettempdir(), "spdeploy_env.json")
+    try:
+        os.remove(env_json)
+    except Exception:
+        pass
+    rc, out = run([app, "--check-env", env_json], timeout=90)
+    env_app = {}
+    if os.path.isfile(env_json):
+        try:
+            env_app = (json.load(open(env_json)) or {}).get("app", {})
+        except Exception:
+            env_app = {}
+    check("install: packaged app reports its version", env_app.get("version") == "1.6.0",
+          str(env_app)[:110])
+    check("install: packaged app really has drag & drop (tkinterdnd2 bundled)",
+          env_app.get("drag_and_drop") is True, str(env_app)[:110])
+    check("install: packaged app really has Pillow bundled (visual crop)",
+          env_app.get("pillow") is True, str(env_app)[:110])
 
     # -------------------------------------------------------------------------
     # 2. Bundled mpv & yt-dlp run directly
@@ -460,6 +561,143 @@ def main():
     app_obj._stop()
     root.destroy()
     kill_mpv()
+
+
+    # -------------------------------------------------------------------------
+    # 14. Installer wizard plumbing: Add/Remove entry, component choices,
+    #     shortcuts, custom path, and a real uninstall
+    # -------------------------------------------------------------------------
+    regvals = reg_read(inst.UNINSTALL_KEY)
+    check("wizard: Add/Remove Programs entry is registered", bool(regvals),
+          str(regvals)[:90] if regvals else "missing")
+    if regvals:
+        check("wizard: Add/Remove entry points at the install folder",
+              os.path.normcase(str(regvals.get("InstallLocation", "")))
+              == os.path.normcase(install_dir),
+              str(regvals.get("InstallLocation")))
+        check("wizard: Add/Remove entry offers --uninstall",
+              "--uninstall" in str(regvals.get("UninstallString", "")),
+              str(regvals.get("UninstallString")))
+        check("wizard: Add/Remove entry carries the version",
+              str(regvals.get("DisplayVersion", "")) == "1.6.0",
+              str(regvals.get("DisplayVersion")))
+    check("wizard: install.json records which components went in",
+          bool(state.get("mpv_installed")) and bool(state.get("ytdlp_installed"))
+          and bool(state.get("updater_installed")), str(state)[:110])
+
+    # app-only install: every component can be switched off
+    dir_min = tempfile.mkdtemp(prefix="spdeploy_min_")
+    rc, out = run([SETUP_EXE, "--silent", "--install-dir", dir_min, "--no-mpv",
+                   "--no-ytdlp", "--no-updater", "--no-launch"], timeout=200)
+    check("wizard: app-only install exits 0", rc == 0, out.strip()[:110])
+    check("wizard: app-only install still installs the app",
+          os.path.isfile(os.path.join(dir_min, "SyncPlayer.exe")))
+    check("wizard: --no-mpv really leaves mpv out",
+          not os.path.isfile(os.path.join(dir_min, "mpv", "mpv.exe")))
+    check("wizard: --no-ytdlp really leaves yt-dlp out",
+          not os.path.isfile(os.path.join(dir_min, "mpv", "yt-dlp.exe")))
+    check("wizard: --no-updater really leaves the updater out",
+          not os.path.isfile(os.path.join(dir_min, "SyncPlayer-Updater.exe")))
+    st_min = {}
+    try:
+        st_min = json.load(open(os.path.join(dir_min, "install.json")))
+    except Exception:
+        pass
+    check("wizard: install.json reflects the component choices",
+          st_min.get("mpv_installed") is False
+          and st_min.get("ytdlp_installed") is False
+          and st_min.get("updater_installed") is False, str(st_min)[:110])
+    check("wizard: the chosen install path is recorded",
+          os.path.normcase(str(st_min.get("install_dir", ""))) == os.path.normcase(dir_min),
+          str(st_min.get("install_dir")))
+
+    # yt-dlp without mpv must still be discoverable where the app looks for it
+    dir_yt = tempfile.mkdtemp(prefix="spdeploy_yt_")
+    rc, out = run([SETUP_EXE, "--silent", "--install-dir", dir_yt, "--no-mpv",
+                   "--no-updater", "--no-launch"], timeout=200)
+    check("wizard: yt-dlp without mpv keeps yt-dlp where the app finds it",
+          os.path.isfile(os.path.join(dir_yt, "mpv", "yt-dlp.exe"))
+          and not os.path.isfile(os.path.join(dir_yt, "mpv", "mpv.exe")),
+          out.strip()[:90])
+
+    # a full install WITH shortcuts, into a path of our own choosing
+    saved_lnks = save_real_shortcuts()
+    desk_lnk = os.path.join(os.path.expanduser("~"), "Desktop", "SyncPlayer.lnk")
+    sm_dir = inst.startmenu_dir()
+    dir_full = tempfile.mkdtemp(prefix="spdeploy_full_")
+    try:
+        rc, out = run([SETUP_EXE, "--silent", "--install-dir", dir_full], timeout=240)
+        check("wizard: full install exits 0", rc == 0, out.strip()[:110])
+        check("wizard: Desktop shortcut created",
+              os.path.isfile(desk_lnk))
+        check("wizard: Desktop shortcut points at the installed exe",
+              os.path.normcase(lnk_target(desk_lnk))
+              == os.path.normcase(os.path.join(dir_full, "SyncPlayer.exe")),
+              lnk_target(desk_lnk))
+        check("wizard: Start Menu folder created",
+              os.path.isdir(sm_dir))
+        check("wizard: Start Menu has the app, the updater and an uninstall entry",
+              os.path.isfile(os.path.join(sm_dir, "SyncPlayer.lnk"))
+              and os.path.isfile(os.path.join(sm_dir, "SyncPlayer - Check for Updates.lnk"))
+              and os.path.isfile(os.path.join(sm_dir, "Uninstall SyncPlayer.lnk")),
+              str(sorted(os.listdir(sm_dir)) if os.path.isdir(sm_dir) else []))
+        vals_full = reg_read(inst.UNINSTALL_KEY) or {}
+        check("wizard: Add/Remove entry follows the chosen path",
+              os.path.normcase(str(vals_full.get("InstallLocation", "")))
+              == os.path.normcase(dir_full), str(vals_full.get("InstallLocation")))
+
+        # the full install allows itself to launch the app (the default), so
+        # this is also the "user has it open, then uninstalls" case
+        launched = False
+        deadline = time.time() + 15.0
+        while time.time() < deadline:
+            if sp_procs():
+                launched = True
+                break
+            time.sleep(0.5)
+        check("wizard: a normal install launches the app when it finishes",
+              launched, "processes=%d" % len(sp_procs()))
+
+        # --- uninstall: uses the entry Windows would use ---------------------
+        rc, out = run([os.path.join(dir_full, "SyncPlayer.exe"),
+                       "--uninstall", "--silent"], timeout=120)
+        check("uninstall: exits 0", rc == 0, out.strip()[:110])
+        gone = False
+        deadline = time.time() + 25.0
+        while time.time() < deadline:
+            if not os.path.isdir(dir_full):
+                gone = True
+                break
+            time.sleep(0.5)
+        check("uninstall: the program folder is removed", gone,
+              "still there: %s" % dir_full if not gone else "")
+        deadline = time.time() + 15.0
+        while time.time() < deadline and sp_procs():
+            time.sleep(0.5)
+        check("uninstall: closed the running app", not sp_procs(),
+              "processes=%d" % len(sp_procs()))
+        check("uninstall: the Desktop shortcut is removed", not os.path.isfile(desk_lnk))
+        check("uninstall: the Start Menu entry is removed", not os.path.isdir(sm_dir))
+        check("uninstall: the Add/Remove entry is removed",
+              reg_read(inst.UNINSTALL_KEY) is None)
+    finally:
+        restore_real_shortcuts(saved_lnks)
+
+    # --- safety: a bare exe must never delete the folder it sits in ----------
+    dir_bare = tempfile.mkdtemp(prefix="spdeploy_bare_")
+    shutil.copy2(os.path.join(install_dir, "SyncPlayer.exe"),
+                 os.path.join(dir_bare, "SyncPlayer.exe"))
+    rc, out = run([os.path.join(dir_bare, "SyncPlayer.exe"), "--uninstall", "--silent"],
+                  timeout=120)
+    check("uninstall: refuses to delete a folder Setup did not create",
+          os.path.isfile(os.path.join(dir_bare, "SyncPlayer.exe")),
+          "survived=%s" % os.path.isdir(dir_bare))
+    check("uninstall: and says why", "left alone" in out or "not installed" in out,
+          out.strip()[:110])
+
+    for d in (dir_min, dir_yt, dir_bare):
+        shutil.rmtree(d, ignore_errors=True)
+
 
     print("\n==== %d/%d deployment & runtime checks passed ====" % (passed, passed + failed))
     if fail_msgs:

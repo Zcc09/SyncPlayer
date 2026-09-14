@@ -7,24 +7,37 @@ together for the whole runtime.**
 
 | | |
 |---|---|
-| ⚡ **How it syncs** | Each video plays in its **own mpv instance and window** (independent timelines). The panel is a master clock: seeking one video **never** touches the other, and a gentle drift-correction loop pulls the reaction back to its aligned spot whenever it wanders (> 0.45 s). No filter graphs, no rebuilds → **nothing to glitch or crash**. |
+| ⚡ **How it syncs** | Each video plays in its **own mpv instance and window** (independent timelines). The panel is a master clock: seeking one video **never** touches the other, and a drift-correction loop pulls the reaction back to its aligned spot whenever it wanders (> 0.45 s). Small drift is absorbed by a **micro playback-rate trim** (±5 %, pitch-preserved, invisible) instead of a visible jump; only a real gap (> 0.8 s) is seeked. No filter graphs, no rebuilds → **nothing to glitch or crash**. |
 | 🎬 **Sources** | Local files (`mp4/mkv/mov/webm/avi/ts/…`) or URLs (YouTube etc., resolved via yt-dlp). |
 | 🖼 **Windows** | Two mpv windows, auto-arranged side by side (re-arrange anytime). |
 | 🎚 **Three seek bars** | **Master** moves both together. **Movie** and **Reaction** bars move one side only — drag one to align the two, and it stays locked. |
 | 🎞 **Frame-step** | ⏴/⏵ next to each timeline's play button (or `[` / `]`) step THAT video one frame at a time while paused — align the two pictures at 30 fps precision. |
-| 🖱 **Drag & drop** | Drop one or two video files straight onto the window to fill the source slots. |
+| 🖱 **Drag & drop** | Drop one or two video files straight onto the window to fill the source slots — or drop a **subtitle file** (`.srt/.ass/.vtt/…`) to attach it to a feed. A subtitle named after a video (`movie.mp4` + `movie.srt`) goes to that video automatically. |
 | 🔊 **Audio** | Independent volume slider + mute per video, plus a master volume scaling both. |
 | 🎵 **Tracks** | Per-video **audio** and **subtitle** pickers (built from each file's own track list; Off disables). |
 | 🎛 **Transport** | ±10 s jumps, restart, close, screenshots of both videos; **speed** editable (type 1.35 and Enter) with ±0.05 nudge buttons. |
-| 💾 **Persistence** | Paths, volumes, speed saved between sessions. |
+| 🧷 **Remembers the alignment** | The Movie↔Reaction offset is saved **per source pair**: next time you load the same two videos, the reaction is already on its spot. The `🔗 Align` button shows the stored offset — click it to forget it, or after re-aligning to store the new one. |
+| 💾 **Persistence** | Paths, volumes, speed **and remembered alignments** saved between sessions. |
 
 ## Quick start
 
 ### Windows
 
-1. **Install** with `SyncPlayer-Setup.exe` (installs the app **plus a bundled
-   mpv**, so nothing else is needed on the machine). Then launch
-   **SyncPlayer** from the Desktop / Start-Menu shortcut.
+1. **Install**: run `SyncPlayer-Setup.exe` and walk the wizard — it asks
+   **where** to install (default `%LOCALAPPDATA%\Programs\SyncPlayer`, so no
+   administrator prompt), **what** to install (SyncPlayer itself, a bundled
+   **mpv**, **yt-dlp** for URLs, and the update checker — each can be
+   switched off), and whether to add a **Desktop** and/or **Start Menu**
+   shortcut. Then launch it from that shortcut.
+2. **Uninstall** any time from Windows *Apps & Features*, or the
+   *Uninstall SyncPlayer* entry in the Start-Menu folder. Your config and
+   screenshots are kept.
+3. Unattended installs (scripts, imaging):
+
+   ```
+   SyncPlayer-Setup.exe --silent --install-dir D:\Apps\SyncPlayer ^
+       --no-ytdlp --no-desktop-shortcut
+   ```
 
 ### Linux
 
@@ -88,9 +101,12 @@ syncplayer --check-env           # verify mpv, yt-dlp, window backend, paths
 - **Independent seeking**: the Movie/Reaction bars seek *that one player
   only* — a plain mpv seek on its own process. The other video keeps
   playing exactly where it was. This is what makes it crash-proof.
-- **Auto re-sync**: while playing, the panel compares the reaction's live
-  position with its aligned spot and gently re-seeks it when drift exceeds
-  ~0.45 s — so a 2-hour movie stays locked.
+- **Auto re-sync, without jumps**: while playing, the panel compares the
+  reaction's live position with its aligned spot. Past ~0.45 s of drift it
+  **trims the reaction's playback rate by up to ±5 %** (mpv's pitch-preserving
+  time-stretch) until the gap closes — invisible on screen and in the audio,
+  no jump. Only a real gap (**> 0.8 s**, e.g. after a buffering stall or a
+  manual seek) is corrected with a seek, which lands instantly.
 - **🔒 Sync Lock**: once you've aligned both videos with their own bars,
   hit *Lock sync* — the alignment is captured, the per-video bars switch
   off, the Master bar wakes up and drives BOTH videos, and drift
@@ -107,6 +123,18 @@ syncplayer --check-env           # verify mpv, yt-dlp, window backend, paths
   exactly one frame while it is paused — the offset is re-anchored after
   every step, so Lock sync captures the new alignment. mpv was verified to
   step `+/-1/30 s` per press on these clips.
+- **🧷 Remembered alignment**: the offset between the movie and the reaction is
+  stored **per source pair** (keyed by both source paths/URLs, up to 60 pairs),
+  so the next session starts already lined up — *Start* restores the offset and
+  seeks the reaction to its spot. The `🔗 Align` button in the Master row shows
+  the stored offset: click it to **forget** the pair, or after re-aligning to
+  store the new offset. It also saves itself while you align.
+- **📄 Subtitle drag & drop**: dropping a `.srt` / `.ass` / `.ssa` / `.vtt` /
+  `.sub` / `.idx` / `.smi` / `.sup` file on the panel attaches it to a feed live
+  (mpv `sub-add`, selected immediately) — it can never land in a source slot.
+  Routing: a subtitle whose file name matches a loaded video goes to that video
+  (`movie.mp4` + `movie.srt`), anything else goes to the feed the **Crop**
+  panel is pointed at. Dropped before playback has started, it tells you so.
 - **⧉ Picture-in-Picture (window)**: per-video *PiP* button makes that video
   window borderless and always on top (mpv's own `ontop`) while keeping its
   resize edges — drag an edge to resize, drag the video to move.
@@ -154,7 +182,8 @@ syncplayer --check-env           # verify mpv, yt-dlp, window backend, paths
 - **Config** lives in `%APPDATA%\SyncPlayer\`, screenshots in
   `%USERPROFILE%\Pictures\SyncPlayer` (keeps the Desktop clean).
 - **Rate matching**: if the reaction was recorded at a slightly different
-  speed, use Speed (affects both).
+  speed, use Speed (affects both). The sync loop's own ±5 % trim is temporary
+  and separate — it never changes the Speed value you set.
 
 ## Requirements
 
@@ -165,6 +194,9 @@ syncplayer --check-env           # verify mpv, yt-dlp, window backend, paths
   keeps mpv + yt-dlp current too). Optional **yt-dlp** not needed separately.
 - The bare `SyncPlayer.exe` (a standalone asset) still needs mpv + yt-dlp
   present; the **installer is the recommended** way to get a working app.
+- Setup registers itself in **Apps & Features** (per-user: `HKCU`, so it never
+  asks for administrator rights) and creates an *Uninstall SyncPlayer* entry in
+  the Start-Menu folder. Removing it leaves your config and screenshots alone.
 
 **Linux**
 
@@ -188,23 +220,27 @@ syncplayer.py        # the whole app (panel + two mpv drivers + sync loop)
 sp_plat.py           # platform layer: Win32 + X11 window backends, mpv/yt-dlp
                      # discovery, IPC transport (named pipe / unix socket),
                      # config + screenshot locations
-selftest.py          # 59-check headless verification (python selftest.py)
-selftest_plat.py     # 20-check platform layer: paths, discovery, real mpv IPC
+selftest.py          # 67-check headless verification (python selftest.py)
+selftest_plat.py     # 21-check platform layer: paths, discovery, real mpv IPC
                      # round trip (runs on Windows AND Linux)
-selftest_x11.py      # 16-check Linux/X11 window features against two REAL mpv
+selftest_x11.py      # 17-check Linux/X11 window features against two REAL mpv
                      # windows (find/arrange/borderless/ontop/embed/undock)
-gui_test.py          # 179-check END-TO-END test: drives the real GUI + real
+gui_test.py          # 211-check END-TO-END test: drives the real GUI + real
                      # mpv processes (python gui_test.py) — bars track, per-
-                     # video seeks, drift correction, volume read-back from
-                     # mpv, speed, pause, Sync Lock, PiP, frame-step, tracks,
-                     # PiP black-bar crop & guard, double-click fullscreen,
-                     # PiP size, free-form resize, manual crop, Go-to timecode,
-                     # yt subtitle merge, crop persistence + Auto re-probe
-installer.py         # self-contained installer (bundles app + mpv + yt-dlp + updater)
+                     # video seeks, drift correction (rate trim + seek), volume
+                     # read-back from mpv, speed, pause, Sync Lock, PiP, frame-
+                     # step, tracks, PiP black-bar crop & guard, double-click
+                     # fullscreen, PiP size, free-form resize, manual crop,
+                     # Go-to timecode, yt subtitle merge, crop persistence,
+                     # remembered alignment, subtitle drag & drop
+installer.py         # Setup wizard (folder / components / shortcuts) + silent
+                     # install + Add-Remove-Programs registration
 updater.py           # checks/installs latest SyncPlayer + mpv + yt-dlp releases
-install_test.py      # DEPLOYMENT test (Windows): runs the real installer, then
-                     # verifies the installed app plays TWO videos (one a
-                     # YouTube link) using the bundled mpv + yt-dlp
+install_test.py      # DEPLOYMENT test (Windows): runs the real installer (wizard
+                     # CLI: custom folder, per-component switches, shortcuts,
+                     # Add/Remove entry, uninstall), then verifies the installed
+                     # app plays TWO videos (one a YouTube link) using the
+                     # bundled mpv + yt-dlp
 install.sh           # Linux installer (deps check, launcher, .desktop, yt-dlp)
 uninstall.sh         # Linux uninstaller
 install_test_linux.py# DEPLOYMENT test (Linux): install.sh, then TWO videos
@@ -220,8 +256,12 @@ Build the app exe, then the installer and updater:
 
 ```
 # 1. app exe
+#    --collect-all tkinterdnd2: no PyInstaller hook ships for it, and without it
+#    the packaged app loses drag & drop (the tkdnd binaries are left behind).
+#    Build with pillow + tkinterdnd2 installed, or they will not be bundled.
 python -m PyInstaller --noconfirm --clean --onefile --windowed \
-  --name SyncPlayer --icon icon.ico --version-file version_info.txt syncplayer.py
+  --name SyncPlayer --icon icon.ico --version-file version_info.txt \
+  --collect-all tkinterdnd2 syncplayer.py
 
 # 2. updater (no bundled data)
 python -m PyInstaller --noconfirm --clean --onefile --windowed \

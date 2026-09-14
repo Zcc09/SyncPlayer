@@ -357,5 +357,44 @@ cm = sp.detect_crop_rect(_movie)
 check("detect: bar-less clip rejected", cm is None, "rect=%r" % (cm,))
 kill_mpv()
 
+# ---- micro-speed drift trim + subtitle classification (pure helpers) -----
+# dead band: within 60 ms the two feeds count as aligned and the rate is left
+# alone (a trim that keeps hunting would be audible on music)
+check("micro: dead band holds the rate at 1.0",
+      all(sp.micro_rate(d) == 1.0 for d in (0.0, 0.03, -0.06, None, "x",
+                                            float("nan"))))
+# ahead of the target -> must run slower; behind -> faster
+check("micro: a feed ahead of its target runs slower",
+      sp.micro_rate(0.5) < 1.0 and sp.micro_rate(1.0) < 1.0,
+      "%.4f / %.4f" % (sp.micro_rate(0.5), sp.micro_rate(1.0)))
+check("micro: a feed behind its target runs faster",
+      sp.micro_rate(-0.5) > 1.0 and sp.micro_rate(-1.0) > 1.0,
+      "%.4f / %.4f" % (sp.micro_rate(-0.5), sp.micro_rate(-1.0)))
+# however far off it is, the trim stays inside +-3% (inaudible with pitch
+# correction, and never a visible speed change)
+check("micro: trims are clamped to the rate cap",
+      abs(sp.micro_rate(30.0) - (1.0 - sp.MICRO_MAX_PCT)) < 1e-9
+      and abs(sp.micro_rate(-30.0) - (1.0 + sp.MICRO_MAX_PCT)) < 1e-9,
+      "%.4f / %.4f" % (sp.micro_rate(30.0), sp.micro_rate(-30.0)))
+check("micro: the trim grows with the drift, then saturates at the cap",
+      sp.micro_rate(0.1) > sp.micro_rate(0.4) > sp.micro_rate(0.7)
+      and abs(sp.micro_rate(1.0) - (1.0 - sp.MICRO_MAX_PCT)) < 1e-9,
+      "%.4f %.4f %.4f %.4f" % (sp.micro_rate(0.1), sp.micro_rate(0.4),
+                               sp.micro_rate(0.7), sp.micro_rate(1.0)))
+check("micro: 0.1s of drift is trimmed by no more than 1%",
+      abs(sp.micro_rate(0.1) - 1.0) <= 0.012, "%.4f" % sp.micro_rate(0.1))
+check("micro: the seek threshold sits above every drift the loop acts on",
+      # needs_correction fires at 0.45 s (0.15 s when locked); if MICRO_MAX_DRIFT
+      # were below that, normal drift would be seeked again instead of trimmed
+      sp.MICRO_MAX_DRIFT >= 0.45 and sp.micro_rate(sp.MICRO_MAX_DRIFT) != 1.0,
+      "max_drift=%.2f" % sp.MICRO_MAX_DRIFT)
+
+# subtitle files are recognised by extension (drives drag & drop routing)
+check("drop: subtitle extensions are recognised",
+      all(sp.is_subtitle_file(x) for x in
+          ("a.srt", "B.ASS", "c.ssa", "d.vtt", "e.sub", "f.idx", "g.smi"))
+      and not any(sp.is_subtitle_file(x) for x in
+                  ("m.mp4", "m.mkv", "m.webm", "m.avi", "noext", "")))
+
 print("==== %d/%d checks passed ====" % (passed, passed + failed))
 sys.exit(0 if failed == 0 else 1)

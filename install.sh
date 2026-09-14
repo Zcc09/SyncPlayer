@@ -177,9 +177,12 @@ say "  ok desktop entry (app menu / 'Open with')"
 # ----------------------------------------------------------- metadata ------
 MPVVER="$(mpv --version 2>/dev/null | head -1 | awk '{print $2}' || echo unknown)"
 PYVER="$(python3 -c 'import sys;print("%d.%d.%d"%sys.version_info[:3])' 2>/dev/null || echo unknown)"
+# read the app version from the source instead of hardcoding it here
+APPVER="$(sed -n 's/^APP_VERSION *= *"\([^"]*\)".*/\1/p' "$SCRIPT_DIR/syncplayer.py" 2>/dev/null | head -1)"
+APPVER="${APPVER:-unknown}"
 cat > "$PREFIX/install.json" <<EOF
 {
-  "app_version": "1.5.1",
+  "app_version": "$APPVER",
   "platform": "linux",
   "install_dir": "$PREFIX",
   "python": "$PYVER",

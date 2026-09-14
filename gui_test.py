@@ -13,8 +13,11 @@ Run:  python gui_test.py
 """
 import ctypes
 import io
+import json
 import os
+import json
 import sys
+import tempfile
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -31,6 +34,8 @@ fail_msgs = []
 
 def check(name, cond, extra=""):
     global passed, failed
+    if extra != "" and not isinstance(extra, str):
+        extra = str(extra)          # never let a rich extra break the run
     if cond:
         passed += 1
         print("[PASS] %s%s" % (name, (" — " + extra) if extra else ""))
@@ -367,11 +372,17 @@ ok = wait_until(lambda: app.last_pos["A"] is not None and app.last_pos["B"] is n
 check("lock: master bar drives both while locked", ok,
       "A=%s B=%s off=%s" % (app.last_pos["A"], app.last_pos["B"], round(app.sync_off, 2)))
 
-# tight correction: push the reaction ~0.5s BACKWARD out of alignment
+# Tight correction: push the reaction ~0.5s BACKWARD out of alignment
 # (below the 0.45s UNLOCKED threshold, above the 0.15s LOCKED threshold;
-# backward so the 10s clip cannot end mid-test) -> it must be pulled
-# back WHILE LOCKED. Brake the correction loop first so the injected
-# drift is observable, then release and let it snap back.
+# backward so the 10s clip cannot end mid-test) -> it must be pulled back
+# WHILE LOCKED. Re-anchor both near the top first: the pull-in is a rate trim
+# now (no jump), and at +-5% closing 0.25s takes ~5s of clip, so there has to
+# be clip left to watch it happen. Brake the loop so the injected drift is
+# observable, then release it.
+app._seek_m_val = 1.0
+app._on_seek_m_release()
+ok = wait_until(lambda: app.last_pos["A"] is not None
+                and abs(app.last_pos["A"] - 1.0) < 1.6, 6)
 app._seek_grace_until = time.monotonic() + 4.0   # brake: no corrections
 tp = (app._est_pos("A", time.monotonic()) or 0) + app.sync_off - 0.5
 app.players["B"].seek(max(0.0, tp))
@@ -384,9 +395,29 @@ pushed = wait_until(lambda: _drift_now() is not None and _drift_now() < -0.3, 5)
 check("lock: ~0.5s drift injected while locked", pushed, "drift=%s" % _drift_now())
 app._seek_grace_until = 0.0                   # release the brake
 app._last_corr["B"] = 0.0
-ok = wait_until(lambda: _drift_now() is not None and abs(_drift_now()) < 0.25, 8)
+# Locked sync targets the tightest offset. With micro-speed trimming the pull-in
+# is gradual by design (no jump, no audio hiccup), so allow the trim the time it
+# needs - and prove it was a trim by watching the rate move while the position
+# never jumped.
+_pb = app.players["B"]
+_seeks_before = _pb.last_seek_ts
+_seen_rate = [1.0]
+
+
+def _watch_pull_in():
+    r = app._rate.get("B", 1.0)
+    if abs(r - 1.0) > abs(_seen_rate[0] - 1.0):
+        _seen_rate[0] = r
+    d = _drift_now()
+    return d is not None and abs(d) < 0.25
+
+
+ok = wait_until(_watch_pull_in, 14)
 check("lock: tight correction pulls it back (<0.25s)", ok,
       "drift=%s" % _drift_now())
+check("lock: the pull-in is a rate trim, not a jump",
+      abs(_seen_rate[0] - 1.0) > 0.001 and _pb.last_seek_ts == _seeks_before,
+      "max_rate=%.4f seeked=%s" % (_seen_rate[0], _pb.last_seek_ts != _seeks_before))
 
 # unlocking restores per-video seeking
 app._toggle_lock()
@@ -629,9 +660,14 @@ px0, py0 = pr.left, pr.top
 app._pip_move(-1, -1)    # panel X/Y arrows: move left+up (away from clamps)
 pump(1.0)
 ok = u.GetWindowRect(hwnd, ctypes.byref(pr))
-moved = ok and (pr.left < px0 - 25 and pr.top < py0 - 15)
-check("ipip: X/Y arrow buttons move the pane (%d,%d -> %d,%d)" % (px0, py0, pr.left, pr.top), moved,
-      "size=%s" % app._pip_int_size)
+# compare against the app's own step (3.5% of the travel, min 12 px) rather
+# than a fixed pixel count, which flips by a pixel when the host resizes
+_csz = app._client_size(app.players[app._pip_int_host].hwnd)
+_r = app._pip_calc_rect(_csz[0], _csz[1])
+_step = max(12, int(0.035 * max(_r[4], _r[5], 100)))
+moved = ok and abs((px0 - pr.left) - _step) <= 2 and abs((py0 - pr.top) - _step) <= 2
+check("ipip: X/Y arrows move the pane by one step (%d,%d -> %d,%d)" % (px0, py0, pr.left, pr.top), moved,
+      "step=%d size=%s" % (_step, app._pip_int_size))
 check("ipip: window-dragging disabled on the pane",
       ("A", {"command": ["set_property", "window-dragging", "no"]}) in _cmd_log)
 app._toggle_pip_int("A")   # toggle again = undock
@@ -753,6 +789,240 @@ app._crop_clear()
 pump(0.4)
 app._toggle_lock()
 check("crop: lock released after crop PiP tests", not app.sync_locked)
+
+# -------- 11g. remembered alignment (offset stored per movie+reaction) -----
+# state: A plays MOVIE, B plays REACT, both started, no lock, no crop.
+app._seek(2.0)
+pump(1.5)
+key = app._pair_key()
+check("align: pair key built from both sources", isinstance(key, str) and "\n" in key)
+# the config file outlives a test run, so clear this pair first: the checks
+# below are about remembering, not about what an earlier run left behind
+app._alignments.pop(key, None)
+app._save_config()
+check("align: nothing remembered for this pair yet", app._saved_alignment() is None,
+      "saved=%r" % (app._saved_alignment(),))
+
+# the user lines the two up (drag the Reaction bar / frame step), then clicks
+# Align to remember it. Set the settled offset directly, as that drag would.
+app.sync_off = 3.5
+app._align_last_seen = 3.5
+app._toggle_alignment_memory()
+pump(0.5)
+check("align: clicking Align stores the offset",
+      abs((app._saved_alignment() or 0) - 3.5) < 0.001,
+      "saved=%r" % (app._saved_alignment(),))
+check("align: the button shows the remembered offset",
+      "3.5" in app.btn_align.cget("text"), repr(app.btn_align.cget("text")))
+with io.open(sp.CONFIG_PATH, encoding="utf-8") as _f:
+    _cfg = json.load(_f)
+check("align: offset is written to the config file",
+      abs(float((_cfg.get("alignments") or {}).get(key, 0)) - 3.5) < 0.001,
+      "keys=%d" % len(_cfg.get("alignments") or {}))
+
+# restart the pair: the offset must come back and the reaction must be put on
+# its aligned spot with no user interaction
+app._stop()
+pump(1.0)
+check("align: Stop tears the feeds down", app.started is False
+      and app.players.get("A") is None and app.players.get("B") is None,
+      "started=%s" % app.started)
+app._start()
+pump(4.0)                      # covers the 1200 ms restore timer + IPC
+ok = wait_until(lambda: app.players["A"].hwnd is not None
+                and app.players["B"].hwnd is not None, 8)
+check("align: windows came back after the restart", ok)
+check("align: offset restored on Start", abs(app.sync_off - 3.5) < 0.001,
+      "sync_off=%.3f" % app.sync_off)
+_e_a, _pa = app.players["A"].get_property("time-pos", timeout=3.0)
+_e_b, _pb = app.players["B"].get_property("time-pos", timeout=3.0)
+check("align: reaction seeked to the remembered spot",
+      _pa is not None and _pb is not None
+      and abs(float(_pb) - (float(_pa) + 3.5)) <= 1.0,
+      "A=%s B=%s" % (_pa, _pb))
+app._save_config()
+app._alignments = {}
+app._load_config()
+check("align: survives a config save/reload cycle",
+      abs((app._saved_alignment() or 0) - 3.5) < 0.001,
+      "saved=%r" % (app._saved_alignment(),))
+app._toggle_alignment_memory()
+pump(0.4)
+check("align: clicking again forgets it",
+      app._saved_alignment() is None and "\u2014" in app.btn_align.cget("text"),
+      repr(app.btn_align.cget("text")))
+with io.open(sp.CONFIG_PATH, encoding="utf-8") as _f:
+    _cfg2 = json.load(_f)
+check("align: forgotten offset is gone from the config file",
+      key not in (_cfg2.get("alignments") or {}))
+
+# -------- 11h. drift correction by micro playback speed (no jumps) --------
+# state: both feeds play from near the top of the clips (MOVIE 12 s, REACT 10 s)
+# and every step below stays inside the first ~9 s of both.
+app.sync_off = 0.0
+app._align_last_seen = 0.0
+app._rate["B"] = 1.0
+app._micro_until = 0.0
+app._apply_speed()
+app._seek(0.2)
+pump(1.5)
+for _tag in ("A", "B"):
+    _p = app.players.get(_tag)
+    if _p and _p.running and _p.paused:
+        _p.cmd({"command": ["set_property", "pause", "no"]})
+app.paused = False
+pump(1.0)
+pb = app.players["B"]
+base_speed = app.speed.get()
+
+
+def _drift_now():
+    _n = time.monotonic()
+    return sp.drift(app._est_pos("B", _n), app._est_pos("A", _n), app.sync_off)
+
+
+# Drift the reaction 0.6 s ahead of its aligned spot behind the app's back - what
+# a YouTube buffering gap leaves behind. Exact seek on purpose: these clips have
+# long GOPs, so a keyframe seek would land somewhere else entirely.
+_e, _rb0 = pb.get_property("time-pos", timeout=3.0)
+pb.seek(float(_rb0) + 0.6)
+seeks_before = pb.last_seek_ts
+pump(2.5)                      # let the drift loop notice and trim the rate
+check("micro: a small drift is trimmed, not seeked",
+      abs(app._rate["B"] - 1.0) > 0.0005 and pb.last_seek_ts == seeks_before,
+      "rate=%.4f seeked=%s" % (app._rate["B"], pb.last_seek_ts != seeks_before))
+_e_v, _spd = pb.get_property("speed", timeout=3.0)
+check("micro: mpv really runs the reaction at the trimmed rate",
+      _e_v == "success" and _spd is not None
+      and abs(float(_spd) - base_speed * app._rate["B"]) < 0.003
+      and float(_spd) < base_speed,
+      "speed=%s rate=%.4f base=%.2f" % (_spd, app._rate["B"], base_speed))
+_d0 = _drift_now()
+pump(4.0)
+_d1 = _drift_now()
+check("micro: the trim closes the gap over time",
+      abs(_d1) < abs(_d0) - 0.04, "drift %.2f -> %.2f" % (_d0, _d1))
+check("micro: the trimmed rate stays a tiny fraction of the base speed",
+      abs(app._rate["B"] - 1.0) <= sp.MICRO_MAX_PCT + 1e-9,
+      "rate=%.4f cap=%.3f" % (app._rate["B"], sp.MICRO_MAX_PCT))
+
+# A gap too big to trim (3% of 3.5 s would take ~2 minutes) is still seeked, and
+# the rate goes back to the base speed once the jump has landed.
+app._rate["B"] = 1.0
+app._micro_until = 0.0
+app._apply_speed()
+app.players["A"].seek(4.0)
+pb.seek(0.5)                   # reaction 3.5 s behind its aligned spot
+seeks_before = pb.last_seek_ts
+pump(3.0)
+_e_a, _pa1 = app.players["A"].get_property("time-pos", timeout=3.0)
+_e_b, _pb1 = pb.get_property("time-pos", timeout=3.0)
+check("micro: a large gap is still corrected by a seek",
+      pb.last_seek_ts != seeks_before and abs(app._rate["B"] - 1.0) < 0.0005,
+      "rate=%.4f seeked=%s" % (app._rate["B"], pb.last_seek_ts != seeks_before))
+check("micro: after the jump the two feeds are back together",
+      _pa1 is not None and _pb1 is not None
+      and abs(float(_pb1) - float(_pa1)) <= 0.8,
+      "A=%s B=%s" % (_pa1, _pb1))
+app._rate["B"] = 1.0
+app._micro_until = 0.0
+app._apply_speed()
+app.sync_off = 0.0
+app._seek(2.0)
+pump(1.0)
+
+# -------- 11i. subtitle drag & drop --------------------------------------
+# Dropping a .srt on the panel attaches it to a feed - it must never be taken
+# for a video source, and the routing must be predictable:
+#   1.  a subtitle named after a loaded video goes to that video (movie.srt ->
+#       the movie feed), which is what happens when both are dropped together
+#   2.  anything else goes to the feed the panel is pointed at (Crop: ...)
+sub_dir = tempfile.mkdtemp(prefix="sp_subs_")
+srt_movie = os.path.join(sub_dir, "movie.srt")
+srt_other = os.path.join(sub_dir, "reaction_notes.srt")
+for _f in (srt_movie, srt_other):
+    with io.open(_f, "w", encoding="utf-8", newline="\n") as _fh:
+        _fh.write("1\n00:00:00,500 --> 00:00:03,000\ndrop test cue one\n\n"
+                  "2\n00:00:04,000 --> 00:00:06,500\ndrop test cue two\n")
+
+
+def _sub_tracks(tag):
+    _p = app.players.get(tag)
+    if not _p or not _p.running:
+        return []
+    _e, _tl = _p.get_property("track-list", timeout=3.0)
+    if _e != "success" or not isinstance(_tl, list):
+        return []
+    return [t for t in _tl if t.get("type") == "sub"]
+
+
+class _SubEv(object):
+    def __init__(self, path):
+        self.data = "{%s}" % path
+
+
+srcs_before = (app.movie_path.get(), app.react_path.get())
+subs_a_before = len(_sub_tracks("A"))
+app._on_drop(_SubEv(srt_movie))
+pump(1.2)
+subs_a = _sub_tracks("A")
+check("drop-subs: a dropped .srt does NOT fill a source slot",
+      (app.movie_path.get(), app.react_path.get()) == srcs_before,
+      "A=%r B=%r" % (app.movie_path.get(), app.react_path.get()))
+check("drop-subs: 'movie.srt' attaches to the movie feed",
+      len(subs_a) == subs_a_before + 1,
+      "before=%d after=%d" % (subs_a_before, len(subs_a)))
+check("drop-subs: the new track is external and selected",
+      any(t.get("external") for t in subs_a) and any(t.get("selected") for t in subs_a),
+      "tracks=%s" % str([(t.get("external"), t.get("selected")) for t in subs_a]))
+check("drop-subs: the status line names the feed it went to",
+      "Movie" in app.status_lbl.cget("text"), repr(app.status_lbl.cget("text")))
+
+# rule 2: an unrelated name follows the panel selector
+app._crop_tag = "B"
+subs_b_before = len(_sub_tracks("B"))
+app._on_drop(_SubEv(srt_other))
+pump(1.2)
+subs_b = _sub_tracks("B")
+check("drop-subs: an unrelated name follows the panel's feed",
+      len(subs_b) == subs_b_before + 1,
+      "before=%d after=%d" % (subs_b_before, len(subs_b)))
+check("drop-subs: the movie feed was not touched by it",
+      len(_sub_tracks("A")) == len(subs_a))
+app._crop_tag = "A"
+
+# A .srt dropped before anything is playing must not crash or touch the sources:
+# it explains that playback has to be started first. (The empty player table is
+# exactly the state at launch, before Start.)
+_saved_players = dict(app.players)
+app.players = {}
+app._on_drop(_SubEv(srt_other))
+pump(0.4)
+check("drop-subs: before Start a lone .srt explains itself instead of crashing",
+      "Start" in app.status_lbl.cget("text")
+      or "subtitle" in app.status_lbl.cget("text").lower(),
+      repr(app.status_lbl.cget("text")))
+check("drop-subs: and the source slots are still untouched",
+      (app.movie_path.get(), app.react_path.get()) == srcs_before)
+app.players = _saved_players
+for _f in (srt_movie, srt_other):
+    try:
+        os.remove(_f)
+    except Exception:
+        pass
+try:
+    os.rmdir(sub_dir)
+except Exception:
+    pass
+app.sync_off = 0.0
+app._align_last_seen = 0.0
+app._rate["B"] = 1.0
+app._micro_until = 0.0
+app._apply_speed()
+app._alignments.pop(app._pair_key(), None)     # leave the pair clean
+app._save_config()
+app._seek(2.0)
+pump(1.0)
 
 # ------------ 11x. X-series: dbl-click desync, PiP size, free-form resize --
 # state at entry: A/B are at EOF (12 s clips, long suite) and the app has
