@@ -57,7 +57,7 @@ from tkinter import ttk, filedialog, messagebox
 import sp_plat as plat   # cross-platform: paths, mpv IPC, window control
 
 APP_NAME = "SyncPlayer"
-APP_VERSION = "1.5.1"
+APP_VERSION = "1.6.0"
 
 
 class MpvNotFoundError(Exception):
@@ -501,6 +501,46 @@ def clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
 
+# ---- micro-speed drift correction ------------------------------------------
+# Instead of hard-seeking the reaction back into alignment (a visible jump, and
+# with a YouTube feed often a fresh buffering stall), a small lag/lead is
+# absorbed by running it a fraction of a percent faster or slower. With
+# --audio-pitch-correction the pitch is preserved, so the correction is
+# inaudible; anything larger than MICRO_MAX_DRIFT is still a seek, because
+# trimming a big gap at a few percent would take minutes.
+MICRO_DEADBAND = 0.06         # s: inside this the two feeds count as aligned
+MICRO_MAX_DRIFT = 0.8         # s: above this, seek instead of trimming
+MICRO_MAX_PCT = 0.05         # cap the rate change at +-5%
+MICRO_GAIN = 0.10             # rate delta per second of drift
+MICRO_HOLD = 8.0             # s: keep a trim applied before re-evaluating
+
+# subtitle file types accepted by drag & drop (mpv sub-add handles all of them)
+SUBTITLE_EXTS = (".srt", ".ass", ".ssa", ".vtt", ".sub", ".idx", ".smi", ".sup")
+
+
+def micro_rate(drift_s, deadband=MICRO_DEADBAND, max_pct=MICRO_MAX_PCT,
+               gain=MICRO_GAIN):
+    """Playback-rate factor that absorbs `drift_s` without a seek.
+
+    Signed like drift(): positive means the video is AHEAD of where it should be
+    (so it must run slower), negative means behind (run faster). Returns 1.0
+    inside the dead band, otherwise a factor within [1-max_pct, 1+max_pct].
+    """
+    try:
+        d = float(drift_s)
+    except (TypeError, ValueError):
+        return 1.0
+    if d != d or abs(d) <= deadband:          # NaN guard + dead band
+        return 1.0
+    delta = max(-max_pct, min(max_pct, -d * gain))
+    return 1.0 + delta
+
+
+def is_subtitle_file(path):
+    p = (path or "").strip().lower()
+    return p.endswith(SUBTITLE_EXTS)
+
+
 def reaction_target(movie_pos, sync_off):
     """Where the reaction SHOULD be, given the movie's live position and the
     aligned offset (reaction offset relative to the movie, may be negative)."""
@@ -653,6 +693,8 @@ class MpvDriver:
                 "--fs=no",
                 "--ytdl=yes",
                 "--volume-max=150",
+                # keep pitch intact when the drift loop trims the rate
+                "--audio-pitch-correction=yes",
                 ]
         _ctx = None if _GPU_CTX_DISABLED else _linux_mpv_gpu_context()
         if _ctx:
@@ -1351,6 +1393,13 @@ class SyncApp:
         self.started = False
         self.paused = True
         self.sync_off = 0.0          # reaction's offset vs the movie (can be ±)
+        self._rate = {"A": 1.0, "B": 1.0}   # micro-speed trim per feed (1.0 = base)
+        self._micro_until = 0.0      # keep a trim until this monotonic time
+        self._alignments = {}        # "movie\nreaction" -> offset (remembered)
+        self._align_last_seen = 0.0  # sync_off value we last reacted to
+        self._align_saved_ts = 0.0   # last time the config was written
+        self._align_dirty = False    # offset changed but not yet written
+        self._align_key_seen = None  # pair key currently shown on the button
         self.last_pos = {"A": None, "B": None}
         self.last_dur = {"A": None, "B": None}
         self.cache_dur = {"A": 0.0, "B": 0.0}
@@ -1628,6 +1677,13 @@ class SyncApp:
         self.btn_lock = ttk.Button(mlab, text="🔒 Lock sync", width=11,
                                    command=self._toggle_lock)
         self.btn_lock.pack(side="left", padx=(2, 0))
+        self.btn_align = ttk.Button(mlab, text="\U0001f517 Align \u2014", width=13,
+                                    command=self._toggle_alignment_memory)
+        self.btn_align.pack(side="left", padx=(4, 0))
+        Tooltip(self.btn_align,
+                "Remembered alignment: SyncPlayer stores the movie+reaction offset, "
+                "so the next session starts already in sync. Click to forget it, or "
+                "to remember the alignment you just set.")
         Tooltip(self.btn_lock, "Lock the alignment: per-video bars switch off, the Master bar drives BOTH videos, and drift correction gets stricter.")
         self._ctrls.append(self.btn_lock)
         self.btn_play_m = ttk.Button(mlab, text="▶", width=3,
@@ -1946,18 +2002,53 @@ class SyncApp:
             paths = [p.strip() for p in paths if p.strip()]
             if not paths:
                 return
-            # fill empty slots first, in order A then B
+            # subtitles are attached to a feed; everything else fills a source
+            # slot (a dropped .srt must never land in the Movie/Reaction field)
+            subs = [p for p in paths if is_subtitle_file(p)]
+            vids = [p for p in paths if not is_subtitle_file(p)]
+
             loaded = 0
-            if not self.movie_path.get().strip():
-                self.movie_path.set(paths.pop(0))
-                loaded += 1
-            if not self.react_path.get().strip():
-                if paths:
-                    self.react_path.set(paths.pop(0))
+            filled = []
+            for path in vids:
+                if not self.movie_path.get().strip():
+                    self.movie_path.set(path)
                     loaded += 1
-            both = bool(self.movie_path.get().strip() and self.react_path.get().strip())
-            self.status_lbl.config(
-                text="Loaded %d file(s)%s" % (loaded, " — press ▶ Play to start." if both else ""))
+                    filled.append("A")
+                elif not self.react_path.get().strip():
+                    self.react_path.set(path)
+                    loaded += 1
+                    filled.append("B")
+
+            attached = 0
+            failed = []
+            for sub in subs:
+                # prefer the feed that matches this file name, then whatever was
+                # just loaded, then the panel's active feed
+                tag = self._sub_target_for(sub, preferred=filled)
+                if self._attach_subtitle(tag, sub):
+                    attached += 1
+                else:
+                    failed.append(os.path.basename(sub))
+
+            if not attached and not loaded and failed:
+                # a subtitle on its own, with nothing playing yet: say what to do
+                self.status_lbl.config(
+                    text="Start playback first, then drop '%s' to attach it."
+                         % failed[0])
+            elif not attached:
+                both = bool(self.movie_path.get().strip()
+                            and self.react_path.get().strip())
+                self.status_lbl.config(
+                    text="Loaded %d file(s)%s"
+                         % (loaded, " — press ▶ Play to start." if both else ""))
+            elif loaded:
+                self.status_lbl.config(
+                    text="Loaded %d file(s) and attached %d subtitle(s)."
+                         % (loaded, attached))
+            elif failed:
+                self.status_lbl.config(
+                    text="Attached %d subtitle(s); %d need playback running first."
+                         % (attached, len(failed)))
         except Exception:
             pass
 
@@ -2038,6 +2129,8 @@ class SyncApp:
         self.started = True
         self.paused = True   # loaded PAUSED: Play/Space starts both videos
         self.sync_off = 0.0
+        self._rate = {"A": 1.0, "B": 1.0}
+        self._micro_until = 0.0
         self.last_pos = {"A": None, "B": None}
         self.last_dur = {"A": None, "B": None}
         self._status_time = {"A": 0.0, "B": 0.0}
@@ -2058,6 +2151,16 @@ class SyncApp:
             self.root.after(2500, lambda: self._list_yt_subs("B"))
         self._apply_volumes()
         self._apply_speed()
+        # restore the remembered alignment for THIS movie + reaction pair
+        _saved = self._saved_alignment()
+        if _saved is not None and abs(_saved) > 0.001:
+            self.sync_off = float(_saved)
+            self._align_last_seen = float(_saved)
+            self.status_lbl.config(
+                text="Alignment remembered for this pair (%+.2fs) - applying..." % _saved)
+            self.root.after(1200, lambda off=float(_saved):
+                            self._apply_saved_alignment(off))
+        self._update_align_btn()
         self._srcs = {"A": ra, "B": rb}
         # Crop is active-session only: reset on start (not persistent across sessions/restarts)
         self._manual_crop = {"A": None, "B": None}
@@ -3504,10 +3607,11 @@ class SyncApp:
         self.status_lbl.config(text="Speed set to %.2fx (both videos)." % s)
 
     def _apply_speed(self):
+        """Apply the user's speed, times each feed's drift-trim factor."""
         for t in ("A", "B"):
             p = self.players.get(t)
             if p and p.running:
-                p.set_speed(self.speed.get())
+                p.set_speed(self.speed.get() * self._rate.get(t, 1.0))
 
     def _shot(self):
         if not self.started:
@@ -3657,7 +3761,8 @@ class SyncApp:
         p = self.players.get(tag)
         if self.paused or (p and p.at_end) or not (p and p.running):
             return pos              # frozen: no extrapolation
-        est = pos + dt * self.speed.get()
+        rate = self.speed.get() * self._rate.get(tag, 1.0)
+        est = pos + dt * rate
         dur = self.last_dur.get(tag)
         return min(est, dur) if dur else est
 
@@ -3667,6 +3772,175 @@ class SyncApp:
         self.last_pos[tag] = max(0.0, pos)
         self._status_time[tag] = time.monotonic()
         self._seek_grace_until = time.monotonic() + 1.2  # let mpv land & report
+        # a seek re-establishes the alignment on its own, so any drift trim
+        # applied before it is no longer wanted
+        if self._rate.get(tag, 1.0) != 1.0:
+            self._rate[tag] = 1.0
+            p = self.players.get(tag)
+            if p and p.running:
+                p.set_speed(self.speed.get())
+        self._micro_until = 0.0
+
+    # -- drift correction by micro speed --------------------------------------
+    def _set_micro_rate(self, tag, factor):
+        """Trim this feed's playback rate to absorb a small drift.
+
+        The drift estimate extrapolates each feed with its OWN rate, so the
+        position is re-anchored to 'now' before the rate changes - otherwise the
+        estimate would lurch by (rate delta x time since the last sample) and the
+        controller would fight itself.
+        """
+        p = self.players.get(tag)
+        if not (p and p.running):
+            return
+        try:
+            factor = float(factor)
+        except (TypeError, ValueError):
+            factor = 1.0
+        factor = max(1.0 - MICRO_MAX_PCT, min(1.0 + MICRO_MAX_PCT, factor))
+        if abs(factor - self._rate.get(tag, 1.0)) < 0.0005:
+            return
+        now = time.monotonic()
+        pos = self._est_pos(tag, now)
+        if pos is not None:
+            self.last_pos[tag] = pos
+            self._status_time[tag] = now
+        self._rate[tag] = factor
+        p.set_speed(self.speed.get() * factor)
+
+    # -- remembered alignment -------------------------------------------------
+    def _pair_key(self):
+        """Identity of the movie+reaction pair currently in the source slots."""
+        a = (self.movie_path.get() or "").strip()
+        b = (self.react_path.get() or "").strip()
+        if not (a and b):
+            return None
+        return a + "\n" + b
+
+    def _saved_alignment(self):
+        k = self._pair_key()
+        if not k:
+            return None
+        v = self._alignments.get(k)
+        try:
+            return float(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def _remember_alignment(self, force=False):
+        """Store the CURRENT offset for this pair so the next session starts
+        aligned. Debounced: the offset moves continuously while a bar is dragged
+        and only the settled value is worth writing to disk."""
+        k = self._pair_key()
+        if not k or not self.started:
+            return False
+        now = time.monotonic()
+        if not force and (now - self._align_saved_ts) < 2.0:
+            self._align_dirty = True
+            return False
+        self._align_saved_ts = now
+        self._align_dirty = False
+        self._alignments[k] = round(float(self.sync_off), 3)
+        if len(self._alignments) > 60:            # keep the config small
+            for old in list(self._alignments)[:-60]:
+                self._alignments.pop(old, None)
+        self._save_config()
+        self._update_align_btn()
+        return True
+
+    def _forget_alignment(self):
+        k = self._pair_key()
+        if not k or self._alignments.pop(k, None) is None:
+            return False
+        self._save_config()
+        self._update_align_btn()
+        return True
+
+    def _update_align_btn(self):
+        off = self._saved_alignment()
+        txt = ("\U0001f517 Align %+.1fs" % off) if off is not None else "\U0001f517 Align \u2014"
+        try:
+            self.btn_align.config(text=txt)
+        except Exception:
+            pass
+
+    def _toggle_alignment_memory(self):
+        """The Align button: forget a remembered offset, or remember this one."""
+        if self._saved_alignment() is not None:
+            self._forget_alignment()
+            self._update_align_btn()
+            self._status_pin = time.monotonic() + 4.0
+            self.status_lbl.config(
+                text="Alignment forgotten for this pair - Start will not offset the reaction.")
+            return
+        if not self.started:
+            self._status_pin = time.monotonic() + 4.0
+            self.status_lbl.config(
+                text="Start playback, line the two videos up, then click Align to remember it.")
+            return
+        self._remember_alignment(force=True)
+        self._update_align_btn()
+        self._status_pin = time.monotonic() + 4.0
+        self.status_lbl.config(
+            text="Alignment remembered: reaction offset %+.2fs for this movie + reaction."
+                 % self.sync_off)
+
+    def _apply_saved_alignment(self, off):
+        """Put the reaction where the remembered offset says it belongs."""
+        p = self.players.get("B")
+        if not (p and p.running):
+            return
+        ra = self._est_pos("A", time.monotonic())
+        ra = 0.0 if ra is None else ra
+        target = max(0.0, ra + off)      # a feed cannot sit before its own start
+        p.seek(target, exact=True)
+        self._commit_seek("B", target)
+        self._status_pin = time.monotonic() + 5.0
+        if target <= 0.01 and off < 0:
+            self.status_lbl.config(
+                text="Alignment remembered (%+.1fs): the reaction starts once the movie is %.0fs in."
+                     % (off, abs(off)))
+        else:
+            self.status_lbl.config(
+                text="Alignment remembered: reaction offset %+.2fs - press Play when ready." % off)
+        self._update_align_btn()
+
+    # -- subtitles by drag & drop ---------------------------------------------
+    def _sub_target_for(self, sub_path, preferred=()):
+        """Which feed a dropped subtitle belongs to.
+
+        1. the file name matches a loaded video (movie.mp4 -> movie.srt)
+        2. only one feed has a source loaded
+        3. otherwise the feed the Crop panel is pointed at
+        """
+        base = os.path.splitext(os.path.basename(sub_path or ""))[0].lower()
+        for t in ("A", "B"):
+            src = self._srcs.get(t) or ""
+            if src and os.path.splitext(os.path.basename(src))[0].lower() == base:
+                return t
+        loaded = [t for t in ("A", "B")
+                  if (self.movie_path.get() if t == "A" else self.react_path.get() or "").strip()]
+        if len(loaded) == 1:
+            return loaded[0]
+        for t in preferred:
+            if self.players.get(t):
+                return t
+        return self._crop_tag if self.players.get(self._crop_tag) else "A"
+
+    def _attach_subtitle(self, tag, path):
+        """Hand a subtitle file to mpv (sub-add selects it immediately)."""
+        p = self.players.get(tag)
+        if not (p and p.running):
+            return False
+        p.cmd({"command": ["sub-add", path, "select"]})
+        name = os.path.basename(path)
+        self._status_pin = time.monotonic() + 5.0
+        self.status_lbl.config(
+            text="Subtitle '%s' attached to %s."
+                 % (name, "Movie" if tag == "A" else "Reaction"))
+        self.root.after(700, self._refresh_tracks)
+        self.root.after(1800, self._refresh_tracks)
+        return True
 
     def _sync_tick(self):
         """Master-clock work: correct drift, then refresh bars/status."""
@@ -3695,8 +3969,14 @@ class SyncApp:
                 and not (self.dragging_seek_a or self.dragging_seek_b
                          or self.dragging_seek_m)):
             target = reaction_target(ra, self.sync_off)
+            if target is not None:
+                # the reaction cannot sit before its own start: while the movie
+                # is shorter than a negative offset, 0 is the achievable target
+                target = max(0.0, target)
+            eff_off = (target - ra) if (target is not None and ra is not None) \
+                else self.sync_off
             pa_at_end = pa.at_end if (pa and pa.running) else True
-            if needs_correction(rb, ra, self.sync_off, threshold=thr,
+            if needs_correction(rb, ra, eff_off, threshold=thr,
                                 playing=True, dragging=False,
                                 movie_at_end=pa_at_end,
                                 react_at_end=react_at_end):
@@ -3705,9 +3985,22 @@ class SyncApp:
                     # cannot be there. Parking at its end IS aligned.
                     self._last_corr["B"] = now
                 else:
-                    pb.seek(target)
-                    self._commit_seek("B", target)
+                    off = (rb - target) if (rb is not None and target is not None) else 0.0
+                    if abs(off) <= MICRO_MAX_DRIFT:
+                        # small lag/lead: trim the rate instead of jumping, so
+                        # the correction is invisible and needs no re-buffer
+                        self._set_micro_rate("B", micro_rate(off))
+                        self._micro_until = now + MICRO_HOLD
+                    else:
+                        # far off (a stall, a long buffering gap): a jump lands
+                        # faster than any amount of rate trimming
+                        self._set_micro_rate("B", 1.0)
+                        pb.seek(target)
+                        self._commit_seek("B", target)
                     self._last_corr["B"] = now
+        elif (abs(self._rate.get("B", 1.0) - 1.0) > 0.0005
+                and now > self._micro_until and not self.paused):
+            self._set_micro_rate("B", 1.0)       # drift is gone: back to base rate
 
         # ---- bars (skip whichever one the user is dragging) ----------------
         # NOTE: ttk.Scale.set() synchronously fires the command callback, which
@@ -3753,8 +4046,23 @@ class SyncApp:
             if btn.cget("text") != want:
                 btn.config(text=want)
 
+        # remember the alignment once it settles (debounced inside), and keep
+        # the Align button in step with the pair in the source slots
+        if self.started and self.sync_off != self._align_last_seen:
+            self._align_last_seen = self.sync_off
+            self._remember_alignment()
+        if self._align_dirty and (time.monotonic() - self._align_saved_ts) > 2.0:
+            self._remember_alignment(force=True)
+        _pk = self._pair_key()
+        if _pk != self._align_key_seen:
+            self._align_key_seen = _pk
+            self._update_align_btn()
+
         d = drift(rb, ra, self.sync_off) if (ra is not None and rb is not None) else 0.0
         d_txt = "Δ %+.1fs" % d if abs(d) >= 0.05 else "Δ 0.0s"
+        rate_b = self._rate.get("B", 1.0)
+        if abs(rate_b - 1.0) > 0.0005:
+            d_txt += "  \u21c4%.2fx" % rate_b     # visible while a trim is active
         lock_txt = " · SYNC LOCKED" if self.sync_locked else ""
         if ra is not None:
             txt = "Movie %s  ·  Reaction %s  ·  %s%s" % (ma, rb_fmt, d_txt, lock_txt)
@@ -3790,6 +4098,9 @@ class SyncApp:
             self.vol_m.set(float(c.get("vol_m", 100.0)))
             self.speed.set(float(c.get("speed", 1.0)))
             self.jump_sec.set(float(c.get("jump_sec", 5.0)))
+            al = c.get("alignments")
+            if isinstance(al, dict):
+                self._alignments = {str(k): v for k, v in al.items() if k}
         except Exception:
             pass
 
@@ -3804,6 +4115,7 @@ class SyncApp:
                     "vol_m": self.vol_m.get(),
                     "speed": self.speed.get(),
                     "jump_sec": self.jump_sec.get(),
+                    "alignments": self._alignments,
                 }, f, indent=2)
         except Exception:
             pass
@@ -3860,10 +4172,208 @@ def _install_crash_hook():
     sys.excepthook = hook
 
 
+# registry subkey created by Setup; BS.join keeps this source free of
+# backslash escapes (which are easy to mangle when patching)
+BS = chr(92)
+_UNINSTALL_KEY = BS.join(["Software", "Microsoft", "Windows",
+                          "CurrentVersion", "Uninstall", APP_NAME])
+
+
+def _emit_env_report(info, argv):
+    """Write/print the --check-env report.
+
+    A windowed Windows build has no stdout (print() goes nowhere), so give it a
+    file: `SyncPlayer.exe --check-env [file]`. This is the report to send with a
+    support question - it is also how the deployment test proves the packaged
+    app shipped its optional pieces (drag & drop, Pillow)."""
+    text = json.dumps(info, indent=2)
+    path = None
+    try:
+        i = argv.index("--check-env")
+        if i + 1 < len(argv) and not argv[i + 1].startswith("-"):
+            path = argv[i + 1]
+    except ValueError:
+        pass
+    if path is None and getattr(sys, "frozen", False):
+        path = os.path.join(tempfile.gettempdir(), "syncplayer_env.json")
+    if path:
+        try:
+            with io.open(path, "w", encoding="utf-8") as f:
+                f.write(text + chr(10))
+            return path
+        except Exception:
+            pass
+    try:
+        print(text)
+    except Exception:
+        pass
+    return None
+
+
+def _uninstall_targets():
+    """Everything the Windows Setup can create for this installation."""
+    exe_dir = (os.path.dirname(os.path.abspath(sys.executable))
+               if getattr(sys, "frozen", False) else BASE)
+    lnks = [os.path.join(os.path.expanduser("~"), "Desktop", APP_NAME + ".lnk")]
+    sm = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"),
+                      "Microsoft", "Windows", "Start Menu", "Programs", APP_NAME)
+    try:
+        lnks += [os.path.join(sm, n) for n in os.listdir(sm)]
+    except Exception:
+        pass
+    return exe_dir, lnks, sm
+
+
+def _is_managed_install(exe_dir):
+    """True only for a folder Setup created.
+
+    Guard: the folder must contain the install.json Setup writes, and must not
+    be one of the user's own folders. A bare SyncPlayer.exe sitting on the
+    Desktop must never take the Desktop with it when it is "uninstalled"."""
+    if not os.path.isfile(os.path.join(exe_dir, "install.json")):
+        return False
+    home = os.path.expanduser("~")
+    banned = set()
+    for p in (home, os.path.join(home, "Desktop"), os.path.join(home, "Downloads"),
+              os.path.join(home, "Documents"), os.path.join(home, "Pictures"),
+              os.environ.get("TEMP") or "", os.environ.get("TMP") or "",
+              os.environ.get("LOCALAPPDATA") or "",
+              os.environ.get("APPDATA") or "",
+              os.environ.get("USERPROFILE") or "",
+              "c:\\", "c:\\program files", "c:\\program files (x86)",
+              (os.environ.get("SystemRoot") or "c:\\windows")):
+        if p:
+            banned.add(os.path.abspath(p).lower().rstrip("\\"))
+    d = os.path.abspath(exe_dir).lower().rstrip("\\")
+    return bool(d) and d not in banned and d.count("\\") >= 2 and len(d) > 12
+
+
+# DOS line ending for the generated .cmd (chr() keeps this file free of
+# escape sequences that patch round-trips could mangle)
+CRLF = chr(13) + chr(10)
+
+
+def _close_other_instances():
+    """Close other running SyncPlayer windows so their files can be removed.
+
+    Our own PID and the onefile bootloader that spawned us are excluded: killing
+    those would kill this process halfway through the uninstall."""
+    cmd = ["taskkill", "/F", "/IM", APP_NAME + ".exe"]
+    for pid in {os.getpid(), os.getppid()}:
+        cmd += ["/FI", "PID ne %d" % pid]
+    try:
+        r = subprocess.run(cmd, capture_output=True,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _spawn_folder_delete(folder):
+    """Delete `folder` after this process exits.
+
+    A running exe cannot delete itself, so hand the job to a detached shell
+    that waits for us to go away first."""
+    try:
+        bat = os.path.join(tempfile.gettempdir(), "syncplayer_uninstall.cmd")
+        with io.open(bat, "w", encoding="utf-8", newline="") as f:
+            f.write("@echo off" + CRLF)
+            # Windows may still hold the exe for a moment after we exit, so retry
+            # instead of giving up and leaving a folder with one file in it
+            f.write("for /L %%i in (1,1,40) do (" + CRLF)
+            f.write('  rmdir /s /q "%s" 2>nul' % folder + CRLF)
+            f.write('  if not exist "%s" goto done' % folder + CRLF)
+            f.write("  ping -n 2 127.0.0.1 >nul" + CRLF)
+            f.write(")" + CRLF)
+            f.write(":done" + CRLF)
+            f.write('del /f /q "%~f0"' + CRLF)
+        flags = (getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                 | getattr(subprocess, "DETACHED_PROCESS", 0))
+        subprocess.Popen(["cmd", "/c", bat], creationflags=flags)
+        return True
+    except Exception:
+        return False
+
+
+def _run_uninstall(silent=False):
+    """Uninstall SyncPlayer: shortcuts, Add/Remove Programs entry, program files.
+
+    Config (%APPDATA%\\SyncPlayer) and screenshots are deliberately kept - they
+    are the user's data, not the program."""
+    if not plat.IS_WIN:
+        print("The uninstaller is Windows-only; on Linux run ./uninstall.sh")
+        return 1
+    exe_dir, lnks, sm = _uninstall_targets()
+    managed = _is_managed_install(exe_dir)
+    if not silent:
+        try:
+            from tkinter import messagebox
+            extra = ("" if managed else
+                     "\n\n(This copy was not installed by Setup, so only its "
+                     "shortcuts and menu entry will be removed - the folder "
+                     "%s is left alone.)" % exe_dir)
+            if not messagebox.askyesno(
+                    APP_NAME,
+                    "Remove %s from this computer?\n\n%s%s\n\nYour saved config "
+                    "and screenshots are kept." % (APP_NAME, exe_dir, extra)):
+                return 1
+        except Exception:
+            pass
+    removed = []
+    # a running instance keeps its own exe locked, so close it first
+    if _close_other_instances():
+        removed.append("running instance")
+        time.sleep(1.0)
+    for p in lnks:
+        try:
+            if os.path.isfile(p):
+                os.remove(p)
+                removed.append(os.path.basename(p))
+        except Exception:
+            pass
+    try:
+        if os.path.isdir(sm) and not os.listdir(sm):
+            os.rmdir(sm)
+    except Exception:
+        pass
+    try:
+        import winreg
+        winreg.DeleteKey(winreg.HKEY_CURRENT_USER, _UNINSTALL_KEY)
+        removed.append("Add/Remove Programs entry")
+    except Exception:
+        pass
+    if managed and _spawn_folder_delete(exe_dir):
+        removed.append("program folder")
+    if not managed:
+        print("This copy was not installed by Setup (no install.json next "
+              "to the exe), so the folder %s was left alone." % exe_dir)
+    print("Uninstalled %s (%s)"
+          % (APP_NAME, ", ".join(removed) or "nothing to remove"))
+    if not silent:
+        try:
+            from tkinter import messagebox
+            messagebox.showinfo(
+                APP_NAME,
+                "%s has been uninstalled.\n\nYour config and screenshots "
+                "were kept." % APP_NAME)
+        except Exception:
+            pass
+    return 0
+
+
 def main():
     _install_crash_hook()
+    if "--uninstall" in sys.argv:
+        return _run_uninstall(silent="--silent" in sys.argv)
     if "--check-env" in sys.argv:
-        print(json.dumps(plat.diagnose(), indent=2))
+        _info = plat.diagnose()
+        _info["app"] = {
+            "version": APP_VERSION,
+            "frozen": bool(getattr(sys, "frozen", False)),
+            "drag_and_drop": _HAS_DND,     # tkinterdnd2 (video + subtitle drop)
+            "pillow": _HAS_PIL,            # visual crop snapshots
+        }
+        _emit_env_report(_info, sys.argv)
         return
     if plat.IS_WIN:
         try:  # keep the GUI sharp on HiDPI
