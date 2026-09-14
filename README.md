@@ -23,15 +23,17 @@ together for the whole runtime.**
 
 ### Windows
 
-1. **Install**: run `SyncPlayer-Setup.exe` and walk the wizard — it asks
-   **where** to install (default `%LOCALAPPDATA%\Programs\SyncPlayer`, so no
-   administrator prompt), **what** to install (SyncPlayer itself, a bundled
-   **mpv**, **yt-dlp** for URLs, and the update checker — each can be
-   switched off), and whether to add a **Desktop** and/or **Start Menu**
-   shortcut. Then launch it from that shortcut.
+1. **Install**: run `SyncPlayer-Setup.exe` and walk the wizard — the usual pages:
+   **Welcome** → **Destination** (default `%LOCALAPPDATA%\Programs\SyncPlayer`, so no
+   administrator prompt; it offers the folder of an existing install and updates that
+   copy in place) → **Start Menu Folder** (name it, or tick "Don't create a Start Menu
+   folder") → **Additional Tasks** (SyncPlayer itself, a bundled **mpv**, **yt-dlp**
+   for URLs and the update checker — each can be switched off — plus the Desktop
+   icon) → **Ready to Install** (a summary of your choices) → **Installing** → **Finish**
+   (with a "Launch SyncPlayer" checkbox).
 2. **Uninstall** any time from Windows *Apps & Features*, or the
-   *Uninstall SyncPlayer* entry in the Start-Menu folder. Your config and
-   screenshots are kept.
+   *Uninstall SyncPlayer* entry in the Start-Menu folder — it removes the Start Menu
+   folder you named, not just the default one. Your config and screenshots are kept.
 3. Unattended installs (scripts, imaging):
 
    ```
@@ -236,11 +238,11 @@ gui_test.py          # 211-check END-TO-END test: drives the real GUI + real
 installer.py         # Setup wizard (folder / components / shortcuts) + silent
                      # install + Add-Remove-Programs registration
 updater.py           # checks/installs latest SyncPlayer + mpv + yt-dlp releases
-install_test.py      # DEPLOYMENT test (Windows): runs the real installer (wizard
-                     # CLI: custom folder, per-component switches, shortcuts,
-                     # Add/Remove entry, uninstall), then verifies the installed
-                     # app plays TWO videos (one a YouTube link) using the
-                     # bundled mpv + yt-dlp
+install_test.py      # DEPLOYMENT test (Windows, 101 checks): drives the real wizard
+                     # page by page (footer visible on every page, refused protected folders, chosen folder,
+                     # custom Start-Menu folder, Add/Remove entry, uninstall) plus
+                     # the silent CLI, then verifies the installed app plays TWO
+                     # videos (one a YouTube link) using the bundled mpv + yt-dlp
 install.sh           # Linux installer (deps check, launcher, .desktop, yt-dlp)
 uninstall.sh         # Linux uninstaller
 install_test_linux.py# DEPLOYMENT test (Linux): install.sh, then TWO videos
@@ -268,13 +270,15 @@ python -m PyInstaller --noconfirm --clean --onefile --windowed \
   --name SyncPlayer-Updater --icon icon.ico updater.py
 
 # 3. installer (bundles the app exe + mpv distro + updater)
+#    icon.png is used by the wizard itself (header icon + window icon).
 cp dist/SyncPlayer.exe bundle/SyncPlayer.exe
 cp dist/SyncPlayer-Updater.exe bundle/SyncPlayer-Updater.exe
 python -m PyInstaller --noconfirm --clean --onefile --windowed \
   --name SyncPlayer-Setup --icon icon.ico installer.py \
   --add-data "bundle/SyncPlayer.exe;." \
   --add-data "bundle/SyncPlayer-Updater.exe;." \
-  --add-data "bundle/mpv;mpv"
+  --add-data "bundle/mpv;mpv" \
+  --add-data "icon.png;."
 ```
 
 The `bundle/mpv` dir is the extracted mpv Windows distro (not committed — it

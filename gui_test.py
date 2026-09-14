@@ -1128,8 +1128,11 @@ check("x: pip size - pane ready", bool(hwnd_p))
 
 
 def _pane_rect():
+    # Client area, not the window rect: for the first moments after embedding the
+    # pane still carries its pre-frameless border, and that frame (9 px here) would
+    # cancel out the height growth and fail these checks on a slow run.
     r = xw.RECT()
-    xu.GetWindowRect(hwnd_p, ctypes.byref(r))
+    xu.GetClientRect(hwnd_p, ctypes.byref(r))
     return r.right - r.left, r.bottom - r.top
 
 

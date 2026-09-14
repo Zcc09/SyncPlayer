@@ -295,7 +295,7 @@ def main():
 
     check("install: SyncPlayer.exe present", os.path.isfile(app))
     check("install: app version is 1.6.0",
-          get_exe_version(app) == "1.6.1", str(get_exe_version(app)))
+          get_exe_version(app) == "1.6.2", str(get_exe_version(app)))
     check("install: bundled mpv.exe present", os.path.isfile(mpv))
     check("install: bundled yt-dlp.exe present", os.path.isfile(ytdl))
     check("install: updater present", os.path.isfile(updater))
@@ -305,7 +305,7 @@ def main():
             state = json.load(open(ij))
         except Exception:
             pass
-    check("install: install.json app_version", state.get("app_version") == "1.6.1")
+    check("install: install.json app_version", state.get("app_version") == "1.6.2")
     check("install: install.json mpv_version", state.get("mpv_version") == "0.41.0")
 
     # The packaged app must report its own optional pieces: a windowed exe with
@@ -323,7 +323,7 @@ def main():
             env_app = (json.load(open(env_json)) or {}).get("app", {})
         except Exception:
             env_app = {}
-    check("install: packaged app reports its version", env_app.get("version") == "1.6.1",
+    check("install: packaged app reports its version", env_app.get("version") == "1.6.2",
           str(env_app)[:110])
     check("install: packaged app really has drag & drop (tkinterdnd2 bundled)",
           env_app.get("drag_and_drop") is True, str(env_app)[:110])
@@ -691,7 +691,7 @@ def main():
               "--uninstall" in str(regvals.get("UninstallString", "")),
               str(regvals.get("UninstallString")))
         check("wizard: Add/Remove entry carries the version",
-              str(regvals.get("DisplayVersion", "")) == "1.6.1",
+              str(regvals.get("DisplayVersion", "")) == "1.6.2",
               str(regvals.get("DisplayVersion")))
     check("wizard: install.json records which components went in",
           bool(state.get("mpv_installed")) and bool(state.get("ytdlp_installed"))
@@ -805,6 +805,181 @@ def main():
         check("uninstall: the Start Menu entry is removed", not os.path.isdir(sm_dir))
         check("uninstall: the Add/Remove entry is removed",
               reg_read(inst.UNINSTALL_KEY) is None)
+
+        # --- the wizard a user actually clicks through -----------------------
+        # The silent CLI above proves the payload handling; this drives the real
+        # wizard: every page in order, the footer on-screen on each one, and the
+        # folder / Start Menu name chosen in the wizard being the ones used.
+        # --- installing over an existing install (the wizard promises this) ---
+        up_dir = tempfile.mkdtemp(prefix="spdeploy_upg_")
+        rc1, _o1 = run([SETUP_EXE, "--silent", "--install-dir", up_dir, "--no-launch",
+                       "--no-shortcuts"], timeout=600)
+        v1 = get_exe_version(os.path.join(up_dir, "SyncPlayer.exe"))
+        rc2, _o2 = run([SETUP_EXE, "--silent", "--install-dir", up_dir, "--no-launch",
+                       "--no-shortcuts"], timeout=600)
+        v2 = get_exe_version(os.path.join(up_dir, "SyncPlayer.exe"))
+        check("upgrade: running Setup again over the same folder succeeds",
+              rc1 == 0 and rc2 == 0, "rc1=%s rc2=%s" % (rc1, rc2))
+        check("upgrade: the installed app version survives the second run",
+              v2 is not None and v2 == v1, "%s -> %s" % (v1, v2))
+        check("upgrade: the second run leaves a complete install",
+              os.path.isfile(os.path.join(up_dir, "SyncPlayer.exe"))
+              and os.path.isfile(os.path.join(up_dir, "install.json"))
+              and os.path.isdir(os.path.join(up_dir, "mpv")))
+        try:
+            _up_state = json.load(open(os.path.join(up_dir, "install.json")))
+        except Exception:
+            _up_state = {}
+        check("upgrade: it still reports the folder it was installed into",
+              os.path.normcase(_up_state.get("install_dir", ""))
+              == os.path.normcase(up_dir), str(_up_state.get("install_dir")))
+        try:                     # uninstall properly: it registered itself
+            run([os.path.join(up_dir, "SyncPlayer.exe"), "--uninstall", "--silent"],
+                timeout=180)
+        except Exception:
+            pass
+        shutil.rmtree(up_dir, ignore_errors=True)
+        _up_tries = 0
+        while os.path.isdir(up_dir) and _up_tries < 40:
+            _up_tries += 1
+            time.sleep(0.5)
+            shutil.rmtree(up_dir, ignore_errors=True)
+
+        import tkinter as _tk
+        import tkinter.messagebox as _mb
+        bundle_dir = os.path.join(BASE, "bundle")
+        wiz_dir = tempfile.mkdtemp(prefix="spdeploy_wiz_")
+        wiz_menu = "SyncPlayerWizardTest"
+        # Not withdrawn: the footer-visibility check below needs real mapping.
+        wroot = _tk.Tk()
+        wopts = inst.parse_options([])
+        wopts.install_dir = wiz_dir
+        wopts.startmenu_folder = wiz_menu
+        wopts.launch = False            # don't start the app at the end
+        # Driven from source the wizard would look for its payload beside
+        # installer.py (there is none - the real Setup has it in its onefile
+        # extraction dir), so point it at the same bundle the Setup is built
+        # from. A modal error box would also hang this test - silence it.
+        _real_resolve = inst.resolve_payloads
+        _modal_saved = {n: getattr(_mb, n) for n in
+                        ("showerror", "showwarning", "showinfo",
+                         "askyesno", "askokcancel")}
+        inst.resolve_payloads = lambda: (
+            os.path.join(bundle_dir, "SyncPlayer.exe"),
+            os.path.join(bundle_dir, "mpv"),
+            os.path.join(bundle_dir, "SyncPlayer-Updater.exe"))
+        # any modal box would block the walk (the fatal one used to hang the run)
+        _mb.showerror = lambda *a, **k: None
+        _mb.showwarning = lambda *a, **k: None
+        _mb.showinfo = lambda *a, **k: None
+        _mb.askyesno = lambda *a, **k: True
+        _mb.askokcancel = lambda *a, **k: True
+        check("wizard: the bundle used for the wizard test is present",
+              os.path.isfile(os.path.join(bundle_dir, "SyncPlayer.exe")),
+              bundle_dir)
+        wiz = inst.Wizard(wroot, wopts)
+        wroot.update()
+        order = []
+        footer_ok = True
+        protected_tried = [False]
+        protected_stayed = [False]
+        last = None
+        deadline = time.time() + 300
+        while time.time() < deadline:
+            name = wiz.PAGES[wiz.page]
+            if name != last:                    # record transitions, not ticks
+                order.append(name)
+                last = name
+            wroot.update_idletasks()
+            win_bottom = wroot.winfo_rooty() + wroot.winfo_height()
+            footer_ok = footer_ok and bool(wiz.btn_next.winfo_ismapped()) and (
+                wiz.btn_next.winfo_rooty() + wiz.btn_next.winfo_height()
+                <= win_bottom + 1)
+            if name == "dest":
+                if not protected_tried[0]:
+                    # a protected folder must be refused HERE, not fail mid-copy
+                    protected_tried[0] = True
+                    wiz.dir_var.set(os.path.join(
+                        os.environ.get("ProgramFiles", "C:\\Program Files"),
+                        "SyncPlayerTest"))
+                    wiz.btn_next.invoke()
+                    wroot.update()
+                    protected_stayed[0] = (wiz.PAGES[wiz.page] == "dest")
+                wiz.dir_var.set(wiz_dir)
+                wiz.btn_next.invoke()
+            elif name == "startmenu":
+                wiz.smf_var.set(wiz_menu)
+                wiz.btn_next.invoke()
+            elif name == "finish":
+                break
+            elif name == "installing":
+                # the worker is copying files / creating shortcuts: let it finish
+                # (Next is disabled here; waiting for the finish page is what a
+                # user experiences)
+                pass
+            else:
+                wiz.btn_next.invoke()
+            wroot.update()
+            time.sleep(0.15)
+        check("wizard: pages follow the standard order",
+              [x for x in order if x != "license"]
+              == ["welcome", "dest", "startmenu", "tasks", "ready", "installing",
+                  "finish"], str(order))
+        check("wizard: refuses a protected destination, staying on the page",
+              protected_stayed[0], str(order))
+        check("wizard: the footer stays visible on every page", footer_ok)
+        check("wizard: it reaches the finish page with no error",
+              wiz.PAGES[wiz.page] == "finish" and wiz.state is not None
+              and not wiz.error, "page=%s error=%s" % (wiz.PAGES[wiz.page], wiz.error))
+        check("wizard: installed into the folder chosen in the wizard",
+              os.path.isfile(os.path.join(wiz_dir, "SyncPlayer.exe")))
+        check("wizard: reports the shortcuts it created",
+              sorted((wiz.state or {}).get("shortcuts") or [])
+              == ["desktop", "startmenu", "startmenu-uninstall",
+                  "startmenu-updater"], str((wiz.state or {}).get("shortcuts")))
+        check("wizard: created the Start Menu folder that was typed in",
+              os.path.isfile(os.path.join(inst.startmenu_dir(wiz_menu),
+                                          "SyncPlayer.lnk")),
+              inst.startmenu_dir(wiz_menu))
+        wiz_state = {}
+        try:
+            wiz_state = json.load(open(os.path.join(wiz_dir, "install.json")))
+        except Exception:
+            pass
+        check("wizard: install.json records the Start Menu folder",
+              wiz_state.get("startmenu_folder") == wiz_menu,
+              str(wiz_state.get("startmenu_folder")))
+        check("wizard: the desktop shortcut points at the wizard's install",
+              os.path.normcase(lnk_target(desk_lnk))
+              == os.path.normcase(os.path.join(wiz_dir, "SyncPlayer.exe")),
+              lnk_target(desk_lnk))
+        check("wizard: the Add/Remove entry follows the wizard's folder",
+              os.path.normcase(str((reg_read(inst.UNINSTALL_KEY) or {}).get(
+                  "InstallLocation", ""))) == os.path.normcase(wiz_dir),
+              str((reg_read(inst.UNINSTALL_KEY) or {}).get("InstallLocation")))
+        try:
+            wroot.destroy()
+        except Exception:
+            pass
+        rc, out = run([os.path.join(wiz_dir, "SyncPlayer.exe"), "--uninstall",
+                       "--silent"], timeout=180)
+        gone = False
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            if not os.path.isdir(wiz_dir):
+                gone = True
+                break
+            time.sleep(0.5)
+        check("wizard uninstall: removes the install the wizard created", gone,
+              "still there: %s" % wiz_dir if not gone else "")
+        check("wizard uninstall: removes the custom Start Menu folder",
+              not os.path.isdir(inst.startmenu_dir(wiz_menu)),
+              inst.startmenu_dir(wiz_menu))
+        inst.resolve_payloads = _real_resolve
+        for _n, _f in _modal_saved.items():
+            setattr(_mb, _n, _f)
+        shutil.rmtree(wiz_dir, ignore_errors=True)
+
     finally:
         restore_real_shortcuts(saved_lnks)
 
