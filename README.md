@@ -15,6 +15,7 @@ together for the whole runtime.**
 | 🖱 **Drag & drop** | Drop one or two video files straight onto the window to fill the source slots — or drop a **subtitle file** (`.srt/.ass/.vtt/…`) to attach it to a feed. A subtitle named after a video (`movie.mp4` + `movie.srt`) goes to that video automatically. |
 | 🔊 **Audio** | Independent volume slider + mute per video, plus a master volume scaling both. |
 | 🎵 **Tracks** | Per-video **audio** and **subtitle** pickers (built from each file's own track list; Off disables). |
+| ⬇ **Download** | Sits in the **Reaction** row: pick a quality (listed by yt-dlp itself, *Best available* on top) and the video is saved to `%USERPROFILE%\Downloads\SyncPlayer`, then the reaction is repointed at that local file - downloaded reactions cannot stall mid-take the way a stream can. Without ffmpeg only single-file formats are offered (usually up to 720p); with it, separate video+audio streams are merged for full quality. |
 | 🎛 **Transport** | ±10 s jumps, restart, close, screenshots of both videos; **speed** editable (type 1.35 and Enter) with ±0.05 nudge buttons. |
 | 🧷 **Remembers the alignment** | The Movie↔Reaction offset is saved **per source pair**: next time you load the same two videos, the reaction is already on its spot. The `🔗 Align` button shows the stored offset — click it to forget it, or after re-aligning to store the new one. |
 | 💾 **Persistence** | Paths, volumes, speed **and remembered alignments** saved between sessions. |
@@ -83,6 +84,15 @@ syncplayer --check-env           # verify mpv, yt-dlp, window backend, paths
 
 > URLs: paste a YouTube link into either source. It streams via mpv's
 > built-in yt-dlp (no download needed).
+
+> **Visual crop** grabs a frame from the feed it targets. If the source is still
+> opening or buffering (or the player window is minimised) it now waits for a
+> decoded frame and retries through mpv's software and window screenshot paths,
+> saying what went wrong instead of a bare "could not capture frame" - and it never
+> pauses or steps your video to do it.
+
+> **Swap** (movie ⇄ reaction) is on **Ctrl+Shift+S**; the reaction row's button is
+> the Download button now.
 
 ## Keyboard shortcuts (panel)
 
@@ -222,12 +232,12 @@ syncplayer.py        # the whole app (panel + two mpv drivers + sync loop)
 sp_plat.py           # platform layer: Win32 + X11 window backends, mpv/yt-dlp
                      # discovery, IPC transport (named pipe / unix socket),
                      # config + screenshot locations
-selftest.py          # 67-check headless verification (python selftest.py)
+selftest.py          # 82-check headless verification (python selftest.py)
 selftest_plat.py     # 21-check platform layer: paths, discovery, real mpv IPC
                      # round trip (runs on Windows AND Linux)
 selftest_x11.py      # 17-check Linux/X11 window features against two REAL mpv
                      # windows (find/arrange/borderless/ontop/embed/undock)
-gui_test.py          # 211-check END-TO-END test: drives the real GUI + real
+gui_test.py          # 222-check END-TO-END test: drives the real GUI + real
                      # mpv processes (python gui_test.py) — bars track, per-
                      # video seeks, drift correction (rate trim + seek), volume
                      # read-back from mpv, speed, pause, Sync Lock, PiP, frame-

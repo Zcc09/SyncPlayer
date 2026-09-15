@@ -1277,6 +1277,144 @@ new_files = after - before
 check("screenshot: two PNGs created", len([f for f in new_files if f.endswith(".png")]) >= 2,
       "new=%s" % sorted(new_files)[:4])
 
+# ------------------------------------------ 12b. download the reaction -----
+# The reaction row's Download button: yt-dlp fetches the video at a chosen
+# quality and the reaction source is repointed at the local file. Served from
+# http://127.0.0.1 so the test needs no internet.
+import functools as _ft
+import http.server as _http
+import socketserver as _sock
+import socket as _sockmod
+import threading as _th
+
+_btn_texts = []
+
+
+def _walk(w):
+    for _c in w.winfo_children():
+        try:
+            if _c.winfo_class() in ("TButton", "Button"):
+                _btn_texts.append(str(_c.cget("text")))
+        except Exception:
+            pass
+        _walk(_c)
+
+
+_walk(app.root)
+check("download: the reaction row has a Download button",
+      any("Download" in x for x in _btn_texts),
+      str([x for x in _btn_texts if "Download" in x]))
+check("download: the old Swap button is gone from the rows",
+      not any("Swap" in x for x in _btn_texts),
+      str([x for x in _btn_texts if "Swap" in x]))
+_binds = [str(b) for b in app.root.bind()]        # every sequence Tk knows
+check("download: Swap is still reachable on Ctrl+Shift+S",
+      any("Control" in b and "-S" in b for b in _binds),
+      str([b for b in _binds if "Control" in b])[:120])
+check("download: yt-dlp is found for the download path", bool(sp.plat.find_ytdl())
+      if hasattr(sp, "plat") else True, "")
+
+_s = _sockmod.socket()
+_s.bind(("127.0.0.1", 0))
+_port = _s.getsockname()[1]
+_s.close()
+_httpd = _sock.TCPServer(("127.0.0.1", _port),
+                         _ft.partial(_http.SimpleHTTPRequestHandler,
+                                     directory=os.path.join(BASE, "testmedia")))
+_th.Thread(target=_httpd.serve_forever, daemon=True).start()
+_url = "http://127.0.0.1:%d/movie.mp4" % _port
+
+_dest = sp.plat.downloads_dir()
+os.makedirs(_dest, exist_ok=True)
+_lines = []
+_ok_dl, _path, _tail = sp.ytdl_download(_url, "b", _dest, sp.plat.find_ytdl(),
+                                        ffmpeg=sp.find_ffmpeg(),
+                                        on_line=lambda l: _lines.append(l))
+check("download: a real download completes and names a real file",
+      _ok_dl and _path and os.path.isfile(_path) and os.path.getsize(_path) > 1000,
+      "%s (%s bytes)" % (_path, os.path.getsize(_path) if _path and
+                         os.path.isfile(_path) else 0))
+check("download: the path it returns is a full path, drive letter included",
+      bool(_path) and os.path.isabs(_path) and ":" in os.path.splitdrive(_path)[0],
+      str(_path))
+check("download: yt-dlp progress was streamed so the UI can show it",
+      any("[download]" in l for l in _lines), str(_lines[:1]))
+check("download: a second run over the same URL reuses the file instead of failing",
+      sp.ytdl_download(_url, "b", _dest, sp.plat.find_ytdl(),
+                       ffmpeg=sp.find_ffmpeg())[0])
+
+# through the dialog, which is what a user clicks. The row's value is restored
+# afterwards: later checks read the config this app saves on close.
+_reaction_before = app.react_path.get()
+app.react_path.set(_url)
+_dlg = sp.DownloadDialog(app.root, app, _url, on_done=app._downloaded_reaction)
+_started = [False]
+_deadline = time.time() + 240
+while time.time() < _deadline:
+    pump(0.3)
+    if not _started[0] and _dlg.entries:
+        _dlg.listbox.selection_set(0)
+        _dlg.start()
+        _started[0] = True
+    if _started[0] and not _dlg.busy and app.react_path.get() != _url:
+        break
+check("download: downloading from the dialog repoints the reaction at the file",
+      os.path.isfile(app.react_path.get()), app.react_path.get()[:90])
+check("download: and that file is inside the downloads folder",
+      os.path.normcase(os.path.dirname(app.react_path.get()))
+      == os.path.normcase(_dest), os.path.dirname(app.react_path.get()))
+try:
+    _dlg.destroy()
+except Exception:
+    pass
+app.react_path.set(_reaction_before)
+pump(0.3)
+try:
+    _httpd.shutdown()
+except Exception:
+    pass
+
+# ------------------------------------------------- 12c. frame capture -------
+# The visual-crop capture must work in the states a user actually crops in and
+# must never disturb playback.
+_pa = app.players["A"]
+_pa.cmd({"command": ["set_property", "pause", "yes"]})
+pump(0.5)
+_paused_before = _pa.paused
+_snap = os.path.join(sp.SHOT_DIR, "_gui_capture_%d.png" % int(time.time()))
+_ok_c, _why_c = _pa.capture_frame(_snap)
+check("capture: a paused feed yields a frame (%s)" % _why_c,
+      _ok_c and os.path.isfile(_snap) and os.path.getsize(_snap) > 1000,
+      "%s bytes" % (os.path.getsize(_snap) if os.path.isfile(_snap) else 0))
+if os.path.isfile(_snap):
+    os.remove(_snap)
+_pa.cmd({"command": ["set_property", "pause", "no"]})
+pump(1.0)
+_snap2 = os.path.join(sp.SHOT_DIR, "_gui_capture2_%d.png" % int(time.time()))
+_ok_c2, _why_c2 = _pa.capture_frame(_snap2)
+check("capture: a playing feed yields a frame (%s)" % _why_c2,
+      _ok_c2 and os.path.isfile(_snap2))
+if os.path.isfile(_snap2):
+    os.remove(_snap2)
+_pa.cmd({"command": ["seek", 11.8, "absolute"]})
+pump(2.0)
+_pa.cmd({"command": ["set_property", "pause", "yes"]})
+pump(0.5)
+_snap3 = os.path.join(sp.SHOT_DIR, "_gui_capture3_%d.png" % int(time.time()))
+_ok_c3, _why_c3 = _pa.capture_frame(_snap3)
+check("capture: a feed at EOF yields a frame (%s)" % _why_c3,
+      _ok_c3 and os.path.isfile(_snap3))
+if os.path.isfile(_snap3):
+    os.remove(_snap3)
+_state_before_bad = _pa.paused
+_ok_bad, _why_bad = _pa.capture_frame(
+    os.path.join(BASE, "no_such_dir_for_test", "_x.png"), timeout=3.0)
+check("capture: an impossible destination fails with a reason, not a crash",
+      (not _ok_bad) and bool(_why_bad), str(_why_bad)[:90])
+check("capture: a failed capture leaves playback state exactly as it was",
+      _pa.paused == _state_before_bad,
+      "paused=%s (was %s)" % (_pa.paused, _state_before_bad))
+
 # ------------------------------------------------------- 13. clean close --
 config_path = sp.CONFIG_PATH
 app._on_close()

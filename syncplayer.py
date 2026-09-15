@@ -57,7 +57,7 @@ from tkinter import ttk, filedialog, messagebox
 import sp_plat as plat   # cross-platform: paths, mpv IPC, window control
 
 APP_NAME = "SyncPlayer"
-APP_VERSION = "1.6.2"
+APP_VERSION = "1.6.3"
 
 
 class MpvNotFoundError(Exception):
@@ -540,6 +540,27 @@ def micro_rate(drift_s, deadband=MICRO_DEADBAND, max_pct=MICRO_MAX_PCT,
     return 1.0 + delta
 
 
+def _mpv_log_tail(tag, lines=2):
+    """Last lines of mpv's own log for one feed, for failure messages."""
+    try:
+        path = os.path.join(SHOT_DIR, "mpv_%s.log" % tag)
+        with io.open(path, "r", encoding="utf-8", errors="replace") as f:
+            tail = [l.strip() for l in f.readlines() if l.strip()]
+        return " / ".join(tail[-lines:])[:200]
+    except Exception:
+        return ""
+
+
+def _diag(text):
+    """Append one line to the diagnostics file (never shown to the user)."""
+    try:
+        with io.open(os.path.join(SHOT_DIR, "syncplayer_diag.txt"), "a",
+                     encoding="utf-8") as f:
+            f.write("%s  %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), text))
+    except Exception:
+        pass
+
+
 def is_subtitle_file(path):
     p = (path or "").strip().lower()
     return p.endswith(SUBTITLE_EXTS)
@@ -693,7 +714,7 @@ class MpvDriver:
                 "--keep-open=yes",
                 "--keepaspect=yes",
                 "--keepaspect-window=no",   # free-form window resize (no aspect snap)
-                "--hwdec=safe",
+                "--hwdec=auto-safe",   # mpv 0.41 dropped the old "safe"
                 "--fs=no",
                 "--ytdl=yes",
                 "--volume-max=150",
@@ -935,6 +956,89 @@ class MpvDriver:
             if err == "property-unavailable":
                 return err, data         # id-less reply: no match possible
         return None, None
+
+    def command_sync(self, cmd, timeout=5.0):
+        """Run one IPC command and return mpv's own (error, data) reply."""
+        if not (self.ipc and self.ipc.connected and self.running):
+            return "not-running", None
+        rid = self._next_rid
+        self._next_rid += 1
+        self._cmdq.put({"command": list(cmd), "request_id": rid})
+        dl = time.monotonic() + timeout
+        while time.monotonic() < dl:
+            try:
+                rid2, err, data = self.rq.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if rid2 == rid:
+                return err, data
+            if err == "property-unavailable":
+                return err, data
+        return "timeout", None
+
+    def capture_frame(self, path, timeout=8.0):
+        """Grab a full video frame to `path`; returns (ok, reason).
+
+        The visual-crop tool must not fail just because the source was still
+        opening or the GPU screenshot path hiccuped, so this waits for a decoded
+        frame and then escalates:
+            screenshot-to-file video  ->  software screenshots  ->  window mode
+        It never changes playback state (no pause toggling, no frame stepping) -
+        stealing the user's pause would be worse than the failure it fixes.
+        `reason` is mpv's own error text, or "no-file" when mpv claimed success.
+        """
+        def file_ok():
+            try:
+                return os.path.isfile(path) and os.path.getsize(path) > 1000
+            except Exception:
+                return False
+
+        def attempt(mode):
+            if os.path.isfile(path):
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+            err, _ = self.command_sync(["screenshot-to-file", path, mode],
+                                       timeout=4.0)
+            dl = time.monotonic() + 2.0
+            while time.monotonic() < dl:
+                if file_ok():
+                    return True, "ok"
+                time.sleep(0.05)
+            return False, (err if err not in (None, "success") else "no-file")
+
+        # wait for something decodable: a URL that is still buffering has no frame
+        dl = time.monotonic() + min(4.0, timeout * 0.5)
+        while time.monotonic() < dl:
+            err, vfmt = self.get_property("video-format", timeout=1.0)
+            if err == "success" and vfmt:
+                break
+            time.sleep(0.2)
+        if os.path.isfile(path) and file_ok():
+            return True, "ok"
+
+        reasons = []
+        ok, why = attempt("video")
+        if ok:
+            return True, "ok"
+        reasons.append("video=%s" % why)
+
+        prev = self.get_property("screenshot-sw", timeout=1.0)[1]
+        self.command_sync(["set_property", "screenshot-sw", "yes"], timeout=3.0)
+        ok, why = attempt("video")
+        if prev is not None:
+            self.command_sync(["set_property", "screenshot-sw",
+                               "yes" if prev else "no"], timeout=3.0)
+        if ok:
+            return True, "ok(software)"
+        reasons.append("software=%s" % why)
+
+        ok, why = attempt("window")
+        if ok:
+            return True, "ok(window)"
+        reasons.append("window=%s" % why)
+        return False, " ".join(reasons)
 
     def track_list(self):
         err, tl = self.get_property("track-list")
@@ -1386,6 +1490,399 @@ class VisualCropDialog(tk.Toplevel):
         self.destroy()
 
 
+def find_ffmpeg():
+    """Locate ffmpeg. yt-dlp needs it to merge separate video+audio streams, which
+    is how anything above ~720p is published; without it we offer single-file
+    formats only instead of failing after a download."""
+    env = os.environ.get("FFMPEG_PATH")
+    if env and os.path.isfile(env):
+        return env
+    w = shutil.which("ffmpeg")
+    if w:
+        return w
+    for exe in (plat.find_ytdl(), plat.find_mpv()):
+        if not exe:
+            continue
+        base = os.path.dirname(exe)
+        for name in ("ffmpeg.exe", "ffmpeg"):
+            cand = os.path.join(base, name)
+            if os.path.isfile(cand):
+                return cand
+    return None
+
+
+def _fmt_size(nbytes):
+    if not nbytes:
+        return ""
+    mb = nbytes / 1048576.0
+    return "~%.0f MB" % mb if mb < 1024 else "~%.1f GB" % (mb / 1024.0)
+
+
+def ytdl_formats(url, ytdlp, ffmpeg=None, timeout=120):
+    """Ask yt-dlp what this URL offers. Returns (entries, error).
+
+    entries are ordered best-first and each is
+    {"label": ..., "fmt": <yt-dlp -f selector>, "height": int}.
+    Heights that only exist as separate video+audio streams are skipped when
+    ffmpeg is missing, because they could never be merged into a playable file.
+    """
+    try:
+        out = subprocess.run(
+            [ytdlp, "-J", "--no-playlist", "--no-warnings", "--socket-timeout", "20",
+             url], capture_output=True, text=True, timeout=timeout,
+            **plat.run_extra())
+    except Exception as e:
+        return [], "could not ask yt-dlp: %s" % e
+    if out.returncode != 0 or not (out.stdout or "").strip():
+        tail = (out.stderr or out.stdout or "yt-dlp failed").strip().splitlines()
+        return [], (tail[-1] if tail else "yt-dlp failed")
+    try:
+        info = json.loads(out.stdout)
+    except Exception:
+        return [], "yt-dlp's reply was not readable"
+    entries = _formats_to_entries(info, ffmpeg)
+    if not entries:
+        return [], "yt-dlp listed no usable video format for this URL"
+    return entries, None
+
+
+def _formats_to_entries(info, ffmpeg=None):
+    """Build the quality list from yt-dlp's JSON. Pure, so it is testable.
+
+    Best-first, always led by an automatic choice. A height that is only
+    published as separate video+audio streams is skipped without ffmpeg, because
+    it could never be merged into a playable file.
+    """
+    formats = (info or {}).get("formats") or []
+    vids = [f for f in formats
+            if (f.get("vcodec") or "none") != "none" and f.get("height")]
+    auds = [f for f in formats
+            if (f.get("vcodec") or "none") == "none"
+            and (f.get("acodec") or "none") != "none"]
+    best_audio = max(auds, key=lambda f: (f.get("abr") or f.get("tbr") or 0),
+                     default=None)
+
+    entries = [{"label": "Best available (auto)" + ("" if ffmpeg
+                                                    else " - single file only"),
+                "fmt": "bv*+ba/b" if ffmpeg else "b",
+                "height": 0}]
+    for h in sorted({int(f["height"]) for f in vids}, reverse=True):
+        cands = [f for f in vids if int(f["height"]) == h]
+        cands.sort(key=lambda f: (f.get("ext") == "mp4", f.get("fps") or 0,
+                                  f.get("tbr") or 0), reverse=True)
+        v = cands[0]
+        muxed = (v.get("acodec") or "none") != "none"
+        if not muxed and not (ffmpeg and best_audio):
+            continue
+        fmt = v["format_id"] if muxed else "%s+%s" % (v["format_id"],
+                                                      best_audio["format_id"])
+        bits = ["%dp" % h, v.get("ext") or "?"]
+        if v.get("fps"):
+            bits.append("%gfps" % v["fps"])
+        size = _fmt_size(v.get("filesize") or v.get("filesize_approx"))
+        if size:
+            bits.append(size)
+        if not muxed:
+            bits.append("video+audio")
+        entries.append({"label": " \u00b7 ".join(bits), "fmt": fmt, "height": h})
+    return entries if len(entries) > 1 else []
+
+
+def _download_path_from_line(line):
+    """Pull (path, was_already_on_disk) out of one yt-dlp output line.
+
+    Never split on ":" - that hits the drive letter of "C:\\...".
+    """
+    if "has already been downloaded" in line:
+        got = line.split("[download]", 1)[-1].strip()
+        suffix = " has already been downloaded"
+        if got.endswith(suffix):
+            return got[:-len(suffix)].strip().strip('"'), True
+        return None, False
+    for marker in ("[download] Destination: ", "Merging formats into "):
+        if marker in line:
+            return line.split(marker, 1)[1].strip().strip('"').strip(), False
+    return None, False
+
+
+def ytdl_download(url, fmt, dest_dir, ytdlp, ffmpeg=None, on_line=None, cancel=None):
+    """Download `url` as `fmt` into `dest_dir`.
+
+    Returns (ok, path_or_None, tail_lines). on_line(line) receives yt-dlp's own
+    output so a dialog can show real progress; `cancel` (threading.Event) kills it.
+    """
+    try:
+        os.makedirs(dest_dir, exist_ok=True)
+    except Exception as e:
+        return False, None, ["cannot create %s: %s" % (dest_dir, e)]
+    before = set()
+    try:
+        before = set(os.listdir(dest_dir))
+    except Exception:
+        pass
+    args = [ytdlp, "--no-playlist", "--newline", "--no-warnings",
+            "--socket-timeout", "30", "-f", fmt, "-P", dest_dir,
+            "-o", "%(title).120B [%(id)s].%(ext)s"]
+    if ffmpeg:
+        args += ["--merge-output-format", "mp4"]
+    args.append(url)
+
+    tail, final, already = [], None, False
+    try:
+        proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, encoding="utf-8", errors="replace",
+                                bufsize=1, **plat.popen_extra())
+    except Exception as e:
+        return False, None, ["cannot start yt-dlp: %s" % e]
+
+    for line in proc.stdout:
+        line = line.rstrip()
+        if not line:
+            continue
+        tail.append(line)
+        del tail[:-60]
+        if on_line:
+            try:
+                on_line(line)
+            except Exception:
+                pass
+        if cancel is not None and cancel.is_set():
+            proc.kill()
+            break
+        got, was_already = _download_path_from_line(line)
+        if got:
+            final = got
+            already = already or was_already
+            if was_already:
+                tail.append("(already on disk: %s)" % got)
+    try:
+        proc.wait(timeout=30)
+    except Exception:
+        proc.kill()
+    if cancel is not None and cancel.is_set():
+        return False, None, tail + ["cancelled"]
+
+    if not (final and os.path.isfile(final)):
+        # yt-dlp's own line is the quickest route; fall back to whatever is new
+        try:
+            new = [os.path.join(dest_dir, f) for f in os.listdir(dest_dir)
+                   if f not in before]
+            new = [p for p in new if os.path.isfile(p)]
+            if new:
+                final = max(new, key=os.path.getmtime)
+        except Exception:
+            pass
+    ok = bool(final and os.path.isfile(final))
+    return ok, (final if ok else None), tail
+
+
+class DownloadDialog(tk.Toplevel):
+    """Pick a quality, download the video, and hand the local file back.
+
+    Local playback is the point: a reaction streamed from the network stalls, a
+    downloaded one cannot.
+    """
+
+    def __init__(self, master, app, url, on_done=None):
+        tk.Toplevel.__init__(self, master)
+        self.app = app
+        self.url = url
+        self.on_done = on_done
+        self.entries = []
+        self.cancel = threading.Event()
+        self.q = queue.Queue()
+        self.busy = False
+        self.ytdlp = plat.find_ytdl()
+        self.ffmpeg = find_ffmpeg()
+        self.dest = plat.downloads_dir()
+
+        self.title("Download for %s" % APP_NAME)
+        self.configure(bg="#16181d")
+        self.geometry("640x460")
+        self.minsize(560, 400)
+        self.transient(master)
+
+        tk.Label(self, text="Download this video for local playback (no buffering)",
+                 bg="#16181d", fg="#e8e8ea",
+                 font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=12, pady=(10, 2))
+        tk.Label(self, text=url, bg="#16181d", fg="#8a8f9a", wraplength=600,
+                 justify="left").pack(anchor="w", padx=12)
+        self.note = tk.Label(self, text="", bg="#16181d", fg="#e0b050",
+                             wraplength=600, justify="left")
+        self.note.pack(anchor="w", padx=12, pady=(4, 0))
+
+        mid = tk.Frame(self, bg="#16181d")
+        mid.pack(fill="both", expand=True, padx=12, pady=(8, 0))
+        self.listbox = tk.Listbox(mid, bg="#1f232b", fg="#e8e8ea", height=8,
+                                  selectbackground="#2c5a9e", selectforeground="#ffffff",
+                                  highlightthickness=1, highlightbackground="#3a4150",
+                                  activestyle="none", exportselection=False)
+        sb = ttk.Scrollbar(mid, orient="vertical", command=self.listbox.yview)
+        self.listbox.configure(yscrollcommand=sb.set)
+        self.listbox.pack(side="left", fill="both", expand=True)
+        sb.pack(side="left", fill="y")
+
+        self.bar = ttk.Progressbar(self, mode="determinate", maximum=100, value=0)
+        self.bar.pack(fill="x", padx=12, pady=(10, 2))
+        self.status = tk.Label(self, text="Asking yt-dlp what this URL offers\u2026",
+                               bg="#16181d", fg="#8a8f9a", anchor="w")
+        self.status.pack(fill="x", padx=12)
+        self.log = tk.Text(self, height=5, bg="#12141a", fg="#9aa0ac",
+                           insertbackground="#e8e8ea", relief="flat", wrap="none")
+        self.log.pack(fill="both", expand=False, padx=12, pady=(6, 0))
+
+        btns = tk.Frame(self, bg="#16181d")
+        btns.pack(fill="x", padx=12, pady=10)
+        self.btn_go = ttk.Button(btns, text="Download", style="Accent.TButton",
+                                 width=12, command=self.start)
+        self.btn_go.pack(side="right")
+        self.btn_close = ttk.Button(btns, text="Close", width=10, command=self.close)
+        self.btn_close.pack(side="right", padx=(0, 6))
+        self.btn_cancel = ttk.Button(btns, text="Cancel", width=10, command=self.cancel_dl)
+        self.btn_cancel.pack(side="right", padx=(0, 6))
+        self.btn_cancel.state(["disabled"])
+
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        self.bind("<Escape>", lambda e: self.close())
+        if self.ffmpeg:
+            self.note.config(text="Saving to %s\nffmpeg found - full quality "
+                                  "(separate video+audio streams are merged)."
+                                  % self.dest, fg="#8a8f9a")
+        else:
+            self.note.config(text="Saving to %s\nffmpeg was not found, so only "
+                                  "single-file formats can be saved (usually up to "
+                                  "720p). Install ffmpeg for full quality."
+                                  % self.dest, fg="#e0b050")
+
+        self._load_formats()
+        try:
+            self.grab_set()
+        except Exception:
+            pass
+        self.after(120, self._pump)
+
+    # -- formats ----------------------------------------------------------
+    def _load_formats(self):
+        if not self.ytdlp:
+            self.status.config(text="yt-dlp was not found - downloads are unavailable.")
+            self.btn_go.state(["disabled"])
+            return
+
+        def work():
+            entries, err = ytdl_formats(self.url, self.ytdlp, ffmpeg=self.ffmpeg)
+            self.q.put(("formats", entries, err))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _fill(self, entries, err):
+        self.listbox.delete(0, "end")
+        if err or not entries:
+            self.status.config(text="Could not list qualities: %s" % (err or "none"))
+            self.log.insert("end", "Falling back to \"Best available\".\n")
+            self.entries = [{"label": "Best available (auto)",
+                             "fmt": "bv*+ba/b" if self.ffmpeg else "b", "height": 0}]
+        else:
+            self.entries = entries
+            self.status.config(text="Pick a quality, then Download.")
+        for e in self.entries:
+            self.listbox.insert("end", "  " + e["label"])
+        if self.entries:
+            self.listbox.selection_set(0)
+
+    # -- download ---------------------------------------------------------
+    def start(self):
+        if self.busy or not self.entries:
+            return
+        sel = self.listbox.curselection()
+        if not sel:
+            self.status.config(text="Pick a quality first.")
+            return
+        entry = self.entries[sel[0]]
+        self.busy = True
+        self.cancel.clear()
+        self.btn_go.state(["disabled"])
+        self.btn_cancel.state(["!disabled"])
+        self.bar.configure(value=0)
+        self.status.config(text="Downloading %s\u2026" % entry["label"])
+        self.log.insert("end", "> yt-dlp -f %s\n" % entry["fmt"])
+        self.log.see("end")
+
+        def on_line(line):
+            m = re.search(r"\[download\]\s+([\d.]+)%", line)
+            pct = float(m.group(1)) if m else None
+            self.q.put(("line", line, pct))
+
+        def work():
+            ok, path, tail = ytdl_download(self.url, entry["fmt"], self.dest,
+                                           self.ytdlp, ffmpeg=self.ffmpeg,
+                                           on_line=on_line, cancel=self.cancel)
+            self.q.put(("done", ok, path, tail))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def cancel_dl(self):
+        if self.busy:
+            self.cancel.set()
+            self.status.config(text="Cancelling\u2026")
+
+    def _pump(self):
+        try:
+            while True:
+                item = self.q.get_nowait()
+                kind = item[0]
+                if kind == "formats":
+                    self._fill(item[1], item[2])
+                elif kind == "line":
+                    line, pct = item[1], item[2]
+                    if pct is not None:
+                        self.bar.configure(value=pct)
+                    self.log.insert("end", line + "\n")
+                    if int(self.log.index("end-1c").split(".")[0]) > 400:
+                        self.log.delete("1.0", "100.0")
+                    self.log.see("end")
+                elif kind == "done":
+                    self._finish(item[1], item[2], item[3])
+        except queue.Empty:
+            pass
+        try:
+            if self.winfo_exists():
+                self.after(120, self._pump)
+        except Exception:
+            pass
+
+    def _finish(self, ok, path, tail):
+        self.busy = False
+        self.btn_go.state(["!disabled"])
+        self.btn_cancel.state(["disabled"])
+        if ok:
+            self.bar.configure(value=100)
+            self.status.config(text="Saved to %s" % path)
+            self.log.insert("end", "Saved: %s\n" % path)
+            self.log.see("end")
+            if self.on_done:
+                try:
+                    self.on_done(path)
+                except Exception:
+                    pass
+        else:
+            last = [l for l in (tail or []) if l.strip()][-1:] or ["no output"]
+            self.status.config(text="Download failed: %s" % last[0][:160])
+            self.log.insert("end", last[0] + "\n")
+            self.log.see("end")
+
+    def close(self):
+        if self.busy:
+            if not messagebox.askyesno(APP_NAME,
+                                       "A download is still running. Stop it and close?"):
+                return
+            self.cancel.set()
+        try:
+            if self.winfo_exists():
+                self.destroy()
+        except Exception:
+            pass
+
+
 class SyncApp:
     def __init__(self, root):
         self.root = root
@@ -1518,6 +2015,9 @@ class SyncApp:
         style.map("Accent.TButton", background=[("active", "#3a6fc0")])
         style.configure("TScale", background=bg, troughcolor="#2a2f3a")
         style.configure("Horizontal.TScale", background=bg)
+        style.configure("Horizontal.TProgressbar", background=accent,
+                        troughcolor="#12141a", bordercolor="#3a4150",
+                        lightcolor=accent, darkcolor=accent)
         style.configure("TRadiobutton", background=bg, foreground=fg)
         style.configure("TCheckbutton", background=bg, foreground=fg)
         style.configure("TLabelframe", background=bg, foreground=fg, bordercolor="#3a4150")
@@ -1574,7 +2074,11 @@ class SyncApp:
         ttk.Entry(row, textvariable=self.react_path).pack(side="left", fill="x", expand=True)
         ttk.Button(row, text="Browse…", width=9, command=lambda: self._browse(1)).pack(side="left", padx=(6, 0))
         ttk.Button(row, text="URL…", width=7, command=lambda: self._url(1)).pack(side="left", padx=(4, 0))
-        ttk.Button(row, text="⇄ Swap", width=7, command=self._swap).pack(side="left", padx=(4, 0))
+        b = ttk.Button(row, text="\u2b07 Download", width=11,
+                       command=self._download_reaction)
+        b.pack(side="left", padx=(4, 0))
+        Tooltip(b, "Download the reaction at a chosen quality so it "
+                   "plays from disk - no buffering. (Swap moved to Ctrl+Shift+S.)")
 
         # ---- transport ------------------------------------------------------
         trans = ttk.LabelFrame(body, text=" Transport ", padding=(8, 6))
@@ -1897,6 +2401,7 @@ class SyncApp:
                                    style="Dim.TLabel")
         self.state_lbl.pack(fill="x")
 
+        self.root.bind("<Control-Shift-S>", lambda e: self._swap())
         self.root.bind("<space>", lambda e: self._toggle_play())
         self.root.bind("<Left>", lambda e: None if self._pip_nudge(-15, 0) else self._jump(-self._get_jump_sec()))
         self.root.bind("<Right>", lambda e: None if self._pip_nudge(15, 0) else self._jump(self._get_jump_sec()))
@@ -1933,6 +2438,39 @@ class SyncApp:
                 self.movie_path.set(p)
             else:
                 self.react_path.set(p)
+
+    def _download_reaction(self):
+        """Download the reaction at a chosen quality, so it plays from disk.
+
+        A streamed reaction can stall mid-take; a downloaded one cannot.
+        """
+        src = self.react_path.get().strip()
+        if not src:
+            messagebox.showinfo(
+                APP_NAME,
+                "Put a reaction URL in the Reaction row first (the URL\u2026 button),\n"
+                "then press Download.")
+            return
+        if not src.lower().startswith(("http://", "https://")):
+            messagebox.showinfo(APP_NAME,
+                                "The reaction source is already a local file:\n\n%s"
+                                % src)
+            return
+        if not plat.find_ytdl():
+            messagebox.showerror(
+                APP_NAME,
+                "yt-dlp was not found, so downloads are unavailable.\n\n"
+                "Install SyncPlayer (it bundles yt-dlp) or set YTDLP_PATH.")
+            return
+        DownloadDialog(self.root, self, src, on_done=self._downloaded_reaction)
+
+    def _downloaded_reaction(self, path):
+        """Point the reaction at the file we just downloaded."""
+        self.react_path.set(path)
+        self._status_pin = time.monotonic() + 8.0
+        self.status_lbl.config(text="Reaction downloaded \u2192 %s" % path)
+        if self.started:
+            self._start()          # reload both feeds from the local copy
 
     def _url(self, idx):
         cur = self.movie_path.get() if idx == 0 else self.react_path.get()
@@ -2943,19 +3481,30 @@ class SyncApp:
         if cur_crop:
             p.cmd({"command": ["set_property", "video-crop", ""]})
 
-        p.screenshot(snap_path)
-
-        for _ in range(30):
-            if os.path.isfile(snap_path) and os.path.getsize(snap_path) > 1000:
-                break
-            time.sleep(0.08)
+        ok, why = p.capture_frame(snap_path)
 
         # Restore previous crop in mpv while dialog is open
         if cur_crop:
             p.cmd({"command": ["set_property", "video-crop", "%dx%d+%d+%d" % cur_crop]})
 
-        if not (os.path.isfile(snap_path) and os.path.getsize(snap_path) > 1000):
-            self.status_lbl.config(text="Could not capture frame from %s." % name)
+        if not ok:
+            logtail = _mpv_log_tail(tag)
+            _diag("visual crop: capture failed for %s (%s) mpv-log: %s"
+                  % (tag, why, logtail))
+            self._status_pin = time.monotonic() + 6.0
+            self.status_lbl.config(
+                text="Could not capture a frame from %s - try Play for a "
+                     "second (mpv: %s)" % (name, why[:50]))
+            if messagebox.askyesno(
+                    APP_NAME,
+                    "Could not capture a frame from %s.\n\n"
+                    "The player may still be opening or buffering the "
+                    "video, or its window may be minimised. Press Play for "
+                    "a moment, then try again.\n\nmpv said: %s%s\n\n"
+                    "Try again now?"
+                    % (name, why[:160],
+                       ("\n" + logtail) if logtail else "")):
+                self._crop_interactive()
             return
 
         def on_apply(rect):
@@ -3625,14 +4174,24 @@ class SyncApp:
         os.makedirs(SHOT_DIR, exist_ok=True)
         stamp = time.strftime("%Y%m%d_%H%M%S")
         names = []
+        failed = []
         for t, lbl in (("A", "movie"), ("B", "reaction")):
             p = self.players.get(t)
             if p and p.running:
                 path = os.path.join(SHOT_DIR, "%s_%s_%s.png" % (stamp, lbl, t))
-                p.screenshot(path)
-                names.append(path)
-        if names:
+                ok, why = p.capture_frame(path)
+                if ok:
+                    names.append(path)
+                else:
+                    failed.append("%s (%s)" % (lbl, why[:40]))
+        if names and not failed:
             self.status_lbl.config(text="Screenshots → %s" % ", ".join(names))
+        elif names:
+            self.status_lbl.config(text="Screenshots → %s (failed: %s)"
+                                        % (", ".join(names), "; ".join(failed)))
+        elif failed:
+            self.status_lbl.config(text="Could not take a screenshot: %s"
+                                        % "; ".join(failed))
         else:
             self.status_lbl.config(text="Nothing playing — nothing to shoot.")
 

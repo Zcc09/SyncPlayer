@@ -396,5 +396,132 @@ check("drop: subtitle extensions are recognised",
       and not any(sp.is_subtitle_file(x) for x in
                   ("m.mp4", "m.mkv", "m.webm", "m.avi", "noext", "")))
 
+# ---------------------------------------------------------------- download --
+# Quality list built from yt-dlp's own JSON: best-first, auto first, and a height
+# that only exists as separate video+audio streams is dropped when ffmpeg is
+# missing, because it could never be merged into a playable file.
+_FMT_INFO = {"formats": [
+    {"format_id": "137", "height": 1080, "ext": "mp4", "fps": 30,
+     "vcodec": "avc1", "acodec": "none", "filesize": 120 * 1048576},
+    {"format_id": "22", "height": 720, "ext": "mp4", "fps": 30,
+     "vcodec": "avc1", "acodec": "mp4a", "filesize": 45 * 1048576},
+    {"format_id": "18", "height": 360, "ext": "mp4", "fps": 30,
+     "vcodec": "avc1", "acodec": "mp4a", "filesize": 12 * 1048576},
+    {"format_id": "140", "height": None, "ext": "m4a", "vcodec": "none",
+     "acodec": "mp4a", "abr": 128},
+]}
+with_ff = sp._formats_to_entries(_FMT_INFO, ffmpeg="ffmpeg")
+without_ff = sp._formats_to_entries(_FMT_INFO, ffmpeg=None)
+check("download: the auto entry is offered first",
+      with_ff and with_ff[0]["height"] == 0 and with_ff[0]["fmt"] == "bv*+ba/b",
+      str(with_ff[0] if with_ff else None))
+check("download: qualities are ordered best-first and named readably",
+      [e["height"] for e in with_ff] == [0, 1080, 720, 360]
+      and with_ff[1]["label"].startswith("1080p")
+      and "MB" in with_ff[1]["label"],
+      " | ".join(e["label"] for e in with_ff))
+check("download: a separate video+audio height needs ffmpeg for merging",
+      1080 in [e["height"] for e in with_ff]
+      and 1080 not in [e["height"] for e in without_ff]
+      and "single file only" in without_ff[0]["label"],
+      "with=%s without=%s" % ([e["height"] for e in with_ff],
+                              [e["height"] for e in without_ff]))
+check("download: merged heights use a yt-dlp video+audio selector",
+      [e["fmt"] for e in with_ff] == ["bv*+ba/b", "137+140", "22", "18"],
+      str([e["fmt"] for e in with_ff]))
+check("download: a URL with nothing usable reports why instead of an empty list",
+      sp._formats_to_entries({"formats": []}) == [])
+
+# the path parser must survive a Windows drive letter (splitting on ":" ate "C:")
+check("download: the destination path keeps its drive letter",
+      sp._download_path_from_line(
+          r"[download] Destination: C:\Users\Zcc09\Downloads\SyncPlayer\movie [id].mp4")
+      == (r"C:\Users\Zcc09\Downloads\SyncPlayer\movie [id].mp4", False))
+check("download: a merged file's quoted path is unquoted",
+      sp._download_path_from_line(
+          r'[Merger] Merging formats into "C:\Users\Zcc09\x\v [id].mp4"')
+      == (r"C:\Users\Zcc09\x\v [id].mp4", False))
+check("download: a file already on disk counts as the result, not a failure",
+      sp._download_path_from_line(
+          r"[download] C:\Users\Zcc09\x\movie [id].mp4 has already been downloaded")
+      == (r"C:\Users\Zcc09\x\movie [id].mp4", True))
+check("download: progress lines are not mistaken for paths",
+      sp._download_path_from_line(
+          "[download]  42.3% of 5.00MiB at 1.00MiB/s ETA 00:03") == (None, False))
+
+# ------------------------------------------------------------- frame capture --
+# capture_frame must escalate (file -> software -> window) and report a reason
+# instead of failing silently, and it must NEVER touch playback state: stealing
+# the user's pause would be worse than the failure it is fixing.
+import tempfile as _tf
+_tmpdir = _tf.mkdtemp(prefix="sp_capture_")
+_missing = os.path.join(_tmpdir, "_never_written.png")
+
+
+class _FakeDriver(object):
+    """Stands in for MpvDriver: records every call, writes the frame or doesn't."""
+
+    def __init__(self, succeed_on=None):
+        self.calls = []
+        self.succeed_on = succeed_on
+        self.attempts = 0
+
+    def get_property(self, prop, timeout=1.0):
+        self.calls.append(("get", prop))
+        if prop == "video-format":
+            return "success", "h264"
+        if prop == "screenshot-sw":
+            return "success", False
+        return "success", None
+
+    def command_sync(self, cmd, timeout=5.0):
+        self.calls.append(("cmd", tuple(cmd)))
+        if cmd and cmd[0] == "screenshot-to-file":
+            self.attempts += 1
+            if self.succeed_on and self.attempts >= self.succeed_on:
+                with open(cmd[1], "wb") as fh:
+                    fh.write(b"x" * 4096)
+                return "success", None
+            return "error running command", None
+        return "success", None
+
+
+_fake = _FakeDriver()
+_ok, _why = sp.MpvDriver.capture_frame(_fake, _missing, timeout=1.0)
+_modes = [c[1] for c in _fake.calls if c[0] == "cmd" and c[1][0] == "screenshot-to-file"]
+check("capture: every way mpv can shoot a frame is tried before giving up",
+      not _ok and [m[2] for m in _modes] == ["video", "video", "window"],
+      "modes=%s why=%s" % ([m[2] for m in _modes], _why))
+check("capture: the failure names the strategies that were tried",
+      "video=" in _why and "software=" in _why and "window=" in _why, _why)
+_PLAYBACK_PROPS = ("pause", "speed", "time-pos", "playback-time", "seeking")
+_PLAYBACK_CMDS = ("frame-step", "frame-back-step", "seek", "cycle", "playlist-next")
+check("capture: it never pauses, unpauses or steps the video",
+      not any(c[0] == "cmd" and (
+          c[1][0] in _PLAYBACK_CMDS
+          or (c[1][0] == "set_property" and len(c[1]) > 1
+              and c[1][1] in _PLAYBACK_PROPS))
+              for c in _fake.calls),
+      str([c[1] for c in _fake.calls if c[0] == "cmd"]))
+
+_fake2 = _FakeDriver(succeed_on=2)          # first try fails, software retry works
+_ok2, _why2 = sp.MpvDriver.capture_frame(_fake2, _missing, timeout=1.0)
+check("capture: a software retry is accepted as success", _ok2, _why2)
+check("capture: the screenshot-sw override is put back afterwards",
+      ("cmd", ("set_property", "screenshot-sw", "no")) in _fake2.calls,
+      str([c[1] for c in _fake2.calls if c[0] == "cmd"][-2:]))
+
+_fake3 = _FakeDriver(succeed_on=1)
+_ok3, _why3 = sp.MpvDriver.capture_frame(_fake3, os.path.join(_tmpdir, "_ok.png"),
+                                         timeout=1.0)
+check("capture: the normal path succeeds on the first attempt",
+      _ok3 and _why3 == "ok" and _fake3.attempts == 1,
+      "attempts=%d why=%s" % (_fake3.attempts, _why3))
+try:
+    import shutil as _sh
+    _sh.rmtree(_tmpdir, ignore_errors=True)
+except Exception:
+    pass
+
 print("==== %d/%d checks passed ====" % (passed, passed + failed))
 sys.exit(0 if failed == 0 else 1)

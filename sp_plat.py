@@ -97,6 +97,26 @@ def config_dir():
     return os.path.join(_xdg("XDG_CONFIG_HOME", ".config"), APP_DIRNAME)
 
 
+def downloads_dir():
+    """Where the Download button puts a finished reaction video."""
+    if IS_WIN:
+        base = os.path.join(os.path.expanduser("~"), "Downloads")
+        if not os.path.isdir(base):
+            base = os.path.expanduser("~")
+        return os.path.join(base, "SyncPlayer")
+    try:
+        with open(os.path.join(_xdg("XDG_CONFIG_HOME", ".config"), "user-dirs.dirs"),
+                  encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if line.startswith("XDG_DOWNLOAD_DIR"):
+                    val = line.split("=", 1)[1].strip().strip('"')
+                    val = os.path.expandvars(val).replace("$HOME", os.path.expanduser("~"))
+                    return os.path.join(val, "SyncPlayer")
+    except Exception:
+        pass
+    return os.path.join(os.path.expanduser("~"), "Downloads", "SyncPlayer")
+
+
 def shot_dir():
     """Where screenshots / mpv logs / helper lua+input.conf are written."""
     if IS_WIN:
