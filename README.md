@@ -35,8 +35,8 @@ together for the whole runtime.**
    **Welcome** → **Destination** (default `%LOCALAPPDATA%\Programs\SyncPlayer`, so no
    administrator prompt; it offers the folder of an existing install and updates that
    copy in place) → **Start Menu Folder** (name it, or tick "Don't create a Start Menu
-   folder") → **Additional Tasks** (SyncPlayer itself, a bundled **mpv**, **yt-dlp**
-   for URLs and the update checker — each can be switched off — plus the Desktop
+   folder") → **Additional Tasks** (SyncPlayer itself, a bundled **mpv**, **yt-dlp**,
+   **ffmpeg** and the update checker — each can be switched off — plus the Desktop
    icon) → **Ready to Install** (a summary of your choices) → **Installing** → **Finish**
    (with a "Launch SyncPlayer" checkbox).
 2. **Uninstall** any time from Windows *Apps & Features*, or the
