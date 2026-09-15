@@ -61,7 +61,7 @@ except Exception:
     sp_upd = None
 
 APP_NAME = "SyncPlayer"
-APP_VERSION = "1.6.6"
+APP_VERSION = "1.6.7"
 
 
 class MpvNotFoundError(Exception):
@@ -451,6 +451,46 @@ def set_playback_quality(quality):
     """Point URL playback at `quality`; returns the format selector in use."""
     _PLAYBACK_YTDL_FORMAT[0] = ytdl_format_expr(quality)
     return _PLAYBACK_YTDL_FORMAT[0]
+
+
+# Seek-bar dragging. "direct" is the original behaviour: the knob follows the
+# pointer and the position is whatever x it lands on. "precise" (the default) is
+# the YouTube-style scrub - the pointer's sideways movement is converted to TIME at
+# a fixed gain, so the bar advances in small controllable steps rather than jumping,
+# and lifting the pointer away from the bar makes it finer still. Whichever is in
+# use, the landing on release is frame-exact.
+SEEK_MODES = (("precise", "Precise (scrub)"),
+              ("direct", "Direct (follow the pointer)"))
+DEFAULT_SEEK_MODE = "precise"
+SCRUB_BASE_GAIN = 0.5      # s per pixel while the pointer stays on the bar
+SCRUB_FINE_GAIN = 0.02     # s per pixel once it is lifted (frame-by-frame)
+SCRUB_LIFT_PX = 24         # how far above the bar counts as "lifted"
+SCRUB_STEP = 0.02          # s: smallest change worth sending to mpv mid-drag
+SCRUB_THROTTLE = 0.05      # s: least time between two live seeks
+SCRUB_EXACT_BELOW = 0.15   # s: a movement this small is sent frame-exact
+
+
+def _hms_or(secs):
+    """mm:ss (or h:mm:ss) for a number of seconds; blank when unknown."""
+    try:
+        v = float(secs)
+    except Exception:
+        return "--:--"
+    if v >= 3600:
+        return "%d:%02d:%02d" % (v // 3600, v // 60 % 60, v % 60)
+    return "%02d:%02d" % (v // 60, v % 60)
+
+
+def scrub_target(pos0, dx_px, lift_px, duration):
+    """Where a precise drag points, given how far the pointer has moved.
+
+    Pure on purpose: the behaviour is testable without a player.
+    """
+    gain = SCRUB_FINE_GAIN if lift_px >= SCRUB_LIFT_PX else SCRUB_BASE_GAIN
+    target = float(pos0) + (int(dx_px) * gain)
+    if duration:
+        return max(0.0, min(target, float(duration)))
+    return max(0.0, target)
 
 
 def is_youtube(url):
@@ -2029,8 +2069,21 @@ class SettingsDialog(tk.Toplevel):
         Tooltip(sp, "Default for the Download window's Connections box: how many "
                     "parts of a video are fetched at once (1-16).")
 
+        # seek mode
+        w = row(2, "Seek bar dragging", "")
+        self.var_seekmode = tk.StringVar(
+            value=dict(SEEK_MODES).get(getattr(app, "seek_mode", DEFAULT_SEEK_MODE),
+                                       SEEK_MODES[0][1]))
+        cm = ttk.Combobox(w, textvariable=self.var_seekmode,
+                          values=[lab for _, lab in SEEK_MODES],
+                          state="readonly", width=26)
+        cm.pack(side="left")
+        Tooltip(cm, "Precise: dragging converts sideways movement into time at a "
+                    "fixed gain (lift the pointer for frame-by-frame) - the knob no "
+                    "longer jumps to the pointer. Direct: the original behaviour.")
+
         # seek distance
-        w = row(2, "Seek distance (s)", "")
+        w = row(3, "Seek distance (s)", "")
         self.var_jump = tk.DoubleVar(value=float(app.jump_sec.get() or 5.0))
         sp2 = ttk.Spinbox(w, from_=0.5, to=120, increment=0.5, width=6,
                           textvariable=self.var_jump)
@@ -2052,7 +2105,8 @@ class SettingsDialog(tk.Toplevel):
         self.bind("<Return>", lambda e: self.save())
         self.bind("<Escape>", lambda e: self.destroy())
         self._refresh_note()
-        for v in (self.var_quality, self.var_conn, self.var_jump):
+        for v in (self.var_quality, self.var_conn, self.var_jump,
+                  self.var_seekmode):
             try:
                 v.trace_add("write", lambda *a: self._refresh_note())
             except Exception:
@@ -2069,7 +2123,7 @@ class SettingsDialog(tk.Toplevel):
     def _refresh_note(self):
         try:
             expr = ytdl_format_expr(self._quality_code())
-            self.note.config(text="mpv will ask yt-dlp for: %s" % expr)
+            self.note.config(text="mpv will ask yt-dlp for: %s\nSeek bar: %s" % (expr, self.var_seekmode.get()))
         except Exception:
             pass
 
@@ -2089,6 +2143,11 @@ class SettingsDialog(tk.Toplevel):
             pass
         try:
             app.jump_sec.set(max(0.5, min(120.0, float(self.var_jump.get() or 5.0))))
+        except Exception:
+            pass
+        try:
+            app.seek_mode = {lab: code for code, lab in SEEK_MODES}.get(
+                self.var_seekmode.get(), DEFAULT_SEEK_MODE)
         except Exception:
             pass
         app.youtube_quality = self._quality_code()
@@ -2363,6 +2422,8 @@ class SyncApp:
         self.jump_sec = tk.DoubleVar(value=5.0)
         self.youtube_quality = DEFAULT_YOUTUBE_QUALITY
         self.download_connections = 8
+        self.seek_mode = DEFAULT_SEEK_MODE
+        self._scrub = {}          # per-bar precise-drag sessions
         self.goto_vars = {"A": tk.StringVar(), "B": tk.StringVar()}
         self.dragging_vol = [False, False]
         self.dragging_master = False
@@ -2706,14 +2767,21 @@ class SyncApp:
         self.seek_b.config(command=self._on_seek_b_drag)
         self.seek_m.config(command=self._on_seek_m_drag)
 
-        self.seek_a.bind("<Button-1>", lambda e: self._handle_click(e, self.seek_a, "dragging_seek_a", "_seek_a_val", self._on_seek_a_release))
-        self.seek_b.bind("<Button-1>", lambda e: self._handle_click(e, self.seek_b, "dragging_seek_b", "_seek_b_val", self._on_seek_b_release))
-        self.seek_m.bind("<Button-1>", lambda e: self._handle_click(e, self.seek_m, "dragging_seek_m", "_seek_m_val", self._on_seek_m_release))
+        # A press either starts a precise scrub session or keeps the original
+        # click/drag behaviour, depending on the Seek mode setting.
+        for _tag, _bar in (("A", self.seek_a), ("B", self.seek_b), ("M", self.seek_m)):
+            _bar.bind("<Button-1>", lambda e, t=_tag: self._seek_press(t, e))
+            _bar.bind("<B1-Motion>", lambda e, t=_tag: self._seek_motion(t, e))
         # Releases over the WIDGET (a release over an mpv video window would
         # otherwise leave the dragging_* flags stuck and freeze that bar).
         self._bind_release(self.seek_a, "dragging_seek_a", self._on_seek_a_release)
         self._bind_release(self.seek_b, "dragging_seek_b", self._on_seek_b_release)
         self._bind_release(self.seek_m, "dragging_seek_m", self._on_seek_m_release)
+        # AFTER _bind_release: it rebinds the same sequence without add="+" and
+        # would otherwise drop this handler (that killed the scrub session).
+        for _tag, _bar in (("A", self.seek_a), ("B", self.seek_b), ("M", self.seek_m)):
+            _bar.bind("<ButtonRelease-1>",
+                      lambda e, t=_tag: self._seek_release(t, e), add="+")
 
         # ---- tracks (audio + subtitle pickers per video) -------------------
         tr = ttk.Frame(body)
@@ -3663,6 +3731,12 @@ class SyncApp:
             "  manager) - more finishes sooner on a fast link." + chr(10) +
             "- Seek buttons: the two next to Start move by the Jump distance" + chr(10) +
             "  (5 s by default), so they can be made as fine as you need." + chr(10) +
+            "- Seek bars (Precise mode, the default): dragging a bar turns sideways" + chr(10) +
+            "  pointer movement into time instead of jumping to the pointer, so you" + chr(10) +
+            "  can walk the timeline frame by frame. Lift the pointer above the bar" + chr(10) +
+            "  for the finest steps; playback holds while you drag and resumes on" + chr(10) +
+            "  release. Prefer the old behaviour? Settings -> Seek bar dragging ->" + chr(10) +
+            "  Direct." + chr(10) +
             "- Shortcuts: Space play/pause both, Left/Right seek by the Jump" + chr(10) +
             "  distance, arrow keys nudge the PiP pane while dragging.")
         lbl = tk.Label(w, text=txt, bg="#16181d", fg="#e8e8ea",
@@ -4673,6 +4747,150 @@ class SyncApp:
             self._commit_seek(t, max(0.0, pos))
         self._seek_m_val = None
 
+    # -- precise scrubbing --------------------------------------------------
+    def _seek_bar_spec(self, which):
+        """(bar, drag flag, value attr, release handler) for a bar tag."""
+        return {"A": (self.seek_a, "dragging_seek_a", "_seek_a_val",
+                      self._on_seek_a_release),
+                "B": (self.seek_b, "dragging_seek_b", "_seek_b_val",
+                      self._on_seek_b_release),
+                "M": (self.seek_m, "dragging_seek_m", "_seek_m_val",
+                      self._on_seek_m_release)}[which]
+
+    def _bar_duration(self, which):
+        if which == "M":
+            return max(self.last_dur.get("A") or 0, self.last_dur.get("B") or 0)
+        return self.last_dur.get(which) or 0
+
+    def _bar_locked(self, which):
+        """The per-video bars are inert while locked, and the master only when not."""
+        return (not self.sync_locked) if which == "M" else bool(self.sync_locked)
+
+    def _seek_press(self, which, event):
+        """Press on a bar: scrub in precise mode, otherwise the old behaviour."""
+        if self.seek_mode != "precise" or self._bar_locked(which):
+            bar, drag_attr, val_attr, release = self._seek_bar_spec(which)
+            self._handle_click(event, bar, drag_attr, val_attr, release)
+            return None
+        try:
+            bar = self._seek_bar_spec(which)[0]
+            pos0 = max(0.0, float(bar.get()))
+            was_playing = bool(self.started and not self.paused
+                               and not self._bar_locked(which))
+            self._scrub[which] = {"x0": int(event.x_root), "y0": int(event.y_root),
+                                  "pos0": pos0, "target": pos0, "sent": pos0,
+                                  "ts": 0.0, "moved": False, "resume": was_playing}
+            if was_playing:
+                # like a video site: scrubbing holds the picture still, and
+                # releasing puts playback back where it was
+                self._set_pause_all(True)
+            self._status_pin = time.monotonic() + 4.0
+            self.status_lbl.config(
+                text="Precise seek - drag sideways (lift the pointer for "
+                     "frame-by-frame), release to land there")
+        except Exception:
+            pass
+        return "break"          # keep Tk from moving the knob to the pointer
+
+    def _seek_motion(self, which, event):
+        s = self._scrub.get(which)
+        if not s:
+            return None
+        try:
+            dx = int(event.x_root) - s["x0"]
+            lift = s["y0"] - int(event.y_root)
+            if abs(dx) > 1 or lift > 0:
+                s["moved"] = True
+            target = scrub_target(s["pos0"], dx, lift, self._bar_duration(which))
+            fine = lift >= SCRUB_LIFT_PX
+            now = time.monotonic()
+            if (abs(target - s["sent"]) < SCRUB_STEP
+                    and (now - s["ts"]) < SCRUB_THROTTLE * 4):
+                return "break"
+            step = abs(target - s["sent"])
+            s["target"] = target
+            s["sent"] = target
+            s["ts"] = now
+            # a nudge is sent frame-exactly so the picture lands on the frame
+            # you asked for; a sweep stays inexact because it is about speed
+            self._scrub_seek(which, target, exact=step <= SCRUB_EXACT_BELOW)
+            self._show_scrub(which, target, fine)
+        except Exception:
+            pass
+        return "break"
+
+    def _seek_release(self, which, event=None):
+        """Land on the scrubbed position, frame-exact, and restore playback."""
+        s = self._scrub.pop(which, None)
+        if not s:
+            return
+        try:
+            target = s["target"]
+            if not s["moved"]:
+                # a plain click (no movement) still seeks where you clicked
+                bar = self._seek_bar_spec(which)[0]
+                w, to = bar.winfo_width(), float(bar.cget("to"))
+                if w > 0 and to > 0:
+                    try:
+                        # the click position from the event (winfo_pointerx is
+                        # only right when a real pointer produced the click)
+                        x = int(event.x_root) - bar.winfo_rootx()
+                    except Exception:
+                        try:
+                            x = bar.winfo_pointerx() - bar.winfo_rootx()
+                        except Exception:
+                            x = 0
+                    target = max(0.0, min(to, x / float(w) * to))
+            self._scrub_seek(which, target, exact=True)
+            if s.get("resume"):
+                self._set_pause_all(False)
+        except Exception:
+            pass
+        finally:
+            try:
+                self.status_lbl.config(text="")
+            except Exception:
+                pass
+
+    def _scrub_seek(self, which, target, exact=False):
+        """Move the dragged bar's video(s) to `target`, offset intact."""
+        tags = ("A", "B") if which == "M" else (which,)
+        for tag in tags:
+            p = self.players.get(tag)
+            if not (p and p.running):
+                continue
+            pos = target + (self.sync_off if (which == "M" and tag == "B") else 0.0)
+            pos = max(0.0, pos)
+            try:
+                p.seek(pos, absolute=True, exact=exact)
+            except Exception:
+                pass
+            self.last_pos[tag] = pos
+
+    def _show_scrub(self, which, target, fine):
+        """Draw the scrubbed position: knob, time label, status hint."""
+        bar, drag_attr, val_attr, _rel = self._seek_bar_spec(which)
+        dur = self._bar_duration(which)
+        self._prog_set = True
+        try:
+            bar.set(target)
+        finally:
+            self._prog_set = False
+        setattr(self, drag_attr, True)
+        setattr(self, val_attr, target)
+        lbl = {"A": self.lbl_a, "B": self.lbl_b, "M": self.lbl_m}[which]
+        try:
+            lbl.config(text=self._fmt(target, dur or 600))
+        except Exception:
+            pass
+        self._status_pin = time.monotonic() + 4.0
+        try:
+            self.status_lbl.config(
+                text="Precise seek %s / %s  [%s]" % (
+                    _hms_or(target), _hms_or(dur), "fine" if fine else "coarse"))
+        except Exception:
+            pass
+
     def _handle_click(self, event, slider, drag_attr, val_attr, release_func):
         try:
             w = slider.winfo_width()
@@ -5276,6 +5494,8 @@ class SyncApp:
                     1, min(16, int(c.get("download_connections", 8) or 8)))
             except Exception:
                 self.download_connections = 8
+            _sm = str(c.get("seek_mode") or DEFAULT_SEEK_MODE).lower()
+            self.seek_mode = _sm if _sm in [m for m, _ in SEEK_MODES] else DEFAULT_SEEK_MODE
             set_playback_quality(self.youtube_quality)
             al = c.get("alignments")
             if isinstance(al, dict):
@@ -5299,6 +5519,7 @@ class SyncApp:
                     "speed": self.speed.get(),
                     "jump_sec": self.jump_sec.get(),
                     "youtube_quality": self.youtube_quality,
+                    "seek_mode": self.seek_mode,
                     "download_connections": self.download_connections,
                     "alignments": self._alignments,
                     "update_checked_at": self._update_checked_at,

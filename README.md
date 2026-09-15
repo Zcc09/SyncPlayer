@@ -12,6 +12,7 @@ together for the whole runtime.**
 | ⚙ **Settings** | Header button: **YouTube playback quality** (**1080p by default**, or 720p/1440p/2160p/Best), the default **download connections**, and the seek distance. A quality change applies to the next video you load. |
 | 🖼 **Windows** | Two mpv windows, auto-arranged side by side (re-arrange anytime). |
 | 🎚 **Three seek bars** | **Master** moves both together. **Movie** and **Reaction** bars move one side only — drag one to align the two, and it stays locked. |
+| ↔ **Scrub seeking** | Dragging a seek bar (default **Precise**) turns sideways pointer movement into time at a fixed gain instead of jumping to the pointer - 0.5 s per pixel on the bar, **0.02 s per pixel** once you lift the pointer above it, so the timeline can be walked frame by frame. Playback holds while you drag and resumes on release, and the landing is frame-exact. Set it to **Direct** in Settings for the old follow-the-pointer behaviour. |
 | ⏪ **Seek buttons** | The two by **Start** step by the same **Jump** distance as `←`/`→` (5 s by default) and show it, so you choose how fine seeking is. |
 | 🎞 **Frame-step** | ⏴/⏵ next to each timeline's play button (or `[` / `]`) step THAT video one frame at a time while paused — align the two pictures at 30 fps precision. |
 | 🖱 **Drag & drop** | Drop one or two video files straight onto the window to fill the source slots — or drop a **subtitle file** (`.srt/.ass/.vtt/…`) to attach it to a feed. A subtitle named after a video (`movie.mp4` + `movie.srt`) goes to that video automatically. |
