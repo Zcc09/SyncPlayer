@@ -38,6 +38,10 @@ YTDLP_REPO = "yt-dlp/yt-dlp"
 # The mpv release tag that our bundled build corresponds to (used as the
 # baseline "current" version when install.json has no mpv_version).
 MPV_RELEASE_VERSION = "0.41.0"
+# Pinned static Windows build used to supply ffmpeg when an installation does
+# not have one (older installs predate it being bundled). ffmpeg is what lets
+# yt-dlp merge separate video+audio streams - i.e. anything above ~720p.
+FFMPEG_URL = ("https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip")
 
 # Overridable so the deployment/in-app tests can serve a fake release from
 # a local HTTP server instead of GitHub.
@@ -143,6 +147,21 @@ def get_install_state(install_dir):
     if not state["mpv_version"] and state["mpv_present"]:
         state["mpv_version"] = MPV_RELEASE_VERSION
     return state
+
+
+def get_ffmpeg_version(path):
+    """Read the version from a bundled ffmpeg ("ffmpeg version 9.0.1-...")."""
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        r = subprocess.run([path, "-version"], capture_output=True, text=True,
+                           timeout=20, errors="replace",
+                           creationflags=(getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                                          if os.name == "nt" else 0))
+        m = re.search(r"version\s+(\S+)", (r.stdout or "").split("\n")[0])
+        return m.group(1).split("-")[0] if m else None
+    except Exception:
+        return None
 
 
 def github_latest(owner_repo):
@@ -363,6 +382,19 @@ def run_check(install_dir):
         }
     except Exception as e:
         out["mpv"] = {"error": str(e)}
+    # ffmpeg (bundled alongside mpv; yt-dlp needs it to merge A/V streams)
+    try:
+        ff_path = os.path.join(install_dir, "mpv", "ffmpeg.exe")
+        out["ffmpeg"] = {
+            "current": get_ffmpeg_version(ff_path) or ("present" if os.path.isfile(ff_path) else "0"),
+            "latest": "bundled",
+            "available": False,
+            "missing": not os.path.isfile(ff_path),
+            "asset": {"url": FFMPEG_URL, "size": 0},
+        }
+    except Exception as e:
+        out["ffmpeg"] = {"error": str(e)}
+
     # yt-dlp (bundled alongside mpv; needed for YouTube links)
     try:
         yt = github_latest(YTDLP_REPO)
@@ -404,6 +436,10 @@ def apply_updates(install_dir, check, progress=None):
         _apply_ytdlp(install_dir, check.get("ytdlp") or {}, progress, log)
     except Exception as e:
         log.append("yt-dlp update failed: %s" % e)
+    try:
+        _apply_ffmpeg(install_dir, check.get("ffmpeg") or {}, progress, log)
+    except Exception as e:
+        log.append("ffmpeg update failed: %s" % e)
 
     # Persist a fresh install.json so future checks have a baseline. Keep what the
     # check reported for the components we did NOT touch.
@@ -468,6 +504,31 @@ def _apply_mpv(install_dir, mpv, progress, log):
     except Exception:
         pass
     log.append("mpv installed/updated.")
+
+
+def _apply_ffmpeg(install_dir, ffmpeg, progress, log):
+    """Fetch ffmpeg when the installation has none (older installs predate it)."""
+    mpv_dir = os.path.join(install_dir, "mpv")
+    target = os.path.join(mpv_dir, "ffmpeg.exe")
+    if os.path.isfile(target) and not ffmpeg.get("missing"):
+        return
+    url = (ffmpeg.get("asset") or {}).get("url") or FFMPEG_URL
+    log.append("Installing ffmpeg (needed for full-quality downloads)...")
+    tmp = tempfile.mktemp(suffix=".zip")
+    download(url, tmp, progress=progress)
+    os.makedirs(mpv_dir, exist_ok=True)
+    with zipfile.ZipFile(tmp) as z:
+        cand = [n for n in z.namelist()
+                if n.lower().endswith("/bin/ffmpeg.exe")]
+        if not cand:
+            raise RuntimeError("no ffmpeg.exe inside %s" % url.rsplit("/", 1)[-1])
+        with z.open(cand[0]) as fsrc, open(target, "wb") as fdst:
+            shutil.copyfileobj(fsrc, fdst)
+    try:
+        os.remove(tmp)
+    except Exception:
+        pass
+    log.append("ffmpeg installed (%s)." % (get_ffmpeg_version(target) or "ok"))
 
 
 def _apply_ytdlp(install_dir, ytdlp, progress, log):

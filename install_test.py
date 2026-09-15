@@ -295,7 +295,7 @@ def main():
 
     check("install: SyncPlayer.exe present", os.path.isfile(app))
     check("install: app version is 1.6.0",
-          get_exe_version(app) == "1.6.4", str(get_exe_version(app)))
+          get_exe_version(app) == "1.6.5", str(get_exe_version(app)))
     check("install: bundled mpv.exe present", os.path.isfile(mpv))
     check("install: bundled yt-dlp.exe present", os.path.isfile(ytdl))
     check("install: updater present", os.path.isfile(updater))
@@ -305,7 +305,7 @@ def main():
             state = json.load(open(ij))
         except Exception:
             pass
-    check("install: install.json app_version", state.get("app_version") == "1.6.4")
+    check("install: install.json app_version", state.get("app_version") == "1.6.5")
     check("install: install.json mpv_version", state.get("mpv_version") == "0.41.0")
 
     # The packaged app must report its own optional pieces: a windowed exe with
@@ -323,7 +323,7 @@ def main():
             env_app = (json.load(open(env_json)) or {}).get("app", {})
         except Exception:
             env_app = {}
-    check("install: packaged app reports its version", env_app.get("version") == "1.6.4",
+    check("install: packaged app reports its version", env_app.get("version") == "1.6.5",
           str(env_app)[:110])
     check("install: packaged app really has drag & drop (tkinterdnd2 bundled)",
           env_app.get("drag_and_drop") is True, str(env_app)[:110])
@@ -691,7 +691,7 @@ def main():
               "--uninstall" in str(regvals.get("UninstallString", "")),
               str(regvals.get("UninstallString")))
         check("wizard: Add/Remove entry carries the version",
-              str(regvals.get("DisplayVersion", "")) == "1.6.4",
+              str(regvals.get("DisplayVersion", "")) == "1.6.5",
               str(regvals.get("DisplayVersion")))
     check("wizard: install.json records which components went in",
           bool(state.get("mpv_installed")) and bool(state.get("ytdlp_installed"))

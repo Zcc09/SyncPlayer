@@ -61,7 +61,7 @@ except Exception:
     sp_upd = None
 
 APP_NAME = "SyncPlayer"
-APP_VERSION = "1.6.4"
+APP_VERSION = "1.6.5"
 
 
 class MpvNotFoundError(Exception):
@@ -1497,13 +1497,15 @@ class VisualCropDialog(tk.Toplevel):
 def find_ffmpeg():
     """Locate ffmpeg. yt-dlp needs it to merge separate video+audio streams, which
     is how anything above ~720p is published; without it we offer single-file
-    formats only instead of failing after a download."""
+    formats only instead of failing after a download.
+
+    The bundled copy (next to mpv/yt-dlp, where the installer puts it) is preferred
+    over whatever happens to be on PATH - the installer promises ffmpeg is included,
+    so that is the one the download path should use.
+    """
     env = os.environ.get("FFMPEG_PATH")
     if env and os.path.isfile(env):
         return env
-    w = shutil.which("ffmpeg")
-    if w:
-        return w
     for exe in (plat.find_ytdl(), plat.find_mpv()):
         if not exe:
             continue
@@ -1512,7 +1514,7 @@ def find_ffmpeg():
             cand = os.path.join(base, name)
             if os.path.isfile(cand):
                 return cand
-    return None
+    return shutil.which("ffmpeg")
 
 
 def _fmt_size(nbytes):

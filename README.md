@@ -15,13 +15,19 @@ together for the whole runtime.**
 | 🖱 **Drag & drop** | Drop one or two video files straight onto the window to fill the source slots — or drop a **subtitle file** (`.srt/.ass/.vtt/…`) to attach it to a feed. A subtitle named after a video (`movie.mp4` + `movie.srt`) goes to that video automatically. |
 | 🔊 **Audio** | Independent volume slider + mute per video, plus a master volume scaling both. |
 | 🎵 **Tracks** | Per-video **audio** and **subtitle** pickers (built from each file's own track list; Off disables). |
-| ⬇ **Download** | Sits in the **Reaction** row: pick a quality (listed by yt-dlp itself, *Best available* on top) and the video is saved to `%USERPROFILE%\Downloads\SyncPlayer`, then the reaction is repointed at that local file - downloaded reactions cannot stall mid-take the way a stream can. Without ffmpeg only single-file formats are offered (usually up to 720p); with it, separate video+audio streams are merged for full quality. |
+| ⬇ **Download** | Sits in the **Reaction** row: pick a quality (listed by yt-dlp itself, *Best available* on top) and the video is saved to `%USERPROFILE%\Downloads\SyncPlayer`, then the reaction is repointed at that local file - downloaded reactions cannot stall mid-take the way a stream can. ffmpeg ships with the installer, so full quality works out of the box
+    (**--no-ffmpeg** omits it, which caps downloads at single-file quality, usually 720p). |
 | ⬆ **Updates** | In the app: the header shows your version (**v1.6.4 ⟳**) — click it to check GitHub on demand. When something newer exists an **Update to X** button appears with the release notes, live progress, and a **Restart** that starts the new version. Checks run in the background at most every 6 h and never touch your config, alignment, screenshots or downloads. If Windows will not let the running exe be swapped, the new build is staged and installed on the next start. |
 | 🎛 **Transport** | ±10 s jumps, restart, close, screenshots of both videos; **speed** editable (type 1.35 and Enter) with ±0.05 nudge buttons. |
 | 🧷 **Remembers the alignment** | The Movie↔Reaction offset is saved **per source pair**: next time you load the same two videos, the reaction is already on its spot. The `🔗 Align` button shows the stored offset — click it to forget it, or after re-aligning to store the new one. |
 | 💾 **Persistence** | Paths, volumes, speed **and remembered alignments** saved between sessions. |
 
 ## Quick start
+
+> **Size note:** the Windows installer is now ~157 MB because it bundles a static
+> **ffmpeg** 9.0.1 (a 98 MB static binary that compresses to ~36 MB inside the installer) — that is the piece that lets yt-dlp merge separate video+audio
+> streams. The bundled build is a GPL build from gyan.dev, redistributed under its own
+> licence.
 
 ### Windows
 

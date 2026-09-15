@@ -15,11 +15,13 @@ Build:
 
 Automation (used by install_test.py):
   SyncPlayer-Setup.exe --silent --install-dir <path> --no-mpv --no-ytdlp \
+                      --no-ffmpeg \
       --no-updater --no-desktop-shortcut --no-startmenu-shortcut --launch --json
 """
 import ctypes
 from ctypes import wintypes
 import json
+import re
 import os
 import shutil
 import subprocess
@@ -235,6 +237,10 @@ class Options(object):
             self.install_dir = self.existing[1]
         self.mpv = True              # the player itself (recommended)
         self.ytdlp = True            # YouTube / URL sources
+        # ffmpeg is what lets yt-dlp MERGE separate video+audio streams: it is
+        # how anything above ~720p is published, so without it downloads are
+        # capped at single-file (usually 720p) quality.
+        self.ffmpeg = True
         self.updater = True          # "Check for Updates"
         self.desktop_shortcut = True
         self.startmenu_shortcut = True
@@ -247,6 +253,8 @@ class Options(object):
             comps.append("mpv")
         if self.ytdlp:
             comps.append("yt-dlp")
+        if self.ffmpeg:
+            comps.append("ffmpeg")
         if self.updater:
             comps.append("updater")
         return ", ".join(comps)
@@ -264,19 +272,27 @@ def do_install(opts, src, progress=None):
     shutil.copy2(src_exe, app_path)
 
     mpv_dir = os.path.join(install_dir, "mpv")
+    skip_names = []
+    if not opts.ytdlp:
+        skip_names.append("yt-dlp.exe")
+    if not opts.ffmpeg:
+        skip_names.append("ffmpeg.exe")
     if opts.mpv:
         cb(18, "Installing mpv %s..." % MPV_RELEASE_VERSION)
-        _copy_tree(src_mpv, mpv_dir,
-                   skip=() if opts.ytdlp else ("yt-dlp.exe",),
+        _copy_tree(src_mpv, mpv_dir, skip=tuple(skip_names),
                    progress=lambda a, b: cb(18 + int(48.0 * a / max(b, 1)),
                                             "Installing mpv... (%d/%d)" % (a, b)))
-    elif opts.ytdlp:
-        # yt-dlp normally ships inside the mpv payload; keep the app's
-        # discovery order (mpv/yt-dlp.exe) working without installing mpv
+    elif opts.ytdlp or opts.ffmpeg:
+        # both tools normally ship inside the mpv payload; keep the app's
+        # discovery order (mpv/yt-dlp.exe, mpv/ffmpeg.exe) working without
+        # installing mpv itself
         os.makedirs(mpv_dir, exist_ok=True)
-        src_ytdlp = os.path.join(src_mpv, "yt-dlp.exe")
-        if os.path.isfile(src_ytdlp):
-            shutil.copy2(src_ytdlp, os.path.join(mpv_dir, "yt-dlp.exe"))
+        for _name in ("yt-dlp.exe", "ffmpeg.exe"):
+            if _name in skip_names:
+                continue
+            _src = os.path.join(src_mpv, _name)
+            if os.path.isfile(_src):
+                shutil.copy2(_src, os.path.join(mpv_dir, _name))
 
     ytdlp_exe = os.path.join(mpv_dir, "yt-dlp.exe")
     ytdlp_ver = "0"
@@ -289,6 +305,19 @@ def do_install(opts, src, progress=None):
             ytdlp_ver = (r.stdout or "").strip() or "0"
         except Exception:
             ytdlp_ver = "0"
+
+    ffmpeg_exe = os.path.join(mpv_dir, "ffmpeg.exe")
+    ffmpeg_ver = "0"
+    if opts.ffmpeg and os.path.isfile(ffmpeg_exe):
+        cb(74, "Checking ffmpeg...")
+        try:
+            _r = subprocess.run([ffmpeg_exe, "-version"], capture_output=True,
+                                text=True, timeout=20,
+                                creationflags=CREATE_NO_WINDOW, errors="replace")
+            _m = re.search(r"version\s+(\S+)", (_r.stdout or "").split("\n")[0])
+            ffmpeg_ver = _m.group(1).split("-")[0] if _m else "0"
+        except Exception:
+            ffmpeg_ver = "0"
 
     updater_path = None
     if opts.updater and src_updater and os.path.isfile(src_updater):
@@ -303,6 +332,8 @@ def do_install(opts, src, progress=None):
         "mpv_installed": bool(opts.mpv),
         "ytdlp_version": ytdlp_ver if opts.ytdlp else "0",
         "ytdlp_installed": bool(opts.ytdlp and os.path.isfile(ytdlp_exe)),
+        "ffmpeg_version": ffmpeg_ver if opts.ffmpeg else "0",
+        "ffmpeg_installed": bool(opts.ffmpeg and os.path.isfile(ffmpeg_exe)),
         "updater_installed": bool(updater_path),
         "install_dir": install_dir,
         "startmenu_folder": (opts.startmenu_folder if opts.startmenu_shortcut
@@ -413,6 +444,7 @@ def parse_options(argv):
     if "--no-shortcuts" in argv or os.environ.get("SYNCPLAYER_NO_SHORTCUTS"):
         opts.desktop_shortcut = opts.startmenu_shortcut = False
     for flag, attr in (("--no-mpv", "mpv"), ("--no-ytdlp", "ytdlp"),
+                       ("--no-ffmpeg", "ffmpeg"),
                        ("--no-updater", "updater"),
                        ("--no-desktop-shortcut", "desktop_shortcut"),
                        ("--no-startmenu-shortcut", "startmenu_shortcut")):
@@ -824,6 +856,7 @@ class Wizard(object):
         self.var_app = tk.BooleanVar(value=True)
         self.var_mpv = tk.BooleanVar(value=self.opts.mpv)
         self.var_ytdlp = tk.BooleanVar(value=self.opts.ytdlp)
+        self.var_ffmpeg = tk.BooleanVar(value=self.opts.ffmpeg)
         self.var_updater = tk.BooleanVar(value=self.opts.updater)
         self.var_desktop = tk.BooleanVar(value=self.opts.desktop_shortcut)
         self.var_launch = tk.BooleanVar(value=self.opts.launch)
@@ -835,6 +868,8 @@ class Wizard(object):
                     " - recommended, plays the two video feeds")
         self._check(inner, self.var_ytdlp, "yt-dlp",
                     " - YouTube and other URL sources")
+        self._check(inner, self.var_ffmpeg, "ffmpeg",
+                    " - merges video+audio, so downloads reach full quality")
         self._check(inner, self.var_updater, "Update checker",
                     " - %s - Check for Updates" % APP_NAME)
         tk.Frame(inner, bg=self.PANEL, height=6).pack()
@@ -1005,6 +1040,7 @@ class Wizard(object):
         elif name == "tasks":
             self.opts.mpv = bool(self.var_mpv.get())
             self.opts.ytdlp = bool(self.var_ytdlp.get())
+            self.opts.ffmpeg = bool(self.var_ffmpeg.get())
             self.opts.updater = bool(self.var_updater.get())
             self.opts.desktop_shortcut = bool(self.var_desktop.get())
             self.opts.launch = bool(self.var_launch.get())
