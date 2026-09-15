@@ -242,18 +242,37 @@ b_id = id(app.players["B"])
 ok = wait_until(lambda: _status_vol.get(a_id) is not None and _status_vol.get(b_id) is not None, 6)
 check("volume: mpv reports both volumes", ok, "A=%s B=%s" % (_status_vol.get(a_id), _status_vol.get(b_id)))
 
+def _vol_now():
+    """mpv's real volume. The status line is printed on property changes only, so
+    while PAUSED it can lag a step behind - assert the property, not the readout."""
+    err, v = P["A"].get_property("volume", timeout=1.5)
+    return v if err == "success" else None
+
+
+def _vol_detail():
+    return "mpv=%s status=%s" % (_vol_now(), _status_vol.get(a_id))
+
+
+def _vol_is(pred):
+    """NB: no `or` fallbacks - 0.0 is a valid volume and falsy."""
+    def probe():
+        v = _vol_now()
+        return v is not None and pred(v)
+    return probe
+
+
 app.vol_a.set(30)
 app._on_vol_release(0)
-ok = wait_until(lambda: _status_vol.get(a_id) is not None and abs(_status_vol.get(a_id) - 30) < 6, 6)
-check("volume: A slider 30% reaches mpv", ok, "vol=%s" % _status_vol.get(a_id))
+ok = wait_until(_vol_is(lambda v: v > 24), 6)
+check("volume: A slider 30% reaches mpv", ok, _vol_detail())
 
 app._mute(0)
-ok = wait_until(lambda: _status_vol.get(a_id) is not None and (_status_vol.get(a_id) or 0) < 3, 6)
-check("volume: mute A -> ~0", ok, "vol=%s" % _status_vol.get(a_id))
+ok = wait_until(_vol_is(lambda v: v < 3), 6)
+check("volume: mute A -> ~0", ok, _vol_detail())
 
 app._mute(0)
-ok = wait_until(lambda: _status_vol.get(a_id) is not None and abs(_status_vol.get(a_id) - 30) < 6, 6)
-check("volume: unmute A restores 30", ok, "vol=%s" % _status_vol.get(a_id))
+ok = wait_until(_vol_is(lambda v: abs(v - 30) < 6), 6)
+check("volume: unmute A restores 30", ok, _vol_detail())
 
 app.vol_b.set(80)
 app._on_vol_release(1)
