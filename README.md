@@ -8,15 +8,17 @@ together for the whole runtime.**
 | | |
 |---|---|
 | ⚡ **How it syncs** | Each video plays in its **own mpv instance and window** (independent timelines). The panel is a master clock: seeking one video **never** touches the other, and a drift-correction loop pulls the reaction back to its aligned spot whenever it wanders (> 0.45 s). Small drift is absorbed by a **micro playback-rate trim** (±5 %, pitch-preserved, invisible) instead of a visible jump; only a real gap (> 0.8 s) is seeked. No filter graphs, no rebuilds → **nothing to glitch or crash**. |
-| 🎬 **Sources** | Local files (`mp4/mkv/mov/webm/avi/ts/…`) or URLs (YouTube etc., resolved via yt-dlp). |
+| 🎬 **Sources** | Local files (`mp4/mkv/mov/webm/avi/ts/…`) or URLs (YouTube etc., resolved via yt-dlp). Paste or drop a link straight into a source field. |
+| ⚙ **Settings** | Header button: **YouTube playback quality** (**1080p by default**, or 720p/1440p/2160p/Best), the default **download connections**, and the seek distance. A quality change applies to the next video you load. |
 | 🖼 **Windows** | Two mpv windows, auto-arranged side by side (re-arrange anytime). |
 | 🎚 **Three seek bars** | **Master** moves both together. **Movie** and **Reaction** bars move one side only — drag one to align the two, and it stays locked. |
+| ⏪ **Seek buttons** | The two by **Start** step by the same **Jump** distance as `←`/`→` (5 s by default) and show it, so you choose how fine seeking is. |
 | 🎞 **Frame-step** | ⏴/⏵ next to each timeline's play button (or `[` / `]`) step THAT video one frame at a time while paused — align the two pictures at 30 fps precision. |
 | 🖱 **Drag & drop** | Drop one or two video files straight onto the window to fill the source slots — or drop a **subtitle file** (`.srt/.ass/.vtt/…`) to attach it to a feed. A subtitle named after a video (`movie.mp4` + `movie.srt`) goes to that video automatically. |
 | 🔊 **Audio** | Independent volume slider + mute per video, plus a master volume scaling both. |
 | 🎵 **Tracks** | Per-video **audio** and **subtitle** pickers (built from each file's own track list; Off disables). |
 | ⬇ **Download** | Sits in the **Reaction** row: pick a quality (listed by yt-dlp itself, *Best available* on top) and the video is saved to `%USERPROFILE%\Downloads\SyncPlayer`, then the reaction is repointed at that local file - downloaded reactions cannot stall mid-take the way a stream can. ffmpeg ships with the installer, so full quality works out of the box
-    (**--no-ffmpeg** omits it, which caps downloads at single-file quality, usually 720p). |
+    (**--no-ffmpeg** omits it, which caps downloads at single-file quality, usually 720p). A **Connections** box (1-16) fetches that many parts of the video at once - the download-manager approach - and remembers your choice. |
 | ⬆ **Updates** | In the app: the header shows your version (**v1.6.4 ⟳**) — click it to check GitHub on demand. When something newer exists an **Update to X** button appears with the release notes, live progress, and a **Restart** that starts the new version. Checks run in the background at most every 6 h and never touch your config, alignment, screenshots or downloads. If Windows will not let the running exe be swapped, the new build is staged and installed on the next start. |
 | 🎛 **Transport** | ±10 s jumps, restart, close, screenshots of both videos; **speed** editable (type 1.35 and Enter) with ±0.05 nudge buttons. |
 | 🧷 **Remembers the alignment** | The Movie↔Reaction offset is saved **per source pair**: next time you load the same two videos, the reaction is already on its spot. The `🔗 Align` button shows the stored offset — click it to forget it, or after re-aligning to store the new one. |
@@ -75,7 +77,7 @@ syncplayer --check-env           # verify mpv, yt-dlp, window backend, paths
 
 ### Both platforms
 
-1. Source A = your movie (Browse… or URL…), Source B = the reaction.
+1. Source A = your movie, Source B = the reaction — **Browse…**, or just paste / drop a link into the field (a YouTube URL streams via yt-dlp).
 2. Hit **Start** — both videos load **paused** and open side by side.
 3. Press **▶ Play** (transport or Master row, or `Space`) when ready.
 4. Drag the **Movie** or **Reaction** bar until the moments line up — that
@@ -106,7 +108,7 @@ syncplayer --check-env           # verify mpv, yt-dlp, window backend, paths
 | Key | Action |
 |---|---|
 | `Space` | Play / pause both |
-| `←` / `→` | Seek both ±5 s *(nudge the PiP pane instead while integrated PiP is active)* |
+| `←` / `→` | Seek both by the **Jump** distance (5 s by default, adjustable 0.5-120) *(nudge the PiP pane instead while integrated PiP is active)* |
 | `[` / `]` | Frame-step the last-touched video back / forward (paused) |
 | `↑` / `↓` | Nudge the PiP pane (integrated PiP) |
 | `Esc` | Exit integrated PiP (video returns to its own window) |

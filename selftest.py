@@ -607,5 +607,88 @@ check("updater: the install dir can be redirected (tests rely on it)",
 import shutil as _sh2
 _sh2.rmtree(_u, ignore_errors=True)
 
+# ------------------------------------------------ 1.6.6 quality + threads ----
+check("quality: 1080p is what a URL is played at by default",
+      sp.DEFAULT_YOUTUBE_QUALITY == "1080")
+check("quality: the 1080p selector mpv is given",
+      sp.ytdl_format_expr("1080")
+      == "bestvideo[height<=1080]+bestaudio/best[height<=1080]",
+      sp.ytdl_format_expr("1080"))
+check("quality: 720p selector",
+      sp.ytdl_format_expr("720")
+      == "bestvideo[height<=720]+bestaudio/best[height<=720]",
+      sp.ytdl_format_expr("720"))
+check("quality: 'best' still hands the choice back to yt-dlp",
+      sp.ytdl_format_expr("best") == "bestvideo+bestaudio/best",
+      sp.ytdl_format_expr("best"))
+check("quality: nonsense falls back to the default instead of crashing",
+      sp.ytdl_format_expr("banana") == sp.ytdl_format_expr(sp.DEFAULT_YOUTUBE_QUALITY),
+      sp.ytdl_format_expr("banana"))
+check("quality: the settings list offers the whole useful range",
+      [c for c, _ in sp.YOUTUBE_QUALITIES] == ["best", "2160", "1440", "1080",
+                                               "720", "480", "360"],
+      str([c for c, _ in sp.YOUTUBE_QUALITIES]))
+check("quality: set_playback_quality is what a new player would use",
+      sp.set_playback_quality("480")
+      == "bestvideo[height<=480]+bestaudio/best[height<=480]"
+      and sp._PLAYBACK_YTDL_FORMAT[0] == sp.ytdl_format_expr("480"),
+      sp._PLAYBACK_YTDL_FORMAT[0])
+sp.set_playback_quality(sp.DEFAULT_YOUTUBE_QUALITY)
+
+_cap = {}
+_orig_popen = sp.subprocess.Popen
+
+
+class _FakePopen(object):
+    def __init__(self, args, **kw):
+        _cap["args"] = list(args)
+        self.stdout = iter(())
+        self.returncode = 0
+
+    def wait(self, timeout=None):
+        return 0
+
+    def kill(self):
+        pass
+
+
+sp.subprocess.Popen = _FakePopen
+_tmp = None
+try:
+    import tempfile as _tf
+    _tmp = _tf.mkdtemp(prefix="sp_thr_")
+    for _n in (8, 1, 0):
+        sp.ytdl_download("http://127.0.0.1:1/x", "b", _tmp, "yt-dlp.exe",
+                         connections=_n)
+        _cap["c%d" % _n] = _cap["args"]
+    _many = sp.ytdl_download("http://127.0.0.1:1/x", "b", _tmp, "yt-dlp.exe",
+                             connections=64)
+    _cap["c64"] = _cap["args"][:]
+finally:
+    sp.subprocess.Popen = _orig_popen
+    import shutil as _sh3
+    if _tmp:
+        _sh3.rmtree(_tmp, ignore_errors=True)
+
+
+def _argval(args, flag):
+    return args[args.index(flag) + 1] if flag in args else None
+
+
+check("threads: -N carries the connection count",
+      _argval(_cap["c8"], "-N") == "8", str(_cap["c8"][:10]))
+check("threads: chunked downloading is enabled so single-file sources parallelise",
+      _argval(_cap["c8"], "--http-chunk-size") == "10M",
+      str(_argval(_cap["c8"], "--http-chunk-size")))
+check("threads: one connection means a plain download (no -N)",
+      "-N" not in _cap["c1"] and "--http-chunk-size" not in _cap["c1"],
+      str(_cap["c1"][:10]))
+check("threads: a zero/blank count is treated as one connection",
+      "-N" not in _cap["c0"], str(_cap["c0"][:10]))
+check("threads: 64 connections is what gets asked for (the dialog clamps)",
+      _argval(_cap["c64"], "-N") == "64", str(_argval(_cap["c64"], "-N")))
+check("threads: the quality is still passed through unchanged",
+      _argval(_cap["c8"], "-f") == "b")
+
 print("==== %d/%d checks passed ====" % (passed, passed + failed))
 sys.exit(0 if failed == 0 else 1)

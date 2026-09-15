@@ -460,7 +460,6 @@ check("restart: resumed (not paused)", not app.paused)
 app._jump(3)
 ok = wait_until(lambda: app.last_pos["A"] is not None and app.last_pos["A"] > 2.0, 6)
 check("jump +3s: both advance", ok, "A=%s B=%s" % (app.last_pos["A"], app.last_pos["B"]))
-
 # ------------------------------------------------------ 11. pause/resume --
 diag = "started=%s paused_before=%s A.run=%s B.run=%s A.atend=%s B.atend=%s" % (
     app.started, app.paused,
@@ -1382,6 +1381,20 @@ check("download: downloading from the dialog repoints the reaction at the file",
 check("download: and that file is inside the downloads folder",
       os.path.normcase(os.path.dirname(app.react_path.get()))
       == os.path.normcase(_dest), os.path.dirname(app.react_path.get()))
+
+# The connection count is a per-download control that also becomes the default.
+_orig_conn = int(getattr(app, "download_connections", 8) or 8)
+check("download: the dialog exposes the connection count",
+      hasattr(_dlg, "spin_conn") and int(_dlg.connections.get() or 0) >= 1,
+      str(getattr(_dlg, "connections", None) and _dlg.connections.get()))
+_conn_used = max(1, min(16, int(_dlg.connections.get() or 1)))
+_log_txt = _dlg.log.get("1.0", "end")
+check("download: the run logged how many connections it used",
+      ("-N %d" % _conn_used) in _log_txt,
+      str([l for l in _log_txt.splitlines() if "-N" in l][:2]))
+check("download: the dialog's choice is saved as the new default",
+      int(getattr(app, "download_connections", 0) or 0) == _conn_used,
+      "app=%s used=%s" % (getattr(app, "download_connections", None), _conn_used))
 try:
     _dlg.destroy()
 except Exception:
@@ -1433,6 +1446,105 @@ check("capture: an impossible destination fails with a reason, not a crash",
 check("capture: a failed capture leaves playback state exactly as it was",
       _pa.paused == _state_before_bad,
       "paused=%s (was %s)" % (_pa.paused, _state_before_bad))
+
+# --------- 12c2. Settings: playback quality, connections, seek distance ---
+# The dialog is the only place the 1080p default can be changed, so drive it for
+
+# 1.6.6: the seek buttons step by the Jump distance (they used to be a fixed
+# 10 s, which was too coarse for lining a reaction up).
+_orig_jump = float(app.jump_sec.get() or 5.0)
+app.jump_sec.set(2.5)
+pump(0.4)
+_lbl = (app.btn_back.cget("text"), app.btn_fwd.cget("text"))
+check("seek buttons: they name the distance they actually step",
+      all("2.5s" in x for x in _lbl), str(_lbl))
+check("seek buttons: they are smaller than the old 10 s spans",
+      (app.btn_back.cget("width") or 6) <= 6 and (app.btn_fwd.cget("width") or 6) <= 6,
+      "%s / %s" % (app.btn_back.cget("width"), app.btn_fwd.cget("width")))
+_pos0 = app.last_pos["A"]
+app.btn_fwd.invoke()
+_ok_step = wait_until(lambda: app.last_pos["A"] is not None and _pos0 is not None
+                      and 1.2 < (app.last_pos["A"] - _pos0) < 4.0, 8)
+check("seek buttons: clicking really moves ~2.5 s, not the old fixed 10 s",
+      _ok_step, "before=%s after=%s" % (_pos0, app.last_pos["A"]))
+app.jump_sec.set(_orig_jump)
+pump(0.3)
+check("seek buttons: restoring the setting renames them again",
+      ("%g" % _orig_jump) + "s" in app.btn_fwd.cget("text"),
+      app.btn_fwd.cget("text"))
+
+# real: pick a quality, save, and check that the LIVE players were retold.
+_orig_quality = getattr(app, "youtube_quality", sp.DEFAULT_YOUTUBE_QUALITY)
+check("settings: the header has a Settings button",
+      hasattr(app, "btn_settings") and "Settings" in app.btn_settings.cget("text"),
+      str(getattr(app, "btn_settings", None) and app.btn_settings.cget("text")))
+_sd = sp.SettingsDialog(app.root, app)
+pump(0.5)
+_qcode = getattr(app, "youtube_quality", sp.DEFAULT_YOUTUBE_QUALITY)
+_want_lbl = [lab for c, lab in sp.YOUTUBE_QUALITIES if c == _qcode][:1]
+check("settings: it opens showing the quality currently in use",
+      bool(_want_lbl) and _sd.var_quality.get() == _want_lbl[0],
+      "%s vs %s" % (_sd.var_quality.get(), _want_lbl))
+check("settings: it exposes the connection count and the seek distance",
+      int(_sd.var_conn.get() or 0) >= 1 and float(_sd.var_jump.get() or 0) > 0,
+      "%s / %s" % (_sd.var_conn.get(), _sd.var_jump.get()))
+_sd.var_quality.set("720p")
+_sd.var_conn.set(6)
+_sd.var_jump.set(3.0)
+_sd.save()
+pump(1.5)
+check("settings: saving changes the app's playback quality",
+      app.youtube_quality == "720", str(app.youtube_quality))
+check("settings: saving changes the connection default",
+      int(app.download_connections or 0) == 6, str(app.download_connections))
+check("settings: saving changes the seek distance the buttons use",
+      abs(float(app._get_jump_sec()) - 3.0) < 0.01
+      and "3s" in app.btn_fwd.cget("text"),
+      "%s / %s" % (app._get_jump_sec(), app.btn_fwd.cget("text")))
+_expr720 = sp.ytdl_format_expr("720")
+check("settings: the spawn default follows the setting",
+      sp._PLAYBACK_YTDL_FORMAT[0] == _expr720, sp._PLAYBACK_YTDL_FORMAT[0])
+# get_property returns (error, value) - the value is what mpv really holds.
+_live = {}
+for _t, _p in (app.players or {}).items():
+    try:
+        _err, _val = _p.get_property("ytdl-format")
+        _live[_t] = _val if _err == "success" else "error: %s" % _err
+    except Exception as _e:
+        _live[_t] = "error: %s" % _e
+check("settings: the LIVE players were told the new selector (no restart needed)",
+      bool(_live) and all(str(v) == _expr720 for v in _live.values()), str(_live))
+try:
+    _grab = app.root.grab_current()
+except Exception:
+    _grab = None
+check("settings: the dialog left no modal grab behind",
+      _grab in (None, app.root), "grab_current=%s" % _grab)
+try:
+    with io.open(sp.CONFIG_PATH, encoding="utf-8") as _f:
+        _disk = json.load(_f)
+except Exception as _e:
+    _disk = {}
+    check("settings: config readable after saving", False, str(_e))
+check("settings: the choice is written to the config file",
+      (_disk or {}).get("youtube_quality") == "720"
+      and int((_disk or {}).get("download_connections") or 0) == 6,
+      "quality=%s connections=%s" % ((_disk or {}).get("youtube_quality"),
+                                     (_disk or {}).get("download_connections")))
+# Put the user's real preferences back: this test app shares their config file.
+try:
+    app.youtube_quality = _orig_quality
+    app.download_connections = _orig_conn
+    app.jump_sec.set(_orig_jump)
+    app._apply_youtube_quality()
+    app._save_config()
+except Exception:
+    pass
+pump(0.3)
+check("settings: the user's own preferences were restored afterwards",
+      app.youtube_quality == _orig_quality
+      and int(app.download_connections or 0) == _orig_conn,
+      "%s / %s" % (app.youtube_quality, app.download_connections))
 
 # ------------------------------------------- 12d. in-app updater ------------
 # A fake GitHub serves a "9.9.9" release (notes + asset) and current-ish tags for
@@ -1576,6 +1688,7 @@ try:
     app.btn_update.pack_forget()
 except Exception:
     pass
+
 
 # ------------------------------------------------------- 13. clean close --
 config_path = sp.CONFIG_PATH

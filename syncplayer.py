@@ -61,7 +61,7 @@ except Exception:
     sp_upd = None
 
 APP_NAME = "SyncPlayer"
-APP_VERSION = "1.6.5"
+APP_VERSION = "1.6.6"
 
 
 class MpvNotFoundError(Exception):
@@ -419,6 +419,40 @@ def probe_duration(path, timeout=20):
     return probe_media(path, timeout)[0]
 
 
+# YouTube playback quality. A URL is handed to mpv, which resolves it through
+# yt-dlp; left alone yt-dlp picks the best streams on offer, so a 4K upload is
+# what stalls the moment its buffer runs dry. The default here is 1080p and the
+# range is selectable in Settings ("best" restores yt-dlp's own choice).
+YOUTUBE_QUALITIES = (("best", "Best available"), ("2160", "2160p (4K)"),
+                     ("1440", "1440p"), ("1080", "1080p"), ("720", "720p"),
+                     ("480", "480p"), ("360", "360p"))
+DEFAULT_YOUTUBE_QUALITY = "1080"
+
+
+def ytdl_format_expr(quality):
+    """The yt-dlp format selector for a playback-quality choice."""
+    q = str(quality or DEFAULT_YOUTUBE_QUALITY).strip().lower()
+    if q in ("best", "auto", "0", ""):
+        return "bestvideo+bestaudio/best"
+    try:
+        h = int(q)
+    except ValueError:
+        h = int(DEFAULT_YOUTUBE_QUALITY)
+    return "bestvideo[height<=%d]+bestaudio/best[height<=%d]" % (h, h)
+
+
+# MpvDriver builds its own command line, so the current selector lives here and
+# the app keeps it in step with the setting instead of threading it through every
+# spawn path.
+_PLAYBACK_YTDL_FORMAT = [ytdl_format_expr(DEFAULT_YOUTUBE_QUALITY)]
+
+
+def set_playback_quality(quality):
+    """Point URL playback at `quality`; returns the format selector in use."""
+    _PLAYBACK_YTDL_FORMAT[0] = ytdl_format_expr(quality)
+    return _PLAYBACK_YTDL_FORMAT[0]
+
+
 def is_youtube(url):
     try:
         u = url.lower()
@@ -721,6 +755,8 @@ class MpvDriver:
                 "--hwdec=auto-safe",   # mpv 0.41 dropped the old "safe"
                 "--fs=no",
                 "--ytdl=yes",
+                # URL playback quality (Settings -> YouTube playback quality)
+                "--ytdl-format=%s" % _PLAYBACK_YTDL_FORMAT[0],
                 "--volume-max=150",
                 # keep pitch intact when the drift loop trims the rate
                 "--audio-pitch-correction=yes",
@@ -1200,6 +1236,10 @@ class VisualCropDialog(tk.Toplevel):
         self.title("Visual Crop — %s" % video_name)
         self.transient(parent)
         self.grab_set()
+        # grab_set() + destroy() is not reliable: a grab that outlives the dialog
+        # leaves the main window deaf to clicks. release_grab is defined further
+        # down, next to the other dialogs.
+        self.bind("<Destroy>", lambda e: release_grab(self), add="+")
         self.configure(bg="#1f232b")
         self.geometry("960x650")
         self.minsize(500, 380)
@@ -1611,7 +1651,8 @@ def _download_path_from_line(line):
     return None, False
 
 
-def ytdl_download(url, fmt, dest_dir, ytdlp, ffmpeg=None, on_line=None, cancel=None):
+def ytdl_download(url, fmt, dest_dir, ytdlp, ffmpeg=None, on_line=None,
+                  cancel=None, connections=1):
     """Download `url` as `fmt` into `dest_dir`.
 
     Returns (ok, path_or_None, tail_lines). on_line(line) receives yt-dlp's own
@@ -1629,6 +1670,15 @@ def ytdl_download(url, fmt, dest_dir, ytdlp, ffmpeg=None, on_line=None, cancel=N
     args = [ytdlp, "--no-playlist", "--newline", "--no-warnings",
             "--socket-timeout", "30", "-f", fmt, "-P", dest_dir,
             "-o", "%(title).120B [%(id)s].%(ext)s"]
+    try:
+        n_conn = max(1, int(connections or 1))
+    except Exception:
+        n_conn = 1
+    if n_conn > 1:
+        # YouTube serves everything as fragments, and -N fetches that many at
+        # once; --http-chunk-size brings sources served as a single file into
+        # the same scheme. Together that is what a download manager does.
+        args += ["-N", str(n_conn), "--http-chunk-size", "10M"]
     if ffmpeg:
         args += ["--merge-output-format", "mp4"]
     args.append(url)
@@ -1701,6 +1751,11 @@ class DownloadDialog(tk.Toplevel):
         self.ytdlp = plat.find_ytdl()
         self.ffmpeg = find_ffmpeg()
         self.dest = plat.downloads_dir()
+        try:
+            self.connections = tk.IntVar(
+                value=int(getattr(app, "download_connections", 8) or 8))
+        except Exception:
+            self.connections = tk.IntVar(value=8)
 
         self.title("Download for %s" % APP_NAME)
         self.configure(bg="#16181d")
@@ -1748,8 +1803,19 @@ class DownloadDialog(tk.Toplevel):
         self.btn_cancel.pack(side="right", padx=(0, 6))
         self.btn_cancel.state(["disabled"])
 
+        # Parallel connections, adjustable per download (a local copy of the
+        # setting; whatever is used becomes the default for next time).
+        ttk.Label(btns, text="Connections").pack(side="left")
+        self.spin_conn = ttk.Spinbox(btns, from_=1, to=16, width=4,
+                                     textvariable=self.connections)
+        self.spin_conn.pack(side="left", padx=(6, 0))
+        Tooltip(self.spin_conn, "How many parts of the video to fetch at once "
+                                "(1-16). Higher finishes sooner on fast links.")
+
         self.protocol("WM_DELETE_WINDOW", self.close)
         self.bind("<Escape>", lambda e: self.close())
+        # it already holds a grab from above; make sure it cannot outlive us
+        self.bind("<Destroy>", lambda e: release_grab(self), add="+")
         if self.ffmpeg:
             self.note.config(text="Saving to %s\nffmpeg found - full quality "
                                   "(separate video+audio streams are merged)."
@@ -1810,7 +1876,17 @@ class DownloadDialog(tk.Toplevel):
         self.btn_cancel.state(["!disabled"])
         self.bar.configure(value=0)
         self.status.config(text="Downloading %s\u2026" % entry["label"])
-        self.log.insert("end", "> yt-dlp -f %s\n" % entry["fmt"])
+        try:
+            n_conn = max(1, min(16, int(self.connections.get() or 1)))
+        except Exception:
+            n_conn = 1
+        if n_conn != getattr(self.app, "download_connections", n_conn):
+            self.app.download_connections = n_conn
+            try:
+                self.app._save_config()
+            except Exception:
+                pass
+        self.log.insert("end", "> yt-dlp -f %s -N %d\n" % (entry["fmt"], n_conn))
         self.log.see("end")
 
         def on_line(line):
@@ -1821,7 +1897,8 @@ class DownloadDialog(tk.Toplevel):
         def work():
             ok, path, tail = ytdl_download(self.url, entry["fmt"], self.dest,
                                            self.ytdlp, ffmpeg=self.ffmpeg,
-                                           on_line=on_line, cancel=self.cancel)
+                                           on_line=on_line, cancel=self.cancel,
+                                           connections=n_conn)
             self.q.put(("done", ok, path, tail))
 
         threading.Thread(target=work, daemon=True).start()
@@ -1887,6 +1964,145 @@ class DownloadDialog(tk.Toplevel):
                 self.destroy()
         except Exception:
             pass
+
+
+def release_grab(win):
+    """Drop a modal grab on the way out.
+
+    grab_set() plus destroy() is not reliable: a grab that outlives its dialog
+    leaves the main window deaf to clicks - other dialogs included.
+    """
+    try:
+        if win.grab_current() is win:
+            win.grab_release()
+    except Exception:
+        pass
+
+
+class SettingsDialog(tk.Toplevel):
+    """The handful of choices that are not per-session: playback quality,
+    download connections, and the seek distance the arrows/seek buttons use."""
+
+    def __init__(self, master, app):
+        tk.Toplevel.__init__(self, master)
+        self.app = app
+        self.title("Settings - %s" % APP_NAME)
+        self.configure(bg="#16181d")
+        self.resizable(False, False)
+        self.transient(master)
+
+        tk.Label(self, text="Playback and downloads", bg="#16181d", fg="#e8e8ea",
+                 font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=14, pady=(12, 6))
+
+        grid = tk.Frame(self, bg="#16181d")
+        grid.pack(fill="x", padx=14)
+
+        def row(r, label, tip):
+            tk.Label(grid, text=label, bg="#16181d", fg="#c9ccd4",
+                     anchor="w").grid(row=r, column=0, sticky="w", pady=4)
+            w = tk.Frame(grid, bg="#16181d")
+            w.grid(row=r, column=1, sticky="w", padx=(12, 0), pady=4)
+            return w
+
+        # playback quality
+        w = row(0, "YouTube playback quality", "")
+        cur = getattr(app, "youtube_quality", DEFAULT_YOUTUBE_QUALITY)
+        labels = [lab for _, lab in YOUTUBE_QUALITIES]
+        codes = [code for code, _ in YOUTUBE_QUALITIES]
+        self.var_quality = tk.StringVar(
+            value=labels[codes.index(cur)] if cur in codes else labels[3])
+        cb = ttk.Combobox(w, textvariable=self.var_quality, values=labels,
+                          state="readonly", width=18)
+        cb.pack(side="left")
+        Tooltip(cb, "Resolution mpv asks yt-dlp for when you load a URL. "
+                    "Applies to the next video you load; files are unaffected.")
+
+        # download connections
+        w = row(1, "Download connections", "")
+        try:
+            conn0 = int(getattr(app, "download_connections", 8) or 8)
+        except Exception:
+            conn0 = 8
+        self.var_conn = tk.IntVar(value=max(1, min(16, conn0)))
+        sp = ttk.Spinbox(w, from_=1, to=16, width=4, textvariable=self.var_conn)
+        sp.pack(side="left")
+        Tooltip(sp, "Default for the Download window's Connections box: how many "
+                    "parts of a video are fetched at once (1-16).")
+
+        # seek distance
+        w = row(2, "Seek distance (s)", "")
+        self.var_jump = tk.DoubleVar(value=float(app.jump_sec.get() or 5.0))
+        sp2 = ttk.Spinbox(w, from_=0.5, to=120, increment=0.5, width=6,
+                          textvariable=self.var_jump)
+        sp2.pack(side="left")
+        Tooltip(sp2, "How far the arrow keys and the seek buttons move (0.5 - 120 s).")
+
+        self.note = tk.Label(self, text="", bg="#16181d", fg="#8a8f9a",
+                             justify="left", wraplength=460)
+        self.note.pack(anchor="w", padx=14, pady=(10, 0))
+
+        btns = tk.Frame(self, bg="#16181d")
+        btns.pack(fill="x", padx=14, pady=12)
+        ttk.Button(btns, text="Cancel", width=10,
+                   command=self.destroy).pack(side="right")
+        self.btn_save = ttk.Button(btns, text="Save", style="Accent.TButton",
+                                   width=10, command=self.save)
+        self.btn_save.pack(side="right", padx=(0, 6))
+
+        self.bind("<Return>", lambda e: self.save())
+        self.bind("<Escape>", lambda e: self.destroy())
+        self._refresh_note()
+        for v in (self.var_quality, self.var_conn, self.var_jump):
+            try:
+                v.trace_add("write", lambda *a: self._refresh_note())
+            except Exception:
+                pass
+        try:
+            self.grab_set()
+        except Exception:
+            pass
+        # save() and destroy() do not reliably release a grab, and one that
+        # outlives the dialog freezes the main window - release it on the way
+        # out, whichever way that is.
+        self.bind("<Destroy>", lambda e: release_grab(self), add="+")
+
+    def _refresh_note(self):
+        try:
+            expr = ytdl_format_expr(self._quality_code())
+            self.note.config(text="mpv will ask yt-dlp for: %s" % expr)
+        except Exception:
+            pass
+
+    def _quality_code(self):
+        labels = [lab for _, lab in YOUTUBE_QUALITIES]
+        codes = [code for code, _ in YOUTUBE_QUALITIES]
+        try:
+            return codes[labels.index(self.var_quality.get())]
+        except Exception:
+            return DEFAULT_YOUTUBE_QUALITY
+
+    def save(self):
+        app = self.app
+        try:
+            app.download_connections = max(1, min(16, int(self.var_conn.get() or 8)))
+        except Exception:
+            pass
+        try:
+            app.jump_sec.set(max(0.5, min(120.0, float(self.var_jump.get() or 5.0))))
+        except Exception:
+            pass
+        app.youtube_quality = self._quality_code()
+        applied = app._apply_youtube_quality()
+        try:
+            app._save_config()
+        except Exception:
+            pass
+        app._status_pin = time.monotonic() + 6.0
+        try:
+            app.status_lbl.config(text="Settings saved (URL playback: %s)" % applied)
+        except Exception:
+            pass
+        self.destroy()
 
 
 # ---------------------------------------------------------------------------
@@ -2145,6 +2361,8 @@ class SyncApp:
         self._seek_m_val = None
         self._scrub_ts = 0.0
         self.jump_sec = tk.DoubleVar(value=5.0)
+        self.youtube_quality = DEFAULT_YOUTUBE_QUALITY
+        self.download_connections = 8
         self.goto_vars = {"A": tk.StringVar(), "B": tk.StringVar()}
         self.dragging_vol = [False, False]
         self.dragging_master = False
@@ -2300,6 +2518,12 @@ class SyncApp:
                                   command=lambda: self._update_check(manual=True))
         self.btn_ver.pack(side="right", padx=(0, 6))
         Tooltip(self.btn_ver, "Click to check GitHub for a newer release.")
+        self.btn_settings = ttk.Button(self.btn_ver.master,
+                                       text="\u2699 Settings", width=11,
+                                       command=self._open_settings)
+        self.btn_settings.pack(side="right", padx=(0, 6))
+        Tooltip(self.btn_settings, "Playback quality, download connections "
+                                   "and the seek distance.")
         self.root.after(4500, self._auto_update_check)
 
         body = ttk.Frame(self.root, padding=(12, 4, 12, 8))
@@ -2314,14 +2538,12 @@ class SyncApp:
         ttk.Label(row, text="Movie / source A", width=16).pack(side="left")
         ttk.Entry(row, textvariable=self.movie_path).pack(side="left", fill="x", expand=True)
         ttk.Button(row, text="Browse…", width=9, command=lambda: self._browse(0)).pack(side="left", padx=(6, 0))
-        ttk.Button(row, text="URL…", width=7, command=lambda: self._url(0)).pack(side="left", padx=(4, 0))
 
         row = ttk.Frame(src)
         row.pack(fill="x", pady=1)
         ttk.Label(row, text="Reaction / source B", width=16).pack(side="left")
         ttk.Entry(row, textvariable=self.react_path).pack(side="left", fill="x", expand=True)
         ttk.Button(row, text="Browse…", width=9, command=lambda: self._browse(1)).pack(side="left", padx=(6, 0))
-        ttk.Button(row, text="URL…", width=7, command=lambda: self._url(1)).pack(side="left", padx=(4, 0))
         b = ttk.Button(row, text="\u2b07 Download", width=11,
                        command=self._download_reaction)
         b.pack(side="left", padx=(4, 0))
@@ -2341,20 +2563,31 @@ class SyncApp:
         self.btn_pause_all.pack(side="left", padx=(5, 0))
         Tooltip(self.btn_pause_all, "Play or pause BOTH videos together (also on the Master row).")
         self._ctrls.append(self.btn_pause_all)
-        for txt, cmd, w, tip in (("⏮ Restart", lambda: self._seek(0), 9,
-                                  "Jump both videos back to the start"),
-                                 ("⏪ 10s", lambda: self._jump(-10), 7,
-                                  "Both videos back 10 s (← = 5 s)"),
-                                 ("10s ▶", lambda: self._jump(10), 7,
-                                  "Both videos forward 10 s (→ = 5 s)"),
-                                 ("📷 Shot", self._shot, 8,
-                                  "Save screenshots of both videos"),
-                                 ("Close", self._stop, 7,
-                                  "Close both video windows")):
-            b = ttk.Button(trans, text=txt, width=w, command=cmd)
+        # The seek buttons step by the same Jump distance the arrow keys use
+        # (5 s by default, adjustable), so they move by a smaller, controllable
+        # amount than the old fixed 10 s jump.
+        b_restart = ttk.Button(trans, text="⏮", width=3,
+                               command=lambda: self._seek(0))
+        self.btn_back = ttk.Button(trans, text="⏪", width=6,
+                                   command=lambda: self._jump(-self._get_jump_sec()))
+        self.btn_fwd = ttk.Button(trans, text="▶", width=6,
+                                  command=lambda: self._jump(self._get_jump_sec()))
+        b_shot = ttk.Button(trans, text="📷 Shot", width=8,
+                            command=self._shot)
+        b_close = ttk.Button(trans, text="Close", width=7, command=self._stop)
+        for b, tip in ((b_restart, "Jump both videos back to the start"),
+                       (self.btn_back, "Back by the Jump distance"),
+                       (self.btn_fwd, "Forward by the Jump distance"),
+                       (b_shot, "Save screenshots of both videos"),
+                       (b_close, "Close both video windows")):
             b.pack(side="left", padx=(5, 0))
-            Tooltip(b, tip)
             self._ctrls.append(b)
+            Tooltip(b, tip)
+        self._sync_jump_labels()
+        try:
+            self.jump_sec.trace_add("write", lambda *a: self._sync_jump_labels())
+        except Exception:
+            pass
 
         sp = ttk.Frame(trans)
         sp.pack(side="right")
@@ -2374,7 +2607,8 @@ class SyncApp:
         ttk.Label(sp, text="Jump:").pack(side="left", padx=(12, 4))
         self.jump_entry = ttk.Entry(sp, textvariable=self.jump_sec, width=4, justify="center")
         self.jump_entry.pack(side="left")
-        Tooltip(self.jump_entry, "Arrow key jump distance in seconds (customizable).")
+        Tooltip(self.jump_entry,
+                "Seek distance in seconds for the arrow keys AND the \u23ea / ▶ buttons (0.5 - 120).")
         ttk.Label(sp, text="s").pack(side="left", padx=(2, 0))
         self._ctrls.append(self.jump_entry)
 
@@ -2769,6 +3003,36 @@ class SyncApp:
                 messagebox.showinfo(APP_NAME, "%s %s is the latest release."
                                               % (APP_NAME, APP_VERSION))
 
+    def _open_settings(self):
+        SettingsDialog(self.root, self)
+
+    def _apply_youtube_quality(self):
+        """Apply the playback quality: the spawn default AND live players.
+
+        mpv reads --ytdl-format at spawn, but ytdl-format is also a runtime
+        property, so loaded players pick the change up on their next URL
+        load without a restart.
+        """
+        expr = set_playback_quality(self.youtube_quality)
+        for tag, p in (getattr(self, "players", {}) or {}).items():
+            try:
+                if p is not None and getattr(p, "proc", None) is not None \
+                        and p.proc.poll() is None:
+                    p.cmd({"command": ["set_property", "ytdl-format", expr]})
+            except Exception:
+                pass
+        return expr
+
+    def _sync_jump_labels(self):
+        """The seek buttons name the distance they actually step."""
+        try:
+            n = abs(float(self._get_jump_sec()))
+            lbl = ("%g" % n) + "s"
+            self.btn_back.config(text="\u23ea " + lbl)
+            self.btn_fwd.config(text=lbl + " \u25b6")
+        except Exception:
+            pass
+
     def _open_update_dialog(self):
         """The Update button: show what's new and install it."""
         check = self._last_check
@@ -2828,33 +3092,6 @@ class SyncApp:
         self.status_lbl.config(text="Reaction downloaded \u2192 %s" % path)
         if self.started:
             self._start()          # reload both feeds from the local copy
-
-    def _url(self, idx):
-        cur = self.movie_path.get() if idx == 0 else self.react_path.get()
-        win = tk.Toplevel(self.root)
-        win.title("Paste URL")
-        win.configure(bg="#16181d")
-        win.geometry("520x120")
-        win.transient(self.root)
-        ttk.Label(win, text="YouTube / any URL (resolved via yt-dlp):").pack(pady=(12, 4))
-        e = ttk.Entry(win, width=70)
-        e.insert(0, cur if cur.startswith("http") else "")
-        e.pack(padx=12)
-        e.focus_set()
-
-        def ok():
-            v = e.get().strip()
-            if v:
-                if idx == 0:
-                    self.movie_path.set(v)
-                else:
-                    self.react_path.set(v)
-            win.destroy()
-
-        def ok_enter(event):
-            ok()
-        e.bind("<Return>", ok_enter)
-        ttk.Button(win, text="Use this URL", command=ok).pack(pady=8)
 
     def _swap(self):
         a, b = self.movie_path.get(), self.react_path.get()
@@ -3416,8 +3653,18 @@ class SyncApp:
             "- Go-to: type a timecode (90 / 83:45 / 1:23:45) in the Master" + chr(10) +
             "  row and press Enter to jump both videos there. Time labels" + chr(10) +
             "  show HH:MM:SS once a video exceeds an hour." + chr(10) +
-            "- Shortcuts: Space play/pause both, Left/Right seek 5 s" + chr(10) +
-            "  both, arrow keys nudge the PiP pane while dragging.")
+            "- URLs: paste one straight into a source field (or drag it in)" + chr(10) +
+            "  and Start - yt-dlp resolves it. Playback quality is picked in" + chr(10) +
+            "  Settings and defaults to 1080p." + chr(10) +
+            "- Settings (in the header): YouTube playback quality, download" + chr(10) +
+            "  connections, and the seek distance." + chr(10) +
+            "- Download: saves the reaction to disk at a chosen quality, with" + chr(10) +
+            "  a Connections box (1-16 parallel fetches, like a download" + chr(10) +
+            "  manager) - more finishes sooner on a fast link." + chr(10) +
+            "- Seek buttons: the two next to Start move by the Jump distance" + chr(10) +
+            "  (5 s by default), so they can be made as fine as you need." + chr(10) +
+            "- Shortcuts: Space play/pause both, Left/Right seek by the Jump" + chr(10) +
+            "  distance, arrow keys nudge the PiP pane while dragging.")
         lbl = tk.Label(w, text=txt, bg="#16181d", fg="#e8e8ea",
                        justify="left", font=("Segoe UI", 10))
         lbl.pack(padx=14, pady=(12, 6))
@@ -5022,6 +5269,14 @@ class SyncApp:
             self.vol_m.set(float(c.get("vol_m", 100.0)))
             self.speed.set(float(c.get("speed", 1.0)))
             self.jump_sec.set(float(c.get("jump_sec", 5.0)))
+            self.youtube_quality = str(c.get("youtube_quality")
+                                       or DEFAULT_YOUTUBE_QUALITY)
+            try:
+                self.download_connections = max(
+                    1, min(16, int(c.get("download_connections", 8) or 8)))
+            except Exception:
+                self.download_connections = 8
+            set_playback_quality(self.youtube_quality)
             al = c.get("alignments")
             if isinstance(al, dict):
                 self._alignments = {str(k): v for k, v in al.items() if k}
@@ -5043,6 +5298,8 @@ class SyncApp:
                     "vol_m": self.vol_m.get(),
                     "speed": self.speed.get(),
                     "jump_sec": self.jump_sec.get(),
+                    "youtube_quality": self.youtube_quality,
+                    "download_connections": self.download_connections,
                     "alignments": self._alignments,
                     "update_checked_at": self._update_checked_at,
                 }, f, indent=2)
