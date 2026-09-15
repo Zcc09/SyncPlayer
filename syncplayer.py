@@ -55,9 +55,13 @@ except Exception:
     _HAS_PIL = False
 from tkinter import ttk, filedialog, messagebox
 import sp_plat as plat   # cross-platform: paths, mpv IPC, window control
+try:                     # release checks/downloads, shared with the
+    import updater as sp_upd   # SyncPlayer-Updater build
+except Exception:
+    sp_upd = None
 
 APP_NAME = "SyncPlayer"
-APP_VERSION = "1.6.3"
+APP_VERSION = "1.6.4"
 
 
 class MpvNotFoundError(Exception):
@@ -1883,6 +1887,233 @@ class DownloadDialog(tk.Toplevel):
             pass
 
 
+# ---------------------------------------------------------------------------
+# in-app updater
+#
+# The release check runs in a background thread (never blocking the UI), at most
+# once per UPDATE_INTERVAL, and stays silent when offline. The header shows the
+# version - clicking it forces a check - and an "Update to X" button appears only
+# when there is something newer. Installing replaces the files and offers a
+# restart: a running exe can be renamed on Windows, so the swap works in place and
+# the leftovers are swept on the next start.
+# ---------------------------------------------------------------------------
+UPDATE_INTERVAL = 6 * 3600          # seconds between automatic release checks
+UPDATE_CFG_KEY = "update_checked_at"
+
+
+def _self_install_dir():
+    """Where this copy of SyncPlayer lives (env override first: tests use it)."""
+    env = os.environ.get("SYNCPLAYER_INSTALL_DIR")
+    if env:
+        return os.path.abspath(env)
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return BASE
+
+
+def _update_summary(check):
+    """[(name, current, latest)] for everything that would change."""
+    rows = []
+    app_row = (check or {}).get("app") or {}
+    if app_row.get("available"):
+        rows.append(("SyncPlayer", app_row.get("current"), app_row.get("latest")))
+    for key, label in (("mpv", "mpv"), ("ytdlp", "yt-dlp")):
+        c = (check or {}).get(key) or {}
+        if c.get("available") or c.get("missing"):
+            rows.append((label, c.get("current") or "not installed", c.get("latest")))
+    return rows
+
+
+def _check_release(install_dir):
+    """Ask GitHub what the latest release is. Never raises: errors are returned."""
+    if not sp_upd:
+        return {"error": "the updater is not available in this build",
+                "app": {}, "mpv": {}, "ytdlp": {}}
+    try:
+        if os.name == "nt":
+            return sp_upd.run_check(install_dir)
+        rel = sp_upd.github_latest("Zcc09/SyncPlayer")
+        name = "%s-%s-linux.tar.gz" % (APP_NAME, rel["version"])
+        return {"install_dir": install_dir,
+                "app": {"current": APP_VERSION,
+                        "latest": rel["version"],
+                        "available": sp_upd.ver_gt(rel["version"], APP_VERSION),
+                        "linux": rel["assets"].get(name),
+                        "notes": rel.get("body", ""),
+                        "page": rel.get("page", "")},
+                "mpv": {}, "ytdlp": {}}
+    except Exception as e:
+        return {"error": str(e), "app": {}, "mpv": {}, "ytdlp": {}}
+
+
+class UpdateDialog(tk.Toplevel):
+    """What's new, then download + install, then offer a restart."""
+
+    def __init__(self, master, app, check, on_restart=None):
+        tk.Toplevel.__init__(self, master)
+        self.app = app
+        self.check = check
+        self.on_restart = on_restart
+        self.cancel = threading.Event()
+        self.q = queue.Queue()
+        self.busy = False
+        self.done = False
+        self.install_dir = _self_install_dir()
+        app_row = (check or {}).get("app") or {}
+
+        self.title("Update %s" % APP_NAME)
+        self.configure(bg="#16181d")
+        self.geometry("660x540")
+        self.minsize(560, 460)
+        self.transient(master)
+
+        tk.Label(self, text="Update available", bg="#16181d", fg="#e8e8ea",
+                 font=("Segoe UI", 12, "bold")).pack(anchor="w", padx=14, pady=(12, 4))
+        rows = _update_summary(check)
+        for name, cur, latest in rows:
+            tk.Label(self, text="%s   %s  \u2192  %s" % (name, cur, latest),
+                     bg="#16181d", fg="#4f9cf9",
+                     font=("Consolas", 10)).pack(anchor="w", padx=14)
+        if not rows:
+            tk.Label(self, text="Nothing to install.", bg="#16181d",
+                     fg="#8a8f9a").pack(anchor="w", padx=14)
+        if app_row.get("page"):
+            tk.Label(self, text=app_row["page"], bg="#16181d",
+                     fg="#8a8f9a").pack(anchor="w", padx=14)
+
+        tk.Label(self, text="What's new", bg="#16181d", fg="#e8e8ea",
+                 font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=14, pady=(10, 2))
+        self.notes = tk.Text(self, height=10, bg="#1f232b", fg="#d6d9e0", relief="flat",
+                             wrap="word", insertbackground="#e8e8ea")
+        self.notes.pack(fill="both", expand=True, padx=14)
+        self.notes.insert("1.0", (app_row.get("notes") or "").strip()
+                          or "No release notes for this version.")
+        self.notes.configure(state="disabled")
+
+        self.bar = ttk.Progressbar(self, mode="determinate", maximum=100, value=0)
+        self.bar.pack(fill="x", padx=14, pady=(10, 2))
+        self.status = tk.Label(self, text="", bg="#16181d", fg="#8a8f9a", anchor="w")
+        self.status.pack(fill="x", padx=14)
+        self.log = tk.Text(self, height=4, bg="#12141a", fg="#9aa0ac", relief="flat",
+                           wrap="none")
+        self.log.pack(fill="x", padx=14, pady=(6, 0))
+
+        btns = tk.Frame(self, bg="#16181d")
+        btns.pack(fill="x", padx=14, pady=12)
+        self.btn_go = ttk.Button(btns, text="Download && install",
+                                 style="Accent.TButton", width=20, command=self.start)
+        self.btn_go.pack(side="right")
+        self.btn_later = ttk.Button(btns, text="Later", width=8, command=self.close)
+        self.btn_later.pack(side="right", padx=(0, 6))
+        self.btn_restart = ttk.Button(btns, text="Restart %s" % APP_NAME, width=18,
+                                      command=self.restart)
+        if not sp_upd:
+            self.btn_go.state(["disabled"])
+            self.status.config(text="The updater is not available in this build.")
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        self.bind("<Escape>", lambda e: self.close())
+        self.after(120, self._pump)
+
+    # -- install ----------------------------------------------------------
+    def start(self):
+        if self.busy or not sp_upd:
+            return
+        self.busy = True
+        self.btn_go.state(["disabled"])
+        self.btn_later.state(["disabled"])
+        self.status.config(text="Stopping playback, then downloading\u2026")
+        try:
+            self.app._stop()          # the files being replaced must not be in use
+        except Exception:
+            pass
+
+        def progress(pct, text=None):
+            self.q.put(("progress", pct))
+
+        def work():
+            logs = []
+            try:
+                if os.name == "nt":
+                    logs = sp_upd.apply_updates(self.install_dir, self.check,
+                                                progress=progress)
+                else:
+                    logs = sp_upd.apply_linux_tarball(self.install_dir, self.check,
+                                                      progress=progress)
+                self.q.put(("done", True, logs))
+            except Exception as e:
+                self.q.put(("done", False, logs + ["Failed: %s" % e]))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _pump(self):
+        try:
+            while True:
+                item = self.q.get_nowait()
+                if item[0] == "progress":
+                    if item[1] is not None:
+                        self.bar.configure(value=item[1])
+                        self.status.config(text="Downloading\u2026 %d%%"
+                                                % int(item[1]))
+                elif item[0] == "done":
+                    self._finish(item[1], item[2])
+        except queue.Empty:
+            pass
+        try:
+            if self.winfo_exists():
+                self.after(120, self._pump)
+        except Exception:
+            pass
+
+    def _finish(self, ok, logs):
+        self.busy = False
+        # A staged build counts as success: it installs itself on the next start.
+        # Only the app failing outright means the update did not happen.
+        ok = (not any("SyncPlayer update failed" in l for l in (logs or []))
+              and any(("SyncPlayer updated" in l or "SyncPlayer staged" in l)
+                      for l in (logs or [])))
+        self.done = bool(ok)
+        for line in logs or []:
+            self.log.insert("end", line + "\n")
+        self.log.see("end")
+        self.btn_later.state(["!disabled"])
+        if ok:
+            staged = any("staged" in l for l in (logs or []))
+            self.bar.configure(value=100)
+            self.status.config(text=("Installed \u2014 restart %s to run it."
+                                     % APP_NAME) if not staged else
+                                    "Prepared \u2014 it installs on the next start.")
+            if not staged:
+                pass
+            self.btn_go.pack_forget()
+            self.btn_restart.pack(side="right", padx=(0, 6))
+            self.btn_later.config(text="Close")
+            try:
+                self.app._status_pin = time.monotonic() + 10.0
+                self.app.status_lbl.config(text="Update installed \u2014 restart to "
+                                               "use the new version.")
+            except Exception:
+                pass
+        else:
+            self.status.config(text="Update failed \u2014 see the log above.")
+            self.btn_go.state(["!disabled"])
+
+    def restart(self):
+        if self.on_restart and self.done:
+            self.on_restart(os.path.join(self.install_dir, APP_NAME + ".exe"))
+
+    def close(self):
+        if self.busy:
+            if not messagebox.askyesno(APP_NAME, "An update is still downloading. "
+                                                 "Stop it and close?"):
+                return
+            self.cancel.set()
+        try:
+            if self.winfo_exists():
+                self.destroy()
+        except Exception:
+            pass
+
+
 class SyncApp:
     def __init__(self, root):
         self.root = root
@@ -1974,6 +2205,11 @@ class SyncApp:
         self.saved_vol_a = 100.0
         self.saved_vol_b = 100.0
 
+        self.update_q = queue.Queue()
+        self._update_busy = False
+        self._last_check = None
+        self._update_checked_at = 0.0
+        self._update_manual = False
         self._load_config()
         self._build_ui()
         self._apply_startup_cli()
@@ -2052,7 +2288,17 @@ class SyncApp:
                   style="Dim.TLabel").pack(side="left", padx=(10, 0), pady=(4, 0))
         self.btn_help = ttk.Button(top, text="❓ Help", width=7, command=self._show_help)
         self.btn_help.pack(side="right")
-        Tooltip(self.btn_help, "Open the full guide: sync workflow, PiP modes, tracks, shortcuts.")
+        Tooltip(self.btn_help, "Open the full guide: sync workflow, PiP modes, "
+                            "tracks, shortcuts.")
+        self.btn_update = ttk.Button(top, text="\u2b06 Update", style="Accent.TButton",
+                                     width=18, command=self._open_update_dialog)
+        Tooltip(self.btn_update, "A newer release is available - see what changed "
+                                 "and install it from here.")
+        self.btn_ver = ttk.Button(top, text="v%s \u27f3" % APP_VERSION, width=11,
+                                  command=lambda: self._update_check(manual=True))
+        self.btn_ver.pack(side="right", padx=(0, 6))
+        Tooltip(self.btn_ver, "Click to check GitHub for a newer release.")
+        self.root.after(4500, self._auto_update_check)
 
         body = ttk.Frame(self.root, padding=(12, 4, 12, 8))
         body.pack(fill="both", expand=True)
@@ -2438,6 +2684,115 @@ class SyncApp:
                 self.movie_path.set(p)
             else:
                 self.react_path.set(p)
+
+    def _drain_update_queue(self):
+        """Pick up a finished release check (runs on the UI thread)."""
+        try:
+            check = self.update_q.get_nowait()
+        except Exception:
+            return
+        try:
+            self._on_update_result(check)
+        except Exception:
+            self._update_busy = False
+
+    def _auto_update_check(self):
+        """Startup check, at most once per UPDATE_INTERVAL, silent if offline."""
+        if sp_upd:
+            try:                     # leftovers from a previous self-update
+                sp_upd.sweep_update_leftovers(self._install_dir())
+            except Exception:
+                pass
+            try:                     # a build staged while it could not be swapped
+                if sp_upd.apply_pending_update(self._install_dir()):
+                    self._status_pin = time.monotonic() + 12.0
+                    self.status_lbl.config(
+                        text="An update was installed \u2014 restart %s to use it."
+                             % APP_NAME)
+            except Exception:
+                pass
+        if time.time() - (self._update_checked_at or 0) < UPDATE_INTERVAL:
+            return
+        self._update_check(manual=False)
+
+    def _install_dir(self):
+        return _self_install_dir()
+
+    def _update_check(self, manual=False):
+        """Ask GitHub for the latest release in the background."""
+        if not sp_upd:
+            if manual:
+                messagebox.showinfo(APP_NAME, "The updater is not available in this "
+                                              "build.")
+            return
+        if self._update_busy:
+            return
+        self._update_busy = True
+        self._update_manual = manual
+        self._update_checked_at = time.time()
+        if manual:
+            self.btn_ver.config(text="checking\u2026")
+            self._status_pin = time.monotonic() + 4.0
+            self.status_lbl.config(text="Checking GitHub for updates\u2026")
+        install_dir = self._install_dir()
+
+        def work():
+            self.update_q.put(_check_release(install_dir))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_update_result(self, check):
+        manual = self._update_manual
+        self._update_manual = False
+        self._update_busy = False
+        self.btn_ver.config(text="v%s \u27f3" % APP_VERSION)
+        rows = _update_summary(check)
+        if rows:
+            self._last_check = check
+            app_row = check.get("app") or {}
+            self.btn_update.config(text=("\u2b06 Update to %s" % app_row["latest"])
+                                   if app_row.get("available") else "\u2b06 Update")
+            self.btn_update.pack(side="right", padx=(0, 6))
+            self._status_pin = time.monotonic() + 10.0
+            self.status_lbl.config(text="Update available: %s"
+                                        % ", ".join("%s %s\u2192%s" % r for r in rows))
+        else:
+            self._last_check = check
+            self.btn_update.pack_forget()
+            err = check.get("error")
+            if err:
+                self._status_pin = time.monotonic() + 6.0
+                self.status_lbl.config(text="Update check failed: %s" % str(err)[:60])
+            elif manual:
+                messagebox.showinfo(APP_NAME, "%s %s is the latest release."
+                                              % (APP_NAME, APP_VERSION))
+
+    def _open_update_dialog(self):
+        """The Update button: show what's new and install it."""
+        check = self._last_check
+        if not check or not _update_summary(check):
+            self._update_check(manual=True)
+            return
+        UpdateDialog(self.root, self, check, on_restart=self._restart_after_update)
+
+    def _restart_after_update(self, exe):
+        """Start the freshly installed exe, then close this instance."""
+        self._status_pin = time.monotonic() + 3.0
+        self.status_lbl.config(text="Restarting\u2026")
+        try:
+            subprocess.Popen([exe], cwd=os.path.dirname(exe), **plat.popen_extra())
+        except Exception as e:
+            messagebox.showerror(APP_NAME,
+                                 "Could not start the new version:\n\n%s\n\n"
+                                 "Start %s again yourself." % (e, APP_NAME))
+            return
+        try:
+            self._on_close()
+        except Exception:
+            try:
+                self.root.destroy()
+            except Exception:
+                pass
 
     def _download_reaction(self):
         """Download the reaction at a chosen quality, so it plays from disk.
@@ -4230,6 +4585,8 @@ class SyncApp:
 
     def _poll(self):
 
+        self._drain_update_queue()
+
         for t in ("A", "B"):
             p = self.players.get(t)
             if not p:
@@ -4666,6 +5023,10 @@ class SyncApp:
             al = c.get("alignments")
             if isinstance(al, dict):
                 self._alignments = {str(k): v for k, v in al.items() if k}
+            try:
+                self._update_checked_at = float(c.get("update_checked_at") or 0)
+            except Exception:
+                self._update_checked_at = 0.0
         except Exception:
             pass
 
@@ -4681,6 +5042,7 @@ class SyncApp:
                     "speed": self.speed.get(),
                     "jump_sec": self.jump_sec.get(),
                     "alignments": self._alignments,
+                    "update_checked_at": self._update_checked_at,
                 }, f, indent=2)
         except Exception:
             pass

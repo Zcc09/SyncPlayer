@@ -16,6 +16,7 @@ together for the whole runtime.**
 | 🔊 **Audio** | Independent volume slider + mute per video, plus a master volume scaling both. |
 | 🎵 **Tracks** | Per-video **audio** and **subtitle** pickers (built from each file's own track list; Off disables). |
 | ⬇ **Download** | Sits in the **Reaction** row: pick a quality (listed by yt-dlp itself, *Best available* on top) and the video is saved to `%USERPROFILE%\Downloads\SyncPlayer`, then the reaction is repointed at that local file - downloaded reactions cannot stall mid-take the way a stream can. Without ffmpeg only single-file formats are offered (usually up to 720p); with it, separate video+audio streams are merged for full quality. |
+| ⬆ **Updates** | In the app: the header shows your version (**v1.6.4 ⟳**) — click it to check GitHub on demand. When something newer exists an **Update to X** button appears with the release notes, live progress, and a **Restart** that starts the new version. Checks run in the background at most every 6 h and never touch your config, alignment, screenshots or downloads. If Windows will not let the running exe be swapped, the new build is staged and installed on the next start. |
 | 🎛 **Transport** | ±10 s jumps, restart, close, screenshots of both videos; **speed** editable (type 1.35 and Enter) with ±0.05 nudge buttons. |
 | 🧷 **Remembers the alignment** | The Movie↔Reaction offset is saved **per source pair**: next time you load the same two videos, the reaction is already on its spot. The `🔗 Align` button shows the stored offset — click it to forget it, or after re-aligning to store the new one. |
 | 💾 **Persistence** | Paths, volumes, speed **and remembered alignments** saved between sessions. |
@@ -232,12 +233,12 @@ syncplayer.py        # the whole app (panel + two mpv drivers + sync loop)
 sp_plat.py           # platform layer: Win32 + X11 window backends, mpv/yt-dlp
                      # discovery, IPC transport (named pipe / unix socket),
                      # config + screenshot locations
-selftest.py          # 82-check headless verification (python selftest.py)
+selftest.py          # 96-check headless verification (python selftest.py)
 selftest_plat.py     # 21-check platform layer: paths, discovery, real mpv IPC
                      # round trip (runs on Windows AND Linux)
 selftest_x11.py      # 17-check Linux/X11 window features against two REAL mpv
                      # windows (find/arrange/borderless/ontop/embed/undock)
-gui_test.py          # 222-check END-TO-END test: drives the real GUI + real
+gui_test.py          # 234-check END-TO-END test: drives the real GUI + real
                      # mpv processes (python gui_test.py) — bars track, per-
                      # video seeks, drift correction (rate trim + seek), volume
                      # read-back from mpv, speed, pause, Sync Lock, PiP, frame-
@@ -247,7 +248,8 @@ gui_test.py          # 222-check END-TO-END test: drives the real GUI + real
                      # remembered alignment, subtitle drag & drop
 installer.py         # Setup wizard (folder / components / shortcuts) + silent
                      # install + Add-Remove-Programs registration
-updater.py           # checks/installs latest SyncPlayer + mpv + yt-dlp releases
+updater.py           # release checks + installs (shared by the in-app updater and
+                     # the standalone SyncPlayer-Updater.exe)
 install_test.py      # DEPLOYMENT test (Windows, 101 checks): drives the real wizard
                      # page by page (footer visible on every page, refused protected folders, chosen folder,
                      # custom Start-Menu folder, Add/Remove entry, uninstall) plus

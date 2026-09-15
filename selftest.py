@@ -523,5 +523,89 @@ try:
 except Exception:
     pass
 
+# ---------------------------------------------------------------- updater --
+# The in-app updater: what it offers, and what it does when a file cannot be
+# swapped (a running exe is exactly that case).
+import ctypes as _ct
+import tempfile as _tf2
+
+_upd_ok = True
+try:
+    import updater as _upd
+except Exception as _e:                       # updater is optional
+    _upd_ok = False
+    print("  (updater import failed: %s)" % _e)
+check("updater: the module imports where the app does", _upd_ok)
+check("updater: the API base can be redirected for tests",
+      "{" not in _upd.API and ("%s" in _upd.API),
+      _upd.API[:70])
+check("updater: a newer tag is detected and an equal one is not",
+      _upd.ver_gt("1.6.5", "1.6.4") and not _upd.ver_gt("1.6.4", "1.6.4")
+      and not _upd.ver_gt("1.6.3", "1.6.4") and _upd.ver_gt("1.6.10", "1.6.9"))
+check("updater: a short tag like v2.0 still counts as newer",
+      _upd.parse_version("2.0") == (2, 0, 0)
+      and _upd.parse_version("v3") == (3, 0, 0)
+      and _upd.ver_gt("2.0", "1.9.9") and _upd.ver_gt("v2", "1.9.9"),
+      str(_upd.parse_version("2.0")))
+check("updater: date-style versions compare correctly",
+      _upd.ver_gt("2026.08.20", "2026.08.19")
+      and not _upd.ver_gt("2026.08.19", "2026.08.19"))
+
+# _update_summary: only what would actually change is offered
+_sum = sp._update_summary({"app": {"available": True, "current": "1.0", "latest": "2.0"},
+                           "mpv": {"available": False, "missing": False},
+                           "ytdlp": {"available": False, "missing": False}})
+check("updater: only outdated or missing pieces are offered",
+      [r[0] for r in _sum] == ["SyncPlayer"], str(_sum))
+_sum2 = sp._update_summary({"app": {"available": False},
+                            "mpv": {"missing": True, "latest": "0.42.0"},
+                            "ytdlp": {"available": True, "current": "1", "latest": "2"}})
+check("updater: a missing mpv and an old yt-dlp are both offered",
+      [r[0] for r in _sum2] == ["mpv", "yt-dlp"], str(_sum2))
+check("updater: a current install offers nothing",
+      sp._update_summary({"app": {"available": False}, "mpv": {}, "ytdlp": {}}) == [])
+
+# replacing a file nobody holds, and one that is locked solid
+_u = _tf2.mkdtemp(prefix="sp_upd_")
+_exe = os.path.join(_u, "SyncPlayer.exe")
+_new = os.path.join(_u, "staged-src.exe")
+with open(_exe, "wb") as _f:
+    _f.write(b"OLD")
+with open(_new, "wb") as _f:
+    _f.write(b"NEW")
+_ok, _detail = _upd.replace_running_exe(_new, _exe)
+check("updater: a free exe is replaced in place",
+      _ok and open(_exe, "rb").read() == b"NEW", str(_detail))
+
+if os.name == "nt":                          # the lock trick is Windows-only
+    with open(_exe, "wb") as _f:      # closed before the exclusive lock below
+        _f.write(b"OLD-again")
+    _k32 = _ct.windll.kernel32
+    _h = _k32.CreateFileW(_exe, 0x80000000, 0, None, 3, 0, None)   # share=0
+    _ok2, _detail2 = _upd.replace_running_exe(_new, _exe)
+    check("updater: an unswappable exe is STAGED rather than crashed on",
+          _ok2 is False and _detail2.endswith(".new") and os.path.isfile(_detail2),
+          os.path.basename(_detail2))
+    if _h not in (0, -1, None):
+        _k32.CloseHandle(_h)
+    check("updater: the staged build installs at the next start",
+          _upd.apply_pending_update(_u) and open(_exe, "rb").read() == b"NEW")
+    check("updater: a pending .new file is not swept away",
+          not os.path.isfile(_exe + ".new"))
+else:
+    print("  (skipping the locked-file case: not Windows)")
+
+with open(os.path.join(_u, "junk.old"), "wb") as _f:
+    _f.write(b"x")
+_removed = _upd.sweep_update_leftovers(_u)
+check("updater: .old leftovers are swept after an update",
+      "junk.old" in _removed and not os.path.isfile(os.path.join(_u, "junk.old")),
+      str(_removed))
+check("updater: the install dir can be redirected (tests rely on it)",
+      sp._self_install_dir() == os.path.abspath(os.environ.get(
+          "SYNCPLAYER_INSTALL_DIR") or sp._self_install_dir()))
+import shutil as _sh2
+_sh2.rmtree(_u, ignore_errors=True)
+
 print("==== %d/%d checks passed ====" % (passed, passed + failed))
 sys.exit(0 if failed == 0 else 1)

@@ -1434,6 +1434,149 @@ check("capture: a failed capture leaves playback state exactly as it was",
       _pa.paused == _state_before_bad,
       "paused=%s (was %s)" % (_pa.paused, _state_before_bad))
 
+# ------------------------------------------- 12d. in-app updater ------------
+# A fake GitHub serves a "9.9.9" release (notes + asset) and current-ish tags for
+# mpv/yt-dlp. The app is pointed at it, told to check, and driven through the
+# dialog: nothing here touches the network or the real install.
+import http.server as _uh
+import json as _uj
+import socketserver as _us
+import threading as _ut
+
+_FAKE_EXE = b"MZ-fake-9.9.9-" + b"u" * 4000
+_upd_install = tempfile.mkdtemp(prefix="sp_gui_upd_")
+open(os.path.join(_upd_install, "SyncPlayer.exe"), "wb").write(b"MZ-old" + b"o" * 200)
+os.makedirs(os.path.join(_upd_install, "mpv"), exist_ok=True)
+open(os.path.join(_upd_install, "mpv", "mpv.exe"), "wb").write(b"x")
+open(os.path.join(_upd_install, "mpv", "yt-dlp.exe"), "wb").write(b"x")
+_uj.dump({"app_version": sp.APP_VERSION, "mpv_version": "0.41.0",
+          "ytdlp_version": "2026.08.19", "install_dir": _upd_install},
+         open(os.path.join(_upd_install, "install.json"), "w"))
+
+
+class _UpdHandler(_uh.BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def _send(self, obj):
+        body = _uj.dumps(obj).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        host = "http://127.0.0.1:%d" % self.server.server_address[1]
+        if self.path.endswith("/releases/latest"):
+            if "Zcc09/SyncPlayer" in self.path:
+                self._send({"tag_name": "v9.9.9", "html_url": host + "/rel",
+                            "body": "## 9.9.9\n* in-app updater\n",
+                            "assets": [{"name": "SyncPlayer.exe", "size": len(_FAKE_EXE),
+                                        "browser_download_url": host + "/dl/app.exe"}]})
+            elif "yt-dlp" in self.path:
+                self._send({"tag_name": "2026.08.19", "assets": []})
+            else:
+                self._send({"tag_name": "v0.41.0", "assets": [
+                    {"name": "mpv-v0.41.0-x86_64-w64-mingw32.zip", "size": 4,
+                     "browser_download_url": host + "/dl/mpv.zip"}]})
+            return
+        if self.path == "/dl/app.exe":
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(_FAKE_EXE)))
+            self.end_headers()
+            self.wfile.write(_FAKE_EXE)
+            return
+        self.send_error(404)
+
+
+_us_srv = _us.TCPServer(("127.0.0.1", 0), _UpdHandler)
+_ut.Thread(target=_us_srv.serve_forever, daemon=True).start()
+_api_old = os.environ.get("SYNCPLAYER_RELEASES_API")
+_dir_old = os.environ.get("SYNCPLAYER_INSTALL_DIR")
+os.environ["SYNCPLAYER_RELEASES_API"] = (
+    "http://127.0.0.1:%d/repos/%%s/releases/latest" % _us_srv.server_address[1])
+os.environ["SYNCPLAYER_INSTALL_DIR"] = _upd_install
+# The app's own startup check (real GitHub) may still be in flight and would land
+# after ours, overwriting the button and _last_check: clear that state first.
+app._last_check = None
+app._update_busy = False
+app._update_manual = False
+try:
+    while True:
+        app.update_q.get_nowait()
+except Exception:
+    pass
+try:
+    app.btn_update.pack_forget()
+except Exception:
+    pass
+
+check("updater: the header offers a version control",
+      "v%s" % sp.APP_VERSION in str(app.btn_ver.cget("text")),
+      str(app.btn_ver.cget("text")))
+check("updater: the Update button is hidden while nothing is newer",
+      not app.btn_update.winfo_ismapped())
+
+app._update_check(manual=True)
+
+def _upd_offered():
+    try:
+        return (app.btn_update.winfo_ismapped()
+                and "9.9.9" in str(app.btn_update.cget("text")))
+    except Exception:
+        return False
+
+
+# wait for the TEXT, not just visibility: an older result could have mapped it
+_ok_offered = wait_until(_upd_offered, 90)
+check("updater: a newer release makes the Update button appear", _ok_offered,
+      str(app.btn_update.cget("text")))
+check("updater: the status line says what is available",
+      "9.9.9" in str(app.status_lbl.cget("text")),
+      str(app.status_lbl.cget("text"))[:80])
+
+_dlg = sp.UpdateDialog(app.root, app, app._last_check,
+                       on_restart=app._restart_after_update)
+pump(0.5)
+check("updater dialog: it shows the release notes",
+      "in-app updater" in _dlg.notes.get("1.0", "end"))
+_dlg.start()
+_deadline = time.time() + 120
+while time.time() < _deadline and not _dlg.done:
+    pump(0.3)
+check("updater dialog: the install completes", _dlg.done,
+      str(_dlg.log.get("1.0", "end").strip().splitlines()[-1:]))
+check("updater dialog: the installed exe is the new build",
+      open(os.path.join(_upd_install, "SyncPlayer.exe"), "rb").read() == _FAKE_EXE)
+check("updater dialog: it offers a restart once installed",
+      (not _dlg.busy) and str(_dlg.btn_later.cget("text")) == "Close",
+      str(_dlg.btn_later.cget("text")))
+try:
+    _dlg.destroy()
+except Exception:
+    pass
+pump(0.3)
+
+if _api_old is None:
+    os.environ.pop("SYNCPLAYER_RELEASES_API", None)
+else:
+    os.environ["SYNCPLAYER_RELEASES_API"] = _api_old
+if _dir_old is None:
+    os.environ.pop("SYNCPLAYER_INSTALL_DIR", None)
+else:
+    os.environ["SYNCPLAYER_INSTALL_DIR"] = _dir_old
+try:
+    _us_srv.shutdown()
+except Exception:
+    pass
+app._last_check = None
+app._update_busy = False
+try:
+    app.btn_update.pack_forget()
+except Exception:
+    pass
+
 # ------------------------------------------------------- 13. clean close --
 config_path = sp.CONFIG_PATH
 app._on_close()

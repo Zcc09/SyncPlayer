@@ -16,7 +16,10 @@ Build:
       --name SyncPlayer-Updater --icon icon.ico updater.py
 """
 import ctypes
-from ctypes import wintypes
+try:                 # not present on Linux; only get_exe_version needs it
+    from ctypes import wintypes
+except Exception:    # pragma: no cover
+    wintypes = None
 import json
 import os
 import re
@@ -36,7 +39,10 @@ YTDLP_REPO = "yt-dlp/yt-dlp"
 # baseline "current" version when install.json has no mpv_version).
 MPV_RELEASE_VERSION = "0.41.0"
 
-API = "https://api.github.com/repos/%s/releases/latest"
+# Overridable so the deployment/in-app tests can serve a fake release from
+# a local HTTP server instead of GitHub.
+API = (os.environ.get("SYNCPLAYER_RELEASES_API")
+       or "https://api.github.com/repos/%s/releases/latest")
 
 
 def get_exe_version(path):
@@ -61,13 +67,21 @@ def get_exe_version(path):
 
 
 def parse_version(s):
-    """Turn 'v0.41.0' / '1.4.0' / '0.41.0-dev-g...' into (major, minor, patch)."""
+    """Turn 'v0.41.0' / '1.4.0' / '2.0' / '0.41.0-dev-g...' into (major, minor, patch).
+
+    Short versions are padded ("2.0" -> (2, 0, 0)): refusing to parse them meant a
+    release tagged that way would never be seen as newer, and the app would
+    silently never offer it.
+    """
     if not s:
         return None
-    m = re.search(r"(\d+)\.(\d+)\.(\d+)", str(s))
+    m = re.search(r"(\d+(?:\.\d+)*)", str(s))
     if not m:
         return None
-    return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    parts = [int(x) for x in m.group(1).split(".")]
+    while len(parts) < 3:
+        parts.append(0)
+    return tuple(parts[:3])
 
 
 def ver_gt(a, b):
@@ -132,7 +146,9 @@ def get_install_state(install_dir):
 
 
 def github_latest(owner_repo):
-    url = API % owner_repo
+    # read the override per call: tests (and anyone redirecting it) set the
+    # variable after this module has been imported
+    url = (os.environ.get("SYNCPLAYER_RELEASES_API") or API) % owner_repo
     req = urllib.request.Request(url, headers={
         "Accept": "application/vnd.github+json",
         "User-Agent": "SyncPlayer-Updater"})
@@ -145,7 +161,8 @@ def github_latest(owner_repo):
             "url": a.get("browser_download_url"),
             "size": a.get("size", 0),
         }
-    return {"tag": tag, "version": tag.lstrip("v"), "assets": assets}
+    return {"tag": tag, "version": tag.lstrip("v"), "assets": assets,
+            "body": d.get("body") or "", "page": d.get("html_url") or ""}
 
 
 def pick_mpv_asset(assets):
@@ -206,6 +223,114 @@ def replace_file(src, dst):
     os.replace(tmp, dst)
 
 
+def replace_running_exe(src, dst, backup_suffix=".old"):
+    """Replace an executable that may be the one running right now.
+
+    Returns (installed, detail). Windows will not let you overwrite a running image
+    but it does let you RENAME it, so the old file is moved aside and the new one
+    copied into the free name; the discarded copy is removed by
+    sweep_update_leftovers() on the next start. If the file cannot be swapped even
+    so, the new build is STAGED as "<dst>.new" and apply_pending_update() finishes
+    the job at the next start - a locked file must not fail the whole update.
+    """
+    old = dst + backup_suffix
+    first = None
+    try:
+        if os.path.isfile(dst):
+            if os.path.isfile(old):
+                os.remove(old)      # from a previous update, no longer running
+            os.replace(dst, old)    # allowed while the image is running
+        shutil.copy2(src, dst)
+        if os.path.isfile(dst):
+            return True, dst
+    except Exception as e:
+        first = e
+    staged = dst + ".new"
+    try:
+        shutil.copy2(src, staged)
+        return False, staged
+    except Exception as e:
+        return False, "could not replace %s (%s) nor stage it (%s)" % (dst, first, e)
+
+
+def apply_pending_update(install_dir, log=None):
+    """Install a build a previous run could only stage. True if one was installed
+    (the caller should mention a restart)."""
+    out = log if log is not None else []
+    exe = os.path.join(install_dir, APP_NAME + ".exe")
+    staged = exe + ".new"
+    if not os.path.isfile(staged):
+        return False
+    installed, _detail = replace_running_exe(staged, exe)
+    if installed:
+        try:
+            os.remove(staged)
+        except Exception:
+            pass
+        out.append("A staged update was installed; restart to use it.")
+        return True
+    return False
+
+
+def sweep_update_leftovers(install_dir, log=None):
+    """Delete *.old / *.tmp files a previous self-update could not remove."""
+    removed = []
+    for name in os.listdir(install_dir):
+        if name.endswith((".old", ".tmp")):
+            path = os.path.join(install_dir, name)
+            if not os.path.isfile(path):
+                continue
+            try:
+                os.remove(path)
+                removed.append(name)
+            except Exception:
+                pass                        # still the running image; try next time
+    if removed and log is not None:
+        log.append("Cleaned update leftovers: %s" % ", ".join(removed))
+    return removed
+
+
+def apply_linux_tarball(install_dir, check, progress=None, log=None):
+    """Install a Linux release by unpacking its tarball over the app directory.
+
+    The Linux build is source + install.sh (nothing to swap atomically), so this
+    replaces the source files while keeping the user's config, which lives
+    elsewhere. Returns a log list.
+    """
+    import tarfile
+    out = log if log is not None else []
+    asset = check.get("app", {}).get("linux")
+    if not asset or not asset.get("url"):
+        out.append("No Linux tarball in that release.")
+        return out
+    tmp = tempfile.mktemp(suffix=".tar.gz")
+    try:
+        download(asset["url"], tmp, progress=progress)
+        with tarfile.open(tmp, "r:gz") as tf:
+            members = [m for m in tf.getmembers() if m.isfile()
+                       or m.isdir() or m.issym()]
+            # strip the top-level "<App>-<ver>-linux/" directory
+            roots = {m.name.split("/")[0] for m in members if "/" in m.name}
+            prefix = (roots.pop() + "/") if len(roots) == 1 else ""
+            for m in members:
+                if prefix and not m.name.startswith(prefix):
+                    continue
+                m.name = m.name[len(prefix):] if prefix else m.name
+                if not m.name:
+                    continue
+                tf.extract(m, install_dir, filter="data")
+        out.append("Unpacked %s into %s" % (asset.get("url", "").split("/")[-1],
+                                            install_dir))
+    except Exception as e:
+        out.append("Linux update failed: %s" % e)
+    finally:
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+    return out
+
+
 def run_check(install_dir):
     """Return a status dict comparing installed vs latest for both apps."""
     st = get_install_state(install_dir)
@@ -218,6 +343,9 @@ def run_check(install_dir):
             "latest": sp["version"],
             "available": ver_gt(sp["version"], st["app_version"]),
             "asset": sp["assets"].get(APP_NAME + ".exe"),
+            "linux": sp["assets"].get("%s-%s-linux.tar.gz" % (APP_NAME, sp["version"])),
+            "notes": sp.get("body", ""),
+            "page": sp.get("page", ""),
         }
     except Exception as e:
         out["app"] = {"error": str(e)}
@@ -254,59 +382,45 @@ def run_check(install_dir):
 
 
 def apply_updates(install_dir, check, progress=None):
-    """Download and install whatever is missing/outdated. Returns log list."""
+    """Download and install whatever is missing or outdated. Returns a log list.
+
+    Each component is isolated: mpv or yt-dlp failing (unreachable asset, no room,
+    a held file) must not lose an app update that already succeeded - the log names
+    what failed, and "SyncPlayer update failed" is the only line that means the app
+    itself did not get installed.
+    """
     log = []
     os.makedirs(install_dir, exist_ok=True)
 
-    app_asset = check.get("app", {}).get("asset")
-    app_avail = check.get("app", {}).get("available")
-    app_url = app_asset.get("url") if app_asset else None
-    if app_url:
-        log.append("Updating SyncPlayer...")
-        tmp = tempfile.mktemp(suffix=".exe")
-        download(app_url, tmp, progress=progress)
-        replace_file(tmp, os.path.join(install_dir, APP_NAME + ".exe"))
-        os.remove(tmp)
-        log.append("SyncPlayer updated.")
+    try:
+        _apply_app(install_dir, check.get("app") or {}, progress, log)
+    except Exception as e:
+        log.append("SyncPlayer update failed: %s" % e)
+    try:
+        _apply_mpv(install_dir, check.get("mpv") or {}, progress, log)
+    except Exception as e:
+        log.append("mpv update failed: %s" % e)
+    try:
+        _apply_ytdlp(install_dir, check.get("ytdlp") or {}, progress, log)
+    except Exception as e:
+        log.append("yt-dlp update failed: %s" % e)
 
-    mpv = check.get("mpv", {})
-    mpv_url = mpv.get("asset", {}).get("url") if mpv.get("asset") else None
-    if mpv.get("missing") or mpv.get("available"):
-        if mpv_url:
-            log.append("Updating mpv..." if not mpv.get("missing")
-                       else "Installing mpv...")
-            tmp = tempfile.mktemp(suffix=".zip")
-            download(mpv_url, tmp, progress=progress)
-            mpv_dir = os.path.join(install_dir, "mpv")
-            extract_mpv(tmp, mpv_dir)
-            os.remove(tmp)
-            log.append("mpv installed/updated.")
-        else:
-            log.append("mpv update requested but no matching asset found.")
-
-    ytdlp = check.get("ytdlp", {})
-    ytdlp_url = ytdlp.get("asset", {}).get("url") if ytdlp.get("asset") else None
-    if ytdlp.get("missing") or ytdlp.get("available"):
-        if ytdlp_url:
-            log.append("Updating yt-dlp...")
-            tmp = tempfile.mktemp(suffix=".exe")
-            download(ytdlp_url, tmp, progress=progress)
-            mpv_dir = os.path.join(install_dir, "mpv")
-            os.makedirs(mpv_dir, exist_ok=True)
-            replace_file(tmp, os.path.join(mpv_dir, "yt-dlp.exe"))
-            os.remove(tmp)
-            log.append("yt-dlp installed/updated.")
-        else:
-            log.append("yt-dlp update requested but no asset found.")
-
-    # Persist a fresh install.json so future checks have a baseline.
+    # Persist a fresh install.json so future checks have a baseline. Keep what the
+    # check reported for the components we did NOT touch.
     exe = os.path.join(install_dir, APP_NAME + ".exe")
+    prev = {}
+    try:
+        with open(os.path.join(install_dir, "install.json"), encoding="utf-8") as f:
+            prev = json.load(f)
+    except Exception:
+        pass
     state = {
-        "app_version": get_exe_version(exe) or check.get("app", {}).get(
-            "current", "0.0.0"),
-        "mpv_version": check.get("mpv", {}).get("latest",
-                                                MPV_RELEASE_VERSION),
-        "ytdlp_version": check.get("ytdlp", {}).get("latest", "0"),
+        "app_version": get_exe_version(exe)
+        or (check.get("app") or {}).get("current") or "0.0.0",
+        "mpv_version": (check.get("mpv") or {}).get("latest")
+        or prev.get("mpv_version") or MPV_RELEASE_VERSION,
+        "ytdlp_version": (check.get("ytdlp") or {}).get("latest")
+        or prev.get("ytdlp_version") or "0",
         "install_dir": os.path.abspath(install_dir),
         "installed_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
@@ -315,6 +429,66 @@ def apply_updates(install_dir, check, progress=None):
         json.dump(state, f, indent=2)
     log.append("install.json updated.")
     return log
+
+
+def _apply_app(install_dir, app, progress, log):
+    asset = app.get("asset")
+    url = asset.get("url") if asset else None
+    if not url:
+        log.append("No SyncPlayer asset in that release - app not updated.")
+        return
+    log.append("Updating SyncPlayer...")
+    tmp = tempfile.mktemp(suffix=".exe")
+    download(url, tmp, progress=progress)
+    ok, detail = replace_running_exe(tmp, os.path.join(install_dir, APP_NAME + ".exe"))
+    try:
+        os.remove(tmp)
+    except Exception:
+        pass
+    if ok:
+        log.append("SyncPlayer updated.")
+    else:
+        log.append("SyncPlayer staged for the next start (%s)." % detail)
+
+
+def _apply_mpv(install_dir, mpv, progress, log):
+    if not (mpv.get("missing") or mpv.get("available")):
+        return
+    asset = mpv.get("asset")
+    url = asset.get("url") if asset else None
+    if not url:
+        log.append("mpv update requested but no matching asset found.")
+        return
+    log.append("Installing mpv..." if mpv.get("missing") else "Updating mpv...")
+    tmp = tempfile.mktemp(suffix=".zip")
+    download(url, tmp, progress=progress)
+    extract_mpv(tmp, os.path.join(install_dir, "mpv"))
+    try:
+        os.remove(tmp)
+    except Exception:
+        pass
+    log.append("mpv installed/updated.")
+
+
+def _apply_ytdlp(install_dir, ytdlp, progress, log):
+    if not (ytdlp.get("missing") or ytdlp.get("available")):
+        return
+    asset = ytdlp.get("asset")
+    url = asset.get("url") if asset else None
+    if not url:
+        log.append("yt-dlp update requested but no asset found.")
+        return
+    log.append("Updating yt-dlp...")
+    tmp = tempfile.mktemp(suffix=".exe")
+    download(url, tmp, progress=progress)
+    mpv_dir = os.path.join(install_dir, "mpv")
+    os.makedirs(mpv_dir, exist_ok=True)
+    replace_file(tmp, os.path.join(mpv_dir, "yt-dlp.exe"))
+    try:
+        os.remove(tmp)
+    except Exception:
+        pass
+    log.append("yt-dlp installed/updated.")
 
 
 def cli_check(install_dir):
