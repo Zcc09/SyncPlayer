@@ -61,7 +61,7 @@ except Exception:
     sp_upd = None
 
 APP_NAME = "SyncPlayer"
-APP_VERSION = "1.6.7"
+APP_VERSION = "1.6.8"
 
 
 class MpvNotFoundError(Exception):
@@ -686,6 +686,133 @@ _SWP_NOZORDER_NOACTIVATE = 0x0004 | 0x0010   # kept for reference; backends use 
 # unix domain socket on Linux) and lives in sp_plat.Ipc.
 
 
+# ---------------------------------------------------------------------------
+# frame capture for visual crop
+#
+# "mpv said success" is not evidence: a screenshot of a surface that has not
+# painted yet is a perfectly valid black PNG. Every route below is therefore
+# checked for CONTENT, and a route that returns an empty picture is treated as a
+# failure and escalated past. The last route shows the video and reads the screen,
+# because a GPU-composited surface is only guaranteed to be readable once it is
+# actually on screen.
+# ---------------------------------------------------------------------------
+
+def _any_window_for_pid(pid):
+    """Find a top-level window owned by `pid`, hidden or not.
+
+    find_mpv_window() only matches VISIBLE windows - useless for putting a hidden
+    player back on screen, which is exactly when the screen-grab route is needed.
+    Prefers a real mpv window over any small helper window of the same process.
+    """
+    if os.name != "nt" or not pid:
+        return None
+    try:
+        import ctypes
+        import ctypes.wintypes as wt
+        u = ctypes.windll.user32
+        found = []
+
+        @ctypes.WINFUNCTYPE(ctypes.c_bool, wt.HWND, wt.LPARAM)
+        def _cb(hwnd, _l):
+            wpid = wt.DWORD()
+            u.GetWindowThreadProcessId(hwnd, ctypes.byref(wpid))
+            if wpid.value == pid:
+                r = wt.RECT()
+                if u.GetWindowRect(hwnd, ctypes.byref(r)):
+                    if (r.right - r.left) > 32 and (r.bottom - r.top) > 32:
+                        found.append(int(hwnd))
+            return True
+
+        u.EnumWindows(_cb, 0)
+        for h in found:
+            cls = ctypes.create_unicode_buffer(64)
+            u.GetClassNameW(wt.HWND(h), cls, 64)
+            if cls.value.lower().startswith("mpv"):
+                return h
+        return found[0] if found else None
+    except Exception:
+        return None
+
+
+def _frame_has_content(path, min_stddev=2.0, min_bytes=4000):
+    """True when `path` holds a PNG with an actual picture in it."""
+    try:
+        if not os.path.isfile(path) or os.path.getsize(path) < min_bytes:
+            return False
+    except Exception:
+        return False
+    if not _HAS_PIL:
+        return True                  # cannot look at it: trust the size
+    try:
+        with Image.open(path) as im:
+            g = im.convert("L")
+            g.thumbnail((256, 256))
+            px = list(g.getdata())
+        if not px:
+            return False
+        mean = sum(px) / float(len(px))
+        var = sum((v - mean) ** 2 for v in px) / float(len(px))
+        return (var ** 0.5) >= min_stddev
+    except Exception:
+        return False
+
+
+def _printwindow_png(hwnd, path):
+    """Render a window's own pixels to `path` (works while it is occluded)."""
+    if os.name != "nt" or not _HAS_PIL:
+        return False
+    try:
+        import ctypes
+        import ctypes.wintypes as wt
+        from PIL import Image, ImageGrab  # noqa: F401
+    except Exception:
+        return False
+    PW_RENDERFULLCONTENT = 0x00000002
+
+    class BITMAPINFOHEADER(ctypes.Structure):
+        _fields_ = [("biSize", wt.DWORD), ("biWidth", wt.LONG), ("biHeight", wt.LONG),
+                    ("biPlanes", wt.WORD), ("biBitCount", wt.WORD),
+                    ("biCompression", wt.DWORD), ("biSizeImage", wt.DWORD),
+                    ("biXPelsPerMeter", wt.LONG), ("biYPelsPerMeter", wt.LONG),
+                    ("biClrUsed", wt.DWORD), ("biClrImportant", wt.DWORD)]
+
+    class BITMAPINFO(ctypes.Structure):
+        _fields_ = [("bmiHeader", BITMAPINFOHEADER), ("bmiColors", wt.DWORD * 3)]
+
+    user32, gdi32 = ctypes.windll.user32, ctypes.windll.gdi32
+    try:
+        rect = wt.RECT()
+        if not user32.GetWindowRect(wt.HWND(hwnd), ctypes.byref(rect)):
+            return False
+        w, h = rect.right - rect.left, rect.bottom - rect.top
+        if w <= 0 or h <= 0:
+            return False
+        hdc = user32.GetWindowDC(wt.HWND(hwnd))
+        mem = gdi32.CreateCompatibleDC(hdc)
+        bmp = gdi32.CreateCompatibleBitmap(hdc, w, h)
+        gdi32.SelectObject(mem, bmp)
+        ok = user32.PrintWindow(wt.HWND(hwnd), mem, PW_RENDERFULLCONTENT)
+        if not ok:
+            ok = user32.PrintWindow(wt.HWND(hwnd), mem, 0)      # legacy flag
+        if ok:
+            bmi = BITMAPINFO()
+            bmi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+            bmi.bmiHeader.biWidth = w
+            bmi.bmiHeader.biHeight = -h                          # top-down
+            bmi.bmiHeader.biPlanes = 1
+            bmi.bmiHeader.biBitCount = 32
+            buf = ctypes.create_string_buffer(w * h * 4)
+            gdi32.GetDIBits(mem, bmp, 0, h, buf, ctypes.byref(bmi), 0)
+            Image.frombuffer("RGBA", (w, h), buf, "raw", "BGRA", 0, 1).convert(
+                "RGB").save(path)
+        gdi32.DeleteObject(bmp)
+        gdi32.DeleteDC(mem)
+        user32.ReleaseDC(wt.HWND(hwnd), hdc)
+        return bool(ok)
+    except Exception:
+        return False
+
+
 def _wb():
     """The active window backend (Win32 / X11 / none)."""
     return plat.get_window_backend()
@@ -713,6 +840,7 @@ class MpvDriver:
     def __init__(self, src, tag, on_pause=None, on_exit=None,
                  start_paused=False):
         self.tag = tag
+        self.src = src
         self.on_pause = on_pause
         self.on_exit = on_exit
         self.proc = None
@@ -1059,21 +1187,22 @@ class MpvDriver:
     def capture_frame(self, path, timeout=8.0):
         """Grab a full video frame to `path`; returns (ok, reason).
 
-        The visual-crop tool must not fail just because the source was still
-        opening or the GPU screenshot path hiccuped, so this waits for a decoded
-        frame and then escalates:
-            screenshot-to-file video  ->  software screenshots  ->  window mode
-        It never changes playback state (no pause toggling, no frame stepping) -
-        stealing the user's pause would be worse than the failure it fixes.
-        `reason` is mpv's own error text, or "no-file" when mpv claimed success.
-        """
-        def file_ok():
-            try:
-                return os.path.isfile(path) and os.path.getsize(path) > 1000
-            except Exception:
-                return False
+        Visual crop has to work for every source and every player state, so this
+        escalates, and every route is verified for CONTENT (a black frame is a
+        failed capture even when mpv reports success):
 
-        def attempt(mode):
+            mpv screenshot: video  ->  software  ->  window
+            ffmpeg straight from the local file          (any format ffmpeg reads)
+            PrintWindow of the player's window           (works while occluded)
+            hardware decoding off, then mpv again        (unreadable GPU surface)
+            show the window, fullscreen if needed, grab the screen
+            fail, with every reason collected
+
+        Playback state is never touched: no pause toggling, no stepping, no
+        seeking. A route that needed the window visible puts it back as it was.
+        `reason` is the collected route failures, or "no-file"/"blank".
+        """
+        def attempt(mode, wait=2.5):
             if os.path.isfile(path):
                 try:
                     os.remove(path)
@@ -1081,44 +1210,234 @@ class MpvDriver:
                     pass
             err, _ = self.command_sync(["screenshot-to-file", path, mode],
                                        timeout=4.0)
-            dl = time.monotonic() + 2.0
+            dl = time.monotonic() + wait
             while time.monotonic() < dl:
-                if file_ok():
+                if _frame_has_content(path):
                     return True, "ok"
                 time.sleep(0.05)
+            if os.path.isfile(path):
+                return False, "blank"
             return False, (err if err not in (None, "success") else "no-file")
 
-        # wait for something decodable: a URL that is still buffering has no frame
-        dl = time.monotonic() + min(4.0, timeout * 0.5)
+        # 0. a decoded frame has to exist at all: a URL still buffering has none
+        dl = time.monotonic() + max(4.0, min(20.0, timeout))
         while time.monotonic() < dl:
             err, vfmt = self.get_property("video-format", timeout=1.0)
             if err == "success" and vfmt:
                 break
             time.sleep(0.2)
-        if os.path.isfile(path) and file_ok():
+        if _frame_has_content(path):
             return True, "ok"
 
         reasons = []
-        ok, why = attempt("video")
-        if ok:
-            return True, "ok"
-        reasons.append("video=%s" % why)
 
-        prev = self.get_property("screenshot-sw", timeout=1.0)[1]
-        self.command_sync(["set_property", "screenshot-sw", "yes"], timeout=3.0)
-        ok, why = attempt("video")
-        if prev is not None:
+        # 1. mpv's own screenshots, best quality first
+        prev_sw = None
+        got = None
+        for phase in ("video", "software", "window"):
+            if phase == "software":
+                prev_sw = self.get_property("screenshot-sw", timeout=1.0)[1]
+                self.command_sync(["set_property", "screenshot-sw", "yes"],
+                                  timeout=3.0)
+            ok, why = attempt("window" if phase == "window" else "video")
+            if ok:
+                got = phase
+                break
+            reasons.append("%s=%s" % (phase, why))
+        if prev_sw is not None:
             self.command_sync(["set_property", "screenshot-sw",
-                               "yes" if prev else "no"], timeout=3.0)
-        if ok:
-            return True, "ok(software)"
-        reasons.append("software=%s" % why)
+                               "yes" if prev_sw else "no"], timeout=3.0)
+        if got:
+            return True, ("ok" if got == "video" else "ok(%s)" % got)
 
-        ok, why = attempt("window")
+        # 2. straight from the local file with ffmpeg: no window, no GPU surface,
+        #    and it reads every container/codec ffmpeg understands
+        ok, why = self._ffmpeg_frame(path)
         if ok:
-            return True, "ok(window)"
-        reasons.append("window=%s" % why)
+            return True, "ok(ffmpeg)"
+        reasons.append("ffmpeg=%s" % why)
+
+        # 3. PrintWindow renders the window itself, so it still works when the
+        #    player is behind something, and needs nothing to be visible
+        ok, why = self._printwindow_frame(path)
+        if ok:
+            return True, "ok(printwindow)"
+        reasons.append("printwindow=%s" % why)
+
+        # 4. hardware decoding off for a moment: a GPU surface mpv will not hand
+        #    over becomes an ordinary frame; the decoder setting is restored
+        try:
+            prev_hw = self.get_property("hwdec", timeout=1.0)[1]
+        except Exception:
+            prev_hw = None
+        if prev_hw not in (None, "no"):
+            self.command_sync(["set_property", "hwdec", "no"], timeout=3.0)
+            time.sleep(1.0)                      # let mpv re-init the decoder
+            for mode in ("video", "window"):
+                ok, why = attempt(mode)
+                if ok:
+                    self.command_sync(["set_property", "hwdec", str(prev_hw)],
+                                      timeout=3.0)
+                    return True, "ok(software-decoder)"
+                reasons.append("hwdec-off/%s=%s" % (mode, why))
+            self.command_sync(["set_property", "hwdec", str(prev_hw)], timeout=3.0)
+
+        # 5. last resort, and the only route guaranteed to have real pixels for a
+        #    GPU surface: put the video on screen and read the screen
+        ok, why = self._screen_frame(path)
+        if ok:
+            return True, "ok(screen)"
+        reasons.append("screen=%s" % why)
+
         return False, " ".join(reasons)
+
+    def _ffmpeg_frame(self, path, pos=None):
+        """A frame straight from the source file with ffmpeg.
+
+        Format-independent and independent of mpv, the window and the GPU - the
+        most reliable route whenever the source is a local file.
+        """
+        src = getattr(self, "src", "") or ""
+        if not src or src.startswith("http") or not os.path.isfile(src):
+            return False, "not-a-local-file"
+        ff = find_ffmpeg()
+        if not ff:
+            return False, "no-ffmpeg"
+        if pos is None:
+            err, pos = self.get_property("time-pos", timeout=1.0)
+            if err != "success":
+                pos = 0.0
+        try:
+            t = max(0.0, float(pos or 0.0))
+        except Exception:
+            t = 0.0
+        if os.path.isfile(path):
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+        try:
+            subprocess.run([ff, "-nostdin", "-loglevel", "error",
+                            "-ss", "%.3f" % t, "-i", src,
+                            "-frames:v", "1", "-y", path],
+                           capture_output=True, timeout=90, **plat.run_extra())
+        except Exception:
+            return False, "run-failed"
+        if _frame_has_content(path):
+            return True, "ok"
+        return False, ("blank" if os.path.isfile(path) else "no-file")
+
+    def _printwindow_frame(self, path):
+        """Render the player's window into a PNG, occluded or not."""
+        hwnd = getattr(self, "hwnd", None)
+        if not hwnd and self.proc is not None:
+            try:
+                hwnd = (find_mpv_window(self.proc.pid, "")
+                        or _any_window_for_pid(self.proc.pid))
+            except Exception:
+                hwnd = None
+        if not hwnd:
+            return False, "no-window"
+        if os.path.isfile(path):
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+        if not _printwindow_png(hwnd, path):
+            return False, "printwindow-failed"
+        return (True, "ok") if _frame_has_content(path) else (False, "blank")
+
+    def _screen_frame(self, path):
+        """Make the video visible and read the pixels off the screen.
+
+        The only route with guaranteed real pixels when the video lives on a GPU
+        surface. Restores the window's position, size, minimised and fullscreen
+        state, and never takes the keyboard focus.
+        """
+        if os.name != "nt" or not _HAS_PIL:
+            return False, "unsupported"
+        hwnd = getattr(self, "hwnd", None)
+        if not hwnd and self.proc is not None:
+            try:
+                hwnd = (find_mpv_window(self.proc.pid, "")
+                        or _any_window_for_pid(self.proc.pid))
+            except Exception:
+                hwnd = None
+        if not hwnd:
+            return False, "no-window"
+        u = ctypes.windll.user32
+        wb = _wb()
+        before = None
+        try:
+            before = wb.get_rect(hwnd)
+        except Exception:
+            pass
+        try:
+            was_iconic = bool(u.IsIconic(hwnd))
+        except Exception:
+            was_iconic = False
+        try:
+            was_hidden = not bool(u.IsWindowVisible(hwnd))
+        except Exception:
+            was_hidden = False
+        try:
+            was_fs = self.get_property("fullscreen", timeout=1.0)[1]
+        except Exception:
+            was_fs = None
+        try:
+            if was_iconic:
+                u.ShowWindow(hwnd, 9)                       # SW_RESTORE
+            # raise it, without activating it, only while we read the pixels
+            u.SetWindowPos(ctypes.c_void_p(hwnd), ctypes.c_void_p(-1), 0, 0, 0, 0,
+                           0x0001 | 0x0002 | 0x0010 | 0x0040)
+            time.sleep(0.4)
+            if not was_fs:
+                # fullscreen clears anything sitting over the video
+                self.command_sync(["set_property", "fullscreen", "yes"], timeout=3.0)
+                time.sleep(1.0)
+            rect = None
+            try:
+                rect = wb.get_rect(hwnd)
+            except Exception:
+                pass
+            rect = rect or before
+            if not rect:
+                return False, "no-rect"
+            from PIL import ImageGrab
+            img = ImageGrab.grab(bbox=(rect[0], rect[1],
+                                       rect[0] + rect[2], rect[1] + rect[3]))
+            img.save(path)
+        except Exception:
+            return False, "grab-failed"
+        finally:
+            try:
+                if not was_fs:
+                    self.command_sync(["set_property", "fullscreen", "no"],
+                                      timeout=3.0)
+                    time.sleep(0.2)
+            except Exception:
+                pass
+            try:
+                if before:
+                    wb.place(hwnd, before[0], before[1], before[2], before[3])
+            except Exception:
+                pass
+            try:
+                u.SetWindowPos(ctypes.c_void_p(hwnd), ctypes.c_void_p(-2), 0, 0, 0, 0,
+                               0x0001 | 0x0002 | 0x0010)     # HWND_NOTOPMOST
+            except Exception:
+                pass
+            if was_hidden:
+                try:
+                    u.ShowWindow(hwnd, 0)                    # SW_HIDE again
+                except Exception:
+                    pass
+            elif was_iconic:
+                try:
+                    u.ShowWindow(hwnd, 6)                    # SW_MINIMIZE again
+                except Exception:
+                    pass
+        return (True, "ok") if _frame_has_content(path) else (False, "blank")
 
     def track_list(self):
         err, tl = self.get_property("track-list")
@@ -4159,7 +4478,15 @@ class SyncApp:
         if cur_crop:
             p.cmd({"command": ["set_property", "video-crop", ""]})
 
-        ok, why = p.capture_frame(snap_path)
+        # the capture can take a moment (it escalates until it has a real
+        # frame), so say so instead of looking hung
+        self._status_pin = time.monotonic() + 12.0
+        self.status_lbl.config(text="Capturing a frame from %s\u2026" % name)
+        try:
+            self.root.update_idletasks()
+        except Exception:
+            pass
+        ok, why = p.capture_frame(snap_path, timeout=12.0)
 
         # Restore previous crop in mpv while dialog is open
         if cur_crop:
@@ -4171,14 +4498,16 @@ class SyncApp:
                   % (tag, why, logtail))
             self._status_pin = time.monotonic() + 6.0
             self.status_lbl.config(
-                text="Could not capture a frame from %s - try Play for a "
-                     "second (mpv: %s)" % (name, why[:50]))
+                text="Could not capture a frame from %s (tried: %s)"
+                     % (name, why[:60]))
             if messagebox.askyesno(
                     APP_NAME,
                     "Could not capture a frame from %s.\n\n"
-                    "The player may still be opening or buffering the "
-                    "video, or its window may be minimised. Press Play for "
-                    "a moment, then try again.\n\nmpv said: %s%s\n\n"
+                    "Every route was tried: mpv's own screenshots, ffmpeg "
+                    "reading the file, the window (even while covered) and a "
+                    "screen grab with the video shown fullscreen. If the "
+                    "video is a stream it may still be buffering - let it "
+                    "play for a few seconds.\n\nWhat was tried: %s%s\n\n"
                     "Try again now?"
                     % (name, why[:160],
                        ("\n" + logtail) if logtail else "")):
