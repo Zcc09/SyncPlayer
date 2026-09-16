@@ -61,7 +61,7 @@ except Exception:
     sp_upd = None
 
 APP_NAME = "SyncPlayer"
-APP_VERSION = "1.6.10"
+APP_VERSION = "1.6.11"
 
 
 class MpvNotFoundError(Exception):
@@ -734,6 +734,49 @@ def _any_window_for_pid(pid):
         return None
 
 
+DARK_MEAN = 12.0        # mean luma below this reads as a blank frame on screen
+
+
+def _image_mean_luma(path):
+    """Mean luminance (0-255) of a captured frame, or None when unreadable."""
+    if not _HAS_PIL:
+        return None
+    try:
+        from PIL import ImageStat
+        with Image.open(path) as im:
+            g = im.convert("L")
+            g.thumbnail((256, 256))
+            return float(ImageStat.Stat(g).mean[0])
+    except Exception:
+        return None
+
+
+def _brighten_if_dark(path, gamma=2.2):
+    """Lift an essentially black frame so an HDR transfer cannot hide it.
+
+    Only applied when the frame is nearly black, and only for HDR/DV sources:
+    the point is to SEE the picture well enough to pick crop bars, which colour
+    accuracy does not affect.
+    """
+    if not _HAS_PIL:
+        return False
+    mean = _image_mean_luma(path)
+    if mean is None or mean >= DARK_MEAN:
+        return False
+    try:
+        lut = [min(255, int(round(255.0 * ((i / 255.0) ** (1.0 / gamma)))))
+               for i in range(256)]
+        with Image.open(path) as im:
+            src = im.convert("RGB")
+        out = src.point(lut * 3)
+        out.save(path)
+        out.close()
+        src.close()
+        return True
+    except Exception:
+        return False
+
+
 def _normalise_snapshot(path):
     """Re-save a captured frame as 8-bit RGB so any Tk build can display it.
 
@@ -1251,10 +1294,28 @@ class MpvDriver:
 
         reasons = []
 
+        # HDR/DV: ask mpv to map down to SDR for this capture, and take the
+        # software route first because it renders through the video output, which
+        # is where tone-mapping happens. Everything set here is restored below.
+        kind, detail = self.hdr_kind()
+        toned = {}
+        if kind:
+            for prop, val in (("target-trc", "srgb"), ("target-prim", "bt.709"),
+                              ("tone-mapping", "auto")):
+                try:
+                    err, prev = self.get_property(prop, timeout=1.0)
+                    toned[prop] = prev
+                    self.command_sync(["set_property", prop, val], timeout=3.0)
+                except Exception:
+                    pass
+            time.sleep(0.4)
+
         # 1. mpv's own screenshots, best quality first
         prev_sw = None
         got = None
-        for phase in ("video", "software", "window"):
+        phases = ("software", "video", "window") if kind else \
+            ("video", "software", "window")
+        for phase in phases:
             if phase == "software":
                 prev_sw = self.get_property("screenshot-sw", timeout=1.0)[1]
                 self.command_sync(["set_property", "screenshot-sw", "yes"],
@@ -1268,13 +1329,19 @@ class MpvDriver:
             self.command_sync(["set_property", "screenshot-sw",
                                "yes" if prev_sw else "no"], timeout=3.0)
         if got:
-            return True, ("ok" if got == "video" else "ok(%s)" % got)
+            lifted = _brighten_if_dark(path) if kind else False
+            return True, ("ok" if got == "video" else "ok(%s)" % got) + \
+                ("(%s%s)" % (kind, " brightened" if lifted else "")
+                 if kind else "")
 
         # 2. straight from the local file with ffmpeg: no window, no GPU surface,
         #    and it reads every container/codec ffmpeg understands
         ok, why = self._ffmpeg_frame(path)
         if ok:
-            return True, "ok(ffmpeg)"
+            lifted = _brighten_if_dark(path) if kind else False
+            return True, "ok(ffmpeg)" + ("(%s%s)" % (kind, " brightened"
+                                                     if lifted else "")
+                                         if kind else "")
         reasons.append("ffmpeg=%s" % why)
 
         # 3. PrintWindow renders the window itself, so it still works when the
@@ -1306,10 +1373,53 @@ class MpvDriver:
         #    GPU surface: put the video on screen and read the screen
         ok, why = self._screen_frame(path)
         if ok:
-            return True, "ok(screen)"
+            lifted = _brighten_if_dark(path) if kind else False
+            return True, "ok(screen)" + ("(%s%s)" % (kind, " brightened"
+                                                     if lifted else "")
+                                         if kind else "")
         reasons.append("screen=%s" % why)
 
+        for prop, prev in toned.items():
+            if prev not in (None, ""):
+                try:
+                    self.command_sync(["set_property", prop, str(prev)],
+                                      timeout=3.0)
+                except Exception:
+                    pass
+        if kind:
+            reasons.append("(source is %s %s)" % (kind, detail))
         return False, " ".join(reasons)
+
+    def hdr_kind(self):
+        """("dolby-vision"|"hdr"|None, detail) for what is playing.
+
+        HDR/DV matters for capture: a screenshot can hand back the raw PQ/HLG
+        transfer, which is near-black on an SDR screen even though the pixels are
+        all there - and a Dolby Vision profile 5 stream needs gpu-next before mpv
+        can map it at all.
+        """
+        try:
+            err, dv = self.get_property("video-params/dolby-vision-profile",
+                                        timeout=1.0)
+            if err == "success" and dv not in (None, "", 0, "0", "no"):
+                return "dolby-vision", "profile %s" % dv
+        except Exception:
+            pass
+        try:
+            err, g = self.get_property("video-params/gamma", timeout=1.0)
+            gs = str(g or "").lower()
+            if err == "success" and gs in ("pq", "hlg", "smpte2084",
+                                           "arib-std-b67"):
+                err2, prim = self.get_property("video-params/primaries",
+                                               timeout=1.0)
+                return "hdr", "%s/%s" % (g, prim if err2 == "success" else "?")
+        except Exception:
+            pass
+        return None, ""
+
+    def capture_screen_frame(self, path):
+        """Force the last-resort route (used by the crop window's button)."""
+        return self._screen_frame(path)
 
     def _ffmpeg_frame(self, path, pos=None):
         """A frame straight from the source file with ffmpeg.
@@ -1610,7 +1720,8 @@ class VisualCropDialog(tk.Toplevel):
     where the user can draw, drag, and resize a crop box with the mouse.
     The viewport and frame dynamically scale with window resizing, allowing
     users to expand the window as large as they want for maximum precision."""
-    def __init__(self, parent, image_path, initial_crop=None, video_name="Video", on_apply=None):
+    def __init__(self, parent, image_path, initial_crop=None,
+                 video_name="Video", on_apply=None, on_recapture=None):
         super().__init__(parent)
         self.title("Visual Crop — %s" % video_name)
         self.transient(parent)
@@ -1625,8 +1736,11 @@ class VisualCropDialog(tk.Toplevel):
         self.resizable(True, True)
 
         self.on_apply = on_apply
-        self.orig_img = Image.open(image_path)
+        self.on_recapture = on_recapture
+        self.image_path = image_path
+        self.orig_img = Image.open(image_path).convert("RGB")
         self.orig_w, self.orig_h = self.orig_img.size
+        self.recap_lbl = None            # only built when recapture is wired
 
         # Crop rectangle in ORIGINAL IMAGE coordinates: ox1, oy1, ox2, oy2
         if initial_crop and len(initial_crop) == 4:
@@ -1683,11 +1797,92 @@ class VisualCropDialog(tk.Toplevel):
         btn_reset = ttk.Button(btn_bar, text="Full Frame (Reset)", width=16, command=self._reset_full)
         btn_reset.pack(side="left", padx=6)
 
+        # Getting a frame must be possible from inside this window: if the one
+        # handed over is blank (an HDR/DV transfer, a stream that had not painted
+        # yet), these two fetch another straight away.
+        if on_recapture is not None:
+            btn_cap = ttk.Button(btn_bar, text="Capture frame", width=14,
+                                 command=lambda: self._recapture("auto"))
+            btn_cap.pack(side="left", padx=(12, 0))
+            Tooltip(btn_cap, "Fetch the current frame from the player again "
+                             "(tone-mapped for HDR).")
+            btn_scr = ttk.Button(btn_bar, text="Grab screen", width=13,
+                                 command=lambda: self._recapture("screen"))
+            btn_scr.pack(side="left", padx=(4, 0))
+            Tooltip(btn_scr, "Show the video fullscreen and read the frame off "
+                             "the screen - the most reliable route for a GPU "
+                             "surface or an HDR/Dolby Vision file. The window is "
+                             "put back afterwards.")
+            self.recap_lbl = ttk.Label(btn_bar, text="", style="Dim.TLabel")
+            self.recap_lbl.pack(side="left", padx=(10, 0))
+            self.recap_lbl.config(text="Showing a frame from %s" % video_name)
+
         btn_cancel = ttk.Button(btn_bar, text="Cancel", width=10, command=self.destroy)
         btn_cancel.pack(side="right", padx=(6, 0))
 
         self.bind("<Return>", lambda e: self._apply())
         self.bind("<Escape>", lambda e: self.destroy())
+
+    def _recapture(self, mode):
+        """Ask the app for a fresh frame and show it here."""
+        try:
+            if getattr(self, "recap_lbl", None) is None:
+                return
+            self.recap_lbl.config(text="Getting a frame\u2026")
+            self.update_idletasks()
+        except Exception:
+            pass
+        try:
+            path, note = self.on_recapture(mode)
+        except Exception as e:
+            path, note = None, "recapture failed: %s" % e
+        if path and self.reload_image(path, keep_crop=True):
+            note = note or "new frame"
+        elif not note:
+            note = "could not get a frame"
+        try:
+            self.recap_lbl.config(text=note[:70])
+        except Exception:
+            pass
+
+    def reload_image(self, path, keep_crop=True):
+        """Swap in another captured frame, keeping the crop box where it was."""
+        if not _HAS_PIL:
+            return False
+        try:
+            with Image.open(path) as im:
+                fresh = im.convert("RGB")
+        except Exception:
+            return False
+        try:
+            # keep the crop where it was, rescaled if the new frame is a different size
+            if keep_crop and (self.orig_w, self.orig_h) != fresh.size:
+                sx = fresh.size[0] / float(self.orig_w or 1)
+                sy = fresh.size[1] / float(self.orig_h or 1)
+                self.ox1 = int(round(self.ox1 * sx))
+                self.oy1 = int(round(self.oy1 * sy))
+                self.ox2 = int(round(self.ox2 * sx))
+                self.oy2 = int(round(self.oy2 * sy))
+        except Exception:
+            pass
+        self.orig_img = fresh
+        self.orig_w, self.orig_h = fresh.size
+        self.image_path = path
+        self._redraw_fitted()
+        return True
+
+    def _redraw_fitted(self):
+        """Re-fit the image to the canvas (the same work as a resize)."""
+        class _E(object):
+            width = 0
+            height = 0
+        e = _E()
+        try:
+            e.width = max(50, self.canvas.winfo_width())
+            e.height = max(50, self.canvas.winfo_height())
+        except Exception:
+            e.width, e.height = 640, 360
+        self._on_canvas_configure(e)
 
     def _on_canvas_configure(self, event):
         cw = max(50, event.width)
@@ -4506,6 +4701,29 @@ class SyncApp:
             return
         self._crop_apply(tag, (int(w), int(h), int(x), int(y)))
 
+    def _crop_recapture(self, tag, snap_path, mode):
+        """Fetch a fresh frame for an open crop window. Returns (path|None, note).
+
+        Used by the crop window's own Capture frame / Grab screen buttons.
+        """
+        p2 = self.players.get(tag)
+        if not (p2 and p2.running):
+            return None, "the player is not running"
+        if os.path.isfile(snap_path):
+            try:
+                os.remove(snap_path)
+            except Exception:
+                pass
+        if mode == "screen":
+            ok2, why2 = p2.capture_screen_frame(snap_path)
+            note = "fullscreen screen grab: %s" % why2
+        else:
+            ok2, why2 = p2.capture_frame(snap_path, timeout=12.0)
+            note = "capture: %s" % why2
+        if ok2 and _normalise_snapshot(snap_path) and _frame_has_content(snap_path):
+            return snap_path, note
+        return None, "no usable frame (%s)" % why2
+
     def _crop_interactive(self):
         """Interactive visual crop: freeze-frame snapshot popup where the user
         can click and drag a crop box directly on the picture with the mouse."""
@@ -4554,25 +4772,13 @@ class SyncApp:
             p.cmd({"command": ["set_property", "video-crop", "%dx%d+%d+%d" % cur_crop]})
 
         if not ok:
-            logtail = _mpv_log_tail(tag)
             _diag("visual crop: capture failed for %s (%s) mpv-log: %s"
-                  % (tag, why, logtail))
-            self._status_pin = time.monotonic() + 6.0
+                  % (tag, why, _mpv_log_tail(tag)))
+            self._status_pin = time.monotonic() + 8.0
             self.status_lbl.config(
-                text="Could not capture a frame from %s (tried: %s)"
-                     % (name, why[:60]))
-            if messagebox.askyesno(
-                    APP_NAME,
-                    "Could not capture a frame from %s.\n\n"
-                    "Every route was tried: mpv's own screenshots, ffmpeg "
-                    "reading the file, the window (even while covered) and a "
-                    "screen grab with the video shown fullscreen. If the "
-                    "video is a stream it may still be buffering - let it "
-                    "play for a few seconds.\n\nWhat was tried: %s%s\n\n"
-                    "Try again now?"
-                    % (name, why[:160],
-                       ("\n" + logtail) if logtail else "")):
-                self._crop_interactive()
+                text="No frame captured from %s (tried: %s) - the crop window "
+                     "has Capture frame and Grab screen buttons."
+                     % (name, why[:70]))
             return
 
         def on_apply(rect):
@@ -4581,9 +4787,24 @@ class SyncApp:
             else:
                 self._crop_clear()
 
+        def on_recapture(mode):
+            """From inside the crop window: fetch a fresh frame here."""
+            return self._crop_recapture(tag, snap_path, mode)
+
+        if not ok:
+            # still open the window, with a placeholder: fetching a frame from
+            # inside it is the whole point of the two buttons
+            try:
+                if _HAS_PIL:
+                    Image.new("RGB", (1280, 720), (26, 28, 33)).save(snap_path)
+                    ok = True
+            except Exception:
+                pass
+
         try:
             dlg = VisualCropDialog(self.root, snap_path, initial_crop=cur_crop,
-                                   video_name=name, on_apply=on_apply)
+                                   video_name=name, on_apply=on_apply,
+                                   on_recapture=on_recapture)
             dlg.wait_window()
         finally:
             try:
@@ -5940,7 +6161,9 @@ class SyncApp:
             d_txt += "  \u21c4%.2fx" % rate_b     # visible while a trim is active
         lock_txt = " · SYNC LOCKED" if self.sync_locked else ""
         if ra is not None and self.show_readout:
-            txt = "Movie %s  ·  Reaction %s  ·  %s%s" % (ma, rb_fmt, d_txt, lock_txt)
+            off_txt = "  ·  Off %+.2fs" % float(self.sync_off)
+            txt = "Movie %s  ·  Reaction %s  ·  %s%s%s" % (ma, rb_fmt, d_txt,
+                                                             off_txt, lock_txt)
             if time.monotonic() >= self._status_pin and self._lbl_status_cache != txt:
                 self.status_lbl.config(text=txt)
                 self._lbl_status_cache = txt
