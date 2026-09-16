@@ -61,7 +61,7 @@ except Exception:
     sp_upd = None
 
 APP_NAME = "SyncPlayer"
-APP_VERSION = "1.6.11"
+APP_VERSION = "1.6.12"
 
 
 class MpvNotFoundError(Exception):
@@ -775,6 +775,54 @@ def _brighten_if_dark(path, gamma=2.2):
         return True
     except Exception:
         return False
+
+
+VIEW_MIN_P99 = 60.0     # a frame whose brightest content is below this reads
+                        # as a blank rectangle on screen, whatever its mean says
+
+
+def frame_stats(path):
+    """(mean, stddev, p99) of a captured frame in 0-255, or (None, None, None)."""
+    if not _HAS_PIL:
+        return None, None, None
+    try:
+        from PIL import ImageStat
+        with Image.open(path) as im:
+            g = im.convert("L")
+            g.thumbnail((256, 256))
+            st = ImageStat.Stat(g)
+            px = sorted(g.getdata())
+        p99 = px[min(len(px) - 1, int(len(px) * 0.99))] if px else None
+        return float(st.mean[0]), float(st.stddev[0]), float(p99)
+    except Exception:
+        return None, None, None
+
+
+def make_frame_viewable(path):
+    """Brighten a frame that would otherwise look like an empty box.
+
+    Judged on the 99th percentile, not the mean: a night scene is mostly dark and
+    perfectly readable, while a frame whose BRIGHTEST content sits at 14/255 is not
+    readable at all. A linear gain (capped) is applied so colour relationships
+    survive; returns (changed, "x2.4") so the caller can say what it did.
+    """
+    if not _HAS_PIL:
+        return False, ""
+    mean, sd, p99 = frame_stats(path)
+    if p99 is None or p99 >= VIEW_MIN_P99:
+        return False, ""
+    gain = min(8.0, VIEW_MIN_P99 / max(1.0, float(p99)))
+    try:
+        lut = [min(255, int(round(i * gain))) for i in range(256)]
+        with Image.open(path) as im:
+            src = im.convert("RGB")
+        out = src.point(lut * 3)
+        out.save(path)
+        out.close()
+        src.close()
+        return True, "x%.1f" % gain
+    except Exception:
+        return False, ""
 
 
 def _normalise_snapshot(path):
@@ -1815,7 +1863,15 @@ class VisualCropDialog(tk.Toplevel):
                              "put back afterwards.")
             self.recap_lbl = ttk.Label(btn_bar, text="", style="Dim.TLabel")
             self.recap_lbl.pack(side="left", padx=(10, 0))
-            self.recap_lbl.config(text="Showing a frame from %s" % video_name)
+            self.recap_lbl.config(
+                text=("Showing a frame from %s  ·  %s"
+                      % (video_name, self.frame_report()))[:110])
+        # Draw once the window has been laid out even if no <Configure> arrives,
+        # and again shortly after: an image item that is never created is
+        # indistinguishable from a blank capture, which made this hard to report.
+        self.bind("<Map>", lambda e: self._redraw_fitted())
+        self.after(120, self._redraw_fitted)
+        self.after(600, self._redraw_fitted)
 
         btn_cancel = ttk.Button(btn_bar, text="Cancel", width=10, command=self.destroy)
         btn_cancel.pack(side="right", padx=(6, 0))
@@ -1841,9 +1897,21 @@ class VisualCropDialog(tk.Toplevel):
         elif not note:
             note = "could not get a frame"
         try:
-            self.recap_lbl.config(text=note[:70])
+            self.recap_lbl.config(text=("%s  ·  %s" % (note, self.frame_report()))[:110])
         except Exception:
             pass
+
+    def frame_report(self):
+        """A one-line description of what is on screen, for the user and for bug reports."""
+        try:
+            mean, sd, p99 = frame_stats(self.image_path)
+        except Exception:
+            mean = sd = p99 = None
+        bits = ["%dx%d" % (self.orig_w, self.orig_h)]
+        if mean is not None:
+            bits.append("luma mean %.0f/255 p99 %.0f" % (mean, p99 or 0))
+        bits.append("drawn %d item(s)" % len(self.canvas.find_all()))
+        return "frame " + "  ·  ".join(bits)
 
     def reload_image(self, path, keep_crop=True):
         """Swap in another captured frame, keeping the crop box where it was."""
@@ -1873,6 +1941,11 @@ class VisualCropDialog(tk.Toplevel):
 
     def _redraw_fitted(self):
         """Re-fit the image to the canvas (the same work as a resize)."""
+        try:
+            if not self.winfo_exists():
+                return
+        except Exception:
+            return
         class _E(object):
             width = 0
             height = 0
@@ -4721,6 +4794,9 @@ class SyncApp:
             ok2, why2 = p2.capture_frame(snap_path, timeout=12.0)
             note = "capture: %s" % why2
         if ok2 and _normalise_snapshot(snap_path) and _frame_has_content(snap_path):
+            lifted, gain = make_frame_viewable(snap_path)
+            if lifted:
+                note = "%s - brightened %s for visibility" % (note, gain)
             return snap_path, note
         return None, "no usable frame (%s)" % why2
 
@@ -4764,8 +4840,16 @@ class SyncApp:
         ok, why = p.capture_frame(snap_path, timeout=12.0)
         if ok:
             # A 10-bit source makes ffmpeg write a 16-bit PNG, which some Tk
-            # builds draw as a blank canvas. Normalise to plain RGB first.
+            # builds draw as a blank canvas. Normalise to plain RGB first, then
+            # make sure there is something a person can actually SEE in it.
             ok, why = _normalise_snapshot(snap_path), why
+            lifted, gain = make_frame_viewable(snap_path)
+            if lifted:
+                why = "%s brightened %s for visibility" % (why, gain)
+            _mean0, _sd0, _p990 = frame_stats(snap_path)
+            _diag("visual crop %s: frame luma mean=%.1f stddev=%.1f p99=%.1f "
+                  "lifted=%s source=%s" % (tag, _mean0 or -1, _sd0 or -1,
+                                           _p990 or -1, bool(lifted), why[:60]))
 
         # Restore previous crop in mpv while dialog is open
         if cur_crop:
