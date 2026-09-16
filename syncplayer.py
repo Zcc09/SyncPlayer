@@ -61,7 +61,7 @@ except Exception:
     sp_upd = None
 
 APP_NAME = "SyncPlayer"
-APP_VERSION = "1.6.8"
+APP_VERSION = "1.6.9"
 
 
 class MpvNotFoundError(Exception):
@@ -3056,6 +3056,27 @@ class SyncApp:
                 "to remember the alignment you just set.")
         Tooltip(self.btn_lock, "Lock the alignment: per-video bars switch off, the Master bar drives BOTH videos, and drift correction gets stricter.")
         self._ctrls.append(self.btn_lock)
+        # Type an offset you already know instead of hunting for it: it is
+        # applied at once and remembered for this movie+reaction pair, so a
+        # later session with the same pair starts aligned.
+        ttk.Label(mlab, text="Offset").pack(side="left", padx=(8, 2))
+        self.align_var = tk.StringVar()
+        self.align_entry = ttk.Entry(mlab, textvariable=self.align_var, width=7,
+                                    justify="center")
+        self.align_entry.pack(side="left")
+        self.align_entry.bind("<Return>", lambda e: self._apply_typed_alignment())
+        self.align_entry.bind("<FocusOut>", lambda e: self._sync_align_entry())
+        Tooltip(self.align_entry,
+                "The offset between the two videos, if you already know it: "
+                "seconds (12.5), a timecode (1:05) or negative (-3.25). Positive "
+                "= the reaction is AHEAD of the movie. Enter applies it and "
+                "remembers it for this pair.")
+        ab = ttk.Button(mlab, text="Set", width=3,
+                        command=self._apply_typed_alignment)
+        ab.pack(side="left", padx=(2, 0))
+        Tooltip(ab, "Apply the typed offset now and move the reaction there.")
+        self._ctrls.extend([self.align_entry, ab])
+
         self.btn_play_m = ttk.Button(mlab, text="▶", width=3,
                                      command=self._toggle_pause_m)
         self.btn_play_m.pack(side="left", padx=(4, 0))
@@ -4048,6 +4069,10 @@ class SyncApp:
             "- Download: saves the reaction to disk at a chosen quality, with" + chr(10) +
             "  a Connections box (1-16 parallel fetches, like a download" + chr(10) +
             "  manager) - more finishes sooner on a fast link." + chr(10) +
+            "- Offset (Master row): if you already know the delay between the" + chr(10) +
+            "  two videos, type it and press Enter - 12.5 / 1:05 / -3.25, with" + chr(10) +
+            "  positive meaning the reaction is AHEAD of the movie. It moves it" + chr(10) +
+            "  there at once and is remembered for that pair." + chr(10) +
             "- Seek buttons: the two next to Start move by the Jump distance" + chr(10) +
             "  (5 s by default), so they can be made as fine as you need." + chr(10) +
             "- Seek bars (Precise mode, the default): dragging a bar turns sideways" + chr(10) +
@@ -5450,6 +5475,7 @@ class SyncApp:
                 except Exception:
                     pass
         self._sync_tick()
+        self._sync_align_entry()      # the Offset field follows the live offset
         # Exactly ONE pending poll timer, whoever calls _poll(). A direct call
         # (tests, scripts, a stray code path) must not stack an extra timer:
         # each _poll schedules the next, so duplicate entry points multiply the
@@ -5534,6 +5560,80 @@ class SyncApp:
         if not (a and b):
             return None
         return a + "\n" + b
+
+    def _parse_offset_text(self, txt):
+        """Signed seconds from '12.5', '+3', '-3.25' or '1:05'/'0:02.5'.
+
+        Returns None when the text is not a usable offset.
+        """
+        if txt is None:
+            return None
+        s = str(txt).strip().replace(",", ".")
+        if not s:
+            return None
+        # _to_seconds already reads a leading '-' (and the sign matters), but it
+        # does not read '+', so only that one is stripped here.
+        if s.startswith("+"):
+            s = s[1:].strip()
+        if not s or s == "-":
+            return None              # a bare sign is not an offset
+        try:
+            val = MpvDriver._to_seconds(s)      # handles ':' forms and a sign
+        except Exception:
+            val = None
+        if val is None:
+            return None
+        try:
+            return float(val)
+        except Exception:
+            return None
+
+    def _sync_align_entry(self):
+        """Show the live offset, unless the user is typing in the field."""
+        try:
+            if self.root.focus_get() is self.align_entry:
+                return
+            txt = "%+.2f" % float(self.sync_off)
+            if self.align_var.get() != txt:
+                self.align_var.set(txt)
+        except Exception:
+            pass
+
+    def _apply_typed_alignment(self):
+        """Apply the typed offset: set it, move the reaction, remember the pair."""
+        raw = self.align_var.get()
+        val = self._parse_offset_text(raw)
+        if val is None:
+            self._status_pin = time.monotonic() + 6.0
+            self.status_lbl.config(
+                text="Enter the offset in seconds (12.5), as a timecode (1:05), or "
+                     "negative (-3.25) if the reaction is behind.")
+            return None
+        self.sync_off = val
+        self._align_last_seen = val      # the poll's manual-change hook
+        self._sync_align_entry()
+        moved = False
+        if self.started:
+            p = self.players.get("B")
+            movie_pos = self.last_pos.get("A")
+            if p and p.running and movie_pos is not None:
+                want = max(0.0, reaction_target(float(movie_pos), self.sync_off))
+                try:
+                    p.seek(want)
+                    moved = True
+                except Exception:
+                    pass
+        remembered = bool(self._remember_alignment(force=True))
+        self._status_pin = time.monotonic() + 8.0
+        try:
+            self.status_lbl.config(
+                text="Offset %+.2f s: reaction plays %s the movie%s%s."
+                     % (val, "ahead of" if val >= 0 else "behind",
+                        " - moved there now" if moved else "",
+                        ", remembered for this pair" if remembered else ""))
+        except Exception:
+            pass
+        return val
 
     def _saved_alignment(self):
         k = self._pair_key()
