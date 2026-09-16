@@ -295,7 +295,7 @@ def main():
 
     check("install: SyncPlayer.exe present", os.path.isfile(app))
     check("install: app version is 1.6.0",
-          get_exe_version(app) == "1.6.9", str(get_exe_version(app)))
+          get_exe_version(app) == "1.6.10", str(get_exe_version(app)))
     check("install: bundled mpv.exe present", os.path.isfile(mpv))
     check("install: bundled yt-dlp.exe present", os.path.isfile(ytdl))
     check("install: updater present", os.path.isfile(updater))

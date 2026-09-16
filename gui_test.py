@@ -821,17 +821,17 @@ app._save_config()
 check("align: nothing remembered for this pair yet", app._saved_alignment() is None,
       "saved=%r" % (app._saved_alignment(),))
 
-# the user lines the two up (drag the Reaction bar / frame step), then clicks
-# Align to remember it. Set the settled offset directly, as that drag would.
+# the user lines the two up (drag the Reaction bar / frame step), then either lets
+# the app remember the settled offset or types it. Set it as that drag would.
 app.sync_off = 3.5
 app._align_last_seen = 3.5
-app._toggle_alignment_memory()
+app._remember_alignment(force=True)
 pump(0.5)
-check("align: clicking Align stores the offset",
+check("align: the settled offset is remembered for this pair",
       abs((app._saved_alignment() or 0) - 3.5) < 0.001,
       "saved=%r" % (app._saved_alignment(),))
-check("align: the button shows the remembered offset",
-      "3.5" in app.btn_align.cget("text"), repr(app.btn_align.cget("text")))
+check("align: the Offset field shows it",
+      app.align_var.get() == "+3.50", app.align_var.get())
 with io.open(sp.CONFIG_PATH, encoding="utf-8") as _f:
     _cfg = json.load(_f)
 check("align: offset is written to the config file",
@@ -864,11 +864,10 @@ app._load_config()
 check("align: survives a config save/reload cycle",
       abs((app._saved_alignment() or 0) - 3.5) < 0.001,
       "saved=%r" % (app._saved_alignment(),))
-app._toggle_alignment_memory()
+app._forget_alignment()          # no button for it any more (typing 0 also works)
 pump(0.4)
-check("align: clicking again forgets it",
-      app._saved_alignment() is None and "\u2014" in app.btn_align.cget("text"),
-      repr(app.btn_align.cget("text")))
+check("align: forgetting clears the remembered offset",
+      app._saved_alignment() is None, "saved=%r" % (app._saved_alignment(),))
 with io.open(sp.CONFIG_PATH, encoding="utf-8") as _f:
     _cfg2 = json.load(_f)
 check("align: forgotten offset is gone from the config file",

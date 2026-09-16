@@ -61,7 +61,7 @@ except Exception:
     sp_upd = None
 
 APP_NAME = "SyncPlayer"
-APP_VERSION = "1.6.9"
+APP_VERSION = "1.6.10"
 
 
 class MpvNotFoundError(Exception):
@@ -734,6 +734,26 @@ def _any_window_for_pid(pid):
         return None
 
 
+def _normalise_snapshot(path):
+    """Re-save a captured frame as 8-bit RGB so any Tk build can display it.
+
+    Returns False when the file cannot be read back at all, which makes the
+    caller treat the capture as a failure instead of opening an empty dialog.
+    """
+    if not _HAS_PIL:
+        return os.path.isfile(path)
+    try:
+        with Image.open(path) as im:
+            if im.mode in ("RGB",):
+                return True
+            conv = im.convert("RGB")
+        conv.save(path)
+        conv.close()
+        return True
+    except Exception:
+        return False
+
+
 def _frame_has_content(path, min_stddev=2.0, min_bytes=4000):
     """True when `path` holds a PNG with an actual picture in it."""
     try:
@@ -1319,7 +1339,7 @@ class MpvDriver:
         try:
             subprocess.run([ff, "-nostdin", "-loglevel", "error",
                             "-ss", "%.3f" % t, "-i", src,
-                            "-frames:v", "1", "-y", path],
+                            "-frames:v", "1", "-pix_fmt", "rgb24", "-y", path],
                            capture_output=True, timeout=90, **plat.run_extra())
         except Exception:
             return False, "run-failed"
@@ -2388,6 +2408,16 @@ class SettingsDialog(tk.Toplevel):
         Tooltip(sp, "Default for the Download window's Connections box: how many "
                     "parts of a video are fetched at once (1-16).")
 
+        # live readout toggle
+        w = row(4, "Status readout", "")
+        self.var_readout = tk.BooleanVar(
+            value=bool(getattr(app, "show_readout", True)))
+        cb2 = ttk.Checkbutton(w, text="Show the live Movie / Reaction / "
+                                      "delta line", variable=self.var_readout)
+        cb2.pack(side="left")
+        Tooltip(cb2, "Off leaves the status line for messages only. "
+                     "The per-video time labels and the bars are unaffected.")
+
         # seek mode
         w = row(2, "Seek bar dragging", "")
         self.var_seekmode = tk.StringVar(
@@ -2425,7 +2455,7 @@ class SettingsDialog(tk.Toplevel):
         self.bind("<Escape>", lambda e: self.destroy())
         self._refresh_note()
         for v in (self.var_quality, self.var_conn, self.var_jump,
-                  self.var_seekmode):
+                  self.var_seekmode, self.var_readout):
             try:
                 v.trace_add("write", lambda *a: self._refresh_note())
             except Exception:
@@ -2467,6 +2497,15 @@ class SettingsDialog(tk.Toplevel):
         try:
             app.seek_mode = {lab: code for code, lab in SEEK_MODES}.get(
                 self.var_seekmode.get(), DEFAULT_SEEK_MODE)
+        except Exception:
+            pass
+        try:
+            want = bool(self.var_readout.get())
+            if want != bool(getattr(app, "show_readout", True)):
+                app.show_readout = want
+                if not want:
+                    app.status_lbl.config(text="")
+                app._lbl_status_cache = None
         except Exception:
             pass
         app.youtube_quality = self._quality_code()
@@ -2742,6 +2781,8 @@ class SyncApp:
         self.youtube_quality = DEFAULT_YOUTUBE_QUALITY
         self.download_connections = 8
         self.seek_mode = DEFAULT_SEEK_MODE
+        self._align_field_value = None   # offset the field currently shows
+        self.show_readout = True         # live Movie/Reaction/delta readout
         self._scrub = {}          # per-bar precise-drag sessions
         self.goto_vars = {"A": tk.StringVar(), "B": tk.StringVar()}
         self.dragging_vol = [False, False]
@@ -3047,13 +3088,6 @@ class SyncApp:
         self.btn_lock = ttk.Button(mlab, text="🔒 Lock sync", width=11,
                                    command=self._toggle_lock)
         self.btn_lock.pack(side="left", padx=(2, 0))
-        self.btn_align = ttk.Button(mlab, text="\U0001f517 Align \u2014", width=13,
-                                    command=self._toggle_alignment_memory)
-        self.btn_align.pack(side="left", padx=(4, 0))
-        Tooltip(self.btn_align,
-                "Remembered alignment: SyncPlayer stores the movie+reaction offset, "
-                "so the next session starts already in sync. Click to forget it, or "
-                "to remember the alignment you just set.")
         Tooltip(self.btn_lock, "Lock the alignment: per-video bars switch off, the Master bar drives BOTH videos, and drift correction gets stricter.")
         self._ctrls.append(self.btn_lock)
         # Type an offset you already know instead of hunting for it: it is
@@ -3065,7 +3099,6 @@ class SyncApp:
                                     justify="center")
         self.align_entry.pack(side="left")
         self.align_entry.bind("<Return>", lambda e: self._apply_typed_alignment())
-        self.align_entry.bind("<FocusOut>", lambda e: self._sync_align_entry())
         Tooltip(self.align_entry,
                 "The offset between the two videos, if you already know it: "
                 "seconds (12.5), a timecode (1:05) or negative (-3.25). Positive "
@@ -3287,9 +3320,6 @@ class SyncApp:
         self.status_lbl = ttk.Label(body, text="Ready. Pick two files (or URLs), then press Start.",
                                     style="Dim.TLabel", wraplength=1100, justify="left")
         self.status_lbl.pack(fill="x", pady=(2, 0))
-        self.state_lbl = ttk.Label(body, text="Shortcuts: Space ⏯ · ←/→ ±5 s seek · [ ] frame step (last video) · Esc undocks PiP",
-                                   style="Dim.TLabel")
-        self.state_lbl.pack(fill="x")
 
         self.root.bind("<Control-Shift-S>", lambda e: self._swap())
         self.root.bind("<space>", lambda e: self._toggle_play())
@@ -4081,8 +4111,10 @@ class SyncApp:
             "  for the finest steps; playback holds while you drag and resumes on" + chr(10) +
             "  release. Prefer the old behaviour? Settings -> Seek bar dragging ->" + chr(10) +
             "  Direct." + chr(10) +
-            "- Shortcuts: Space play/pause both, Left/Right seek by the Jump" + chr(10) +
-            "  distance, arrow keys nudge the PiP pane while dragging.")
+            "- Shortcuts: Space play/pause both; Left/Right seek by the Jump" + chr(10) +
+            "  distance; [ and ] step one frame at a time (the video you last" + chr(10) +
+            "  touched); Ctrl+Shift+S swaps the two sources; Esc undocks the PiP" + chr(10) +
+            "  pane; arrow keys nudge it while dragging.")
         lbl = tk.Label(w, text=txt, bg="#16181d", fg="#e8e8ea",
                        justify="left", font=("Segoe UI", 10))
         lbl.pack(padx=14, pady=(12, 6))
@@ -4512,6 +4544,10 @@ class SyncApp:
         except Exception:
             pass
         ok, why = p.capture_frame(snap_path, timeout=12.0)
+        if ok:
+            # A 10-bit source makes ffmpeg write a 16-bit PNG, which some Tk
+            # builds draw as a blank canvas. Normalise to plain RGB first.
+            ok, why = _normalise_snapshot(snap_path), why
 
         # Restore previous crop in mpv while dialog is open
         if cur_crop:
@@ -5589,11 +5625,21 @@ class SyncApp:
             return None
 
     def _sync_align_entry(self):
-        """Show the live offset, unless the user is typing in the field."""
+        """Show the live offset WITHOUT ever eating what the user typed.
+
+        Only writes when the offset itself changed, and never while the cursor is in
+        the field. (It used to rewrite the entry every poll tick whenever the entry
+        lacked focus - and clicking the Set button moves focus to the BUTTON, so the
+        typed value was replaced by the current one just before it was read.)
+        """
         try:
+            cur = round(float(self.sync_off), 3)
+            if self._align_field_value == cur:
+                return
             if self.root.focus_get() is self.align_entry:
                 return
-            txt = "%+.2f" % float(self.sync_off)
+            self._align_field_value = cur
+            txt = "%+.2f" % cur
             if self.align_var.get() != txt:
                 self.align_var.set(txt)
         except Exception:
@@ -5611,6 +5657,13 @@ class SyncApp:
             return None
         self.sync_off = val
         self._align_last_seen = val      # the poll's manual-change hook
+        # show the applied value in the field's own format (+2.50 / -1.50), so the
+        # sign convention is visible whatever was typed
+        self._align_field_value = round(float(val), 3)
+        try:
+            self.align_var.set("%+.2f" % self._align_field_value)
+        except Exception:
+            pass
         self._sync_align_entry()
         moved = False
         if self.started:
@@ -5675,6 +5728,10 @@ class SyncApp:
         return True
 
     def _update_align_btn(self):
+        # the Align button is gone: the Offset field sets the alignment and the
+        # offset is still remembered automatically (see _remember_alignment)
+        if getattr(self, "btn_align", None) is None:
+            return
         off = self._saved_alignment()
         txt = ("\U0001f517 Align %+.1fs" % off) if off is not None else "\U0001f517 Align \u2014"
         try:
@@ -5882,7 +5939,7 @@ class SyncApp:
         if abs(rate_b - 1.0) > 0.0005:
             d_txt += "  \u21c4%.2fx" % rate_b     # visible while a trim is active
         lock_txt = " · SYNC LOCKED" if self.sync_locked else ""
-        if ra is not None:
+        if ra is not None and self.show_readout:
             txt = "Movie %s  ·  Reaction %s  ·  %s%s" % (ma, rb_fmt, d_txt, lock_txt)
             if time.monotonic() >= self._status_pin and self._lbl_status_cache != txt:
                 self.status_lbl.config(text=txt)
@@ -5925,6 +5982,7 @@ class SyncApp:
                 self.download_connections = 8
             _sm = str(c.get("seek_mode") or DEFAULT_SEEK_MODE).lower()
             self.seek_mode = _sm if _sm in [m for m, _ in SEEK_MODES] else DEFAULT_SEEK_MODE
+            self.show_readout = bool(c.get("show_readout", True))
             set_playback_quality(self.youtube_quality)
             al = c.get("alignments")
             if isinstance(al, dict):
@@ -5949,6 +6007,7 @@ class SyncApp:
                     "jump_sec": self.jump_sec.get(),
                     "youtube_quality": self.youtube_quality,
                     "seek_mode": self.seek_mode,
+                    "show_readout": bool(self.show_readout),
                     "download_connections": self.download_connections,
                     "alignments": self._alignments,
                     "update_checked_at": self._update_checked_at,
