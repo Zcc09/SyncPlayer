@@ -294,6 +294,8 @@ install_test_nsis.py  the installer end to end: component switches, install.json
 install_smoke.py      the quick installer pass run before publishing a release asset
 install_test_linux.py deployment (Linux): install.sh, then playback and window features
 install.sh            Linux installer (dependency check, launcher, .desktop, yt-dlp)
+gui_path_check.py     clicks through the real wizard - the path a user takes -
+                      and verifies the install.json it writes
 uninstall.sh          Linux uninstaller
 make_testclips.sh     regenerates the demo clips (needs ffmpeg)
 make_icon.py          regenerates icon.png and icon.ico
