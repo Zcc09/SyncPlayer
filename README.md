@@ -37,7 +37,9 @@ Windows 10/11 and Linux (X11 and Wayland).
        --no-ytdlp --no-desktop-shortcut
    ```
 
-   Other switches: `--no-mpv`, `--no-ffmpeg`, `--no-updater`, `--no-launch`.
+   Other switches: `--no-mpv`, `--no-ffmpeg`, `--no-updater`, `--no-launch`. Setup is
+   built with NSIS, so its own switches work as well: `/S` for a silent install, and
+   `/D=` for the destination, which has to be the last argument on the line.
 
 ### Linux
 
