@@ -61,7 +61,7 @@ except Exception:
     sp_upd = None
 
 APP_NAME = "SyncPlayer"
-APP_VERSION = "1.6.12"
+APP_VERSION = "1.6.13"
 
 
 class MpvNotFoundError(Exception):

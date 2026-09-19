@@ -294,8 +294,9 @@ def main():
     ij = os.path.join(install_dir, "install.json")
 
     check("install: SyncPlayer.exe present", os.path.isfile(app))
-    check("install: app version is 1.6.0",
-          get_exe_version(app) == "1.6.12", str(get_exe_version(app)))
+    check("install: app version matches the app",
+          str(get_exe_version(app)).startswith(sp.APP_VERSION),
+          str(get_exe_version(app)))
     check("install: bundled mpv.exe present", os.path.isfile(mpv))
     check("install: bundled yt-dlp.exe present", os.path.isfile(ytdl))
     check("install: updater present", os.path.isfile(updater))
@@ -305,7 +306,9 @@ def main():
             state = json.load(open(ij))
         except Exception:
             pass
-    check("install: install.json app_version", state.get("app_version") == "1.6.6")
+    check("install: install.json app_version matches the app",
+          str(state.get("app_version", "")).startswith(sp.APP_VERSION),
+          state.get("app_version"))
     check("install: install.json mpv_version", state.get("mpv_version") == "0.41.0")
 
     # The packaged app must report its own optional pieces: a windowed exe with
@@ -323,7 +326,8 @@ def main():
             env_app = (json.load(open(env_json)) or {}).get("app", {})
         except Exception:
             env_app = {}
-    check("install: packaged app reports its version", env_app.get("version") == "1.6.6",
+    check("install: packaged app reports its version",
+          str(env_app.get("version", "")).startswith(sp.APP_VERSION),
           str(env_app)[:110])
     check("install: packaged app really has drag & drop (tkinterdnd2 bundled)",
           env_app.get("drag_and_drop") is True, str(env_app)[:110])
