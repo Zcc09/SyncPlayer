@@ -16,16 +16,17 @@ Windows 10/11 and Linux (X11 and Wayland).
 
 ### Windows
 
-1. Download `SyncPlayer-Setup.exe` from the latest release and run it. The wizard is the
-   usual flow: **Welcome**, **Destination**, **Start Menu Folder**, **Additional Tasks**,
-   **Ready to Install**, **Installing**, **Finish**.
+1. Download `SyncPlayer-Setup.exe` from the latest release and run it. It is a standard
+   Windows installer, about 96 MB, because it includes the video engine and ffmpeg:
+   the pages are **Welcome**, **Destination**, **Components**, **Start Menu Folder**,
+   **Installing** and **Finish**.
 
-   The default destination is `%LOCALAPPDATA%\Programs\SyncPlayer`, which is per-user, so
-   no administrator prompt appears. If an existing install is found, its folder is offered
-   so the wizard updates that copy in place.
+   The default destination is `%LOCALAPPDATA%\Programs\SyncPlayer`, which is
+   per-user, so no administrator prompt appears. If an existing install is found, its
+   folder is offered so Setup updates that copy in place.
 
-   On **Additional Tasks** you can keep or drop the bundled **mpv**, **yt-dlp** and
-   **ffmpeg**, the update checker, and the Desktop icon.
+   On **Components** you can keep or drop the bundled **mpv**, **yt-dlp** and
+   **ffmpeg**, the update checker, and the Desktop shortcut.
 
 2. Uninstall any time from Windows **Apps & Features**, or the *Uninstall SyncPlayer*
    entry in the Start Menu folder. Your configuration and screenshots are kept.
@@ -274,8 +275,11 @@ syncplayer.py         the application: control panel, two mpv drivers, sync loop
 sp_plat.py            platform layer: Win32 and X11 window backends, mpv and yt-dlp
                       discovery, IPC transport (named pipe or Unix socket), config and
                       screenshot locations
-installer.py          Setup wizard (destination, components, shortcuts) plus silent
-                      install and Add/Remove Programs registration
+SyncPlayer.nsi        the Windows installer (NSIS): wizard pages, components,
+                      shortcuts, install.json and the Add/Remove entry. Built with
+                      makensis; the payload comes from bundle/.
+installer.py          shortcut, registry and version helpers from the earlier Setup,
+                      still used by install_test.py
 updater.py            release checks and installation, shared by the in-app updater and
                       the standalone SyncPlayer-Updater.exe
 selftest.py           headless checks: parsing, helpers, sync maths, updater logic
@@ -283,8 +287,11 @@ selftest_plat.py      platform layer: paths, discovery, a real mpv IPC round tri
                       (Windows and Linux)
 selftest_x11.py       Linux/X11 window features against two real mpv windows
 gui_test.py           end-to-end: drives the real panel and real mpv processes
-install_test.py       deployment (Windows): drives the wizard page by page, then
-                      installs and plays two videos with the bundled mpv
+install_test.py       deployment (Windows): installs the shipped Setup, then plays
+                      two videos with the bundled mpv
+install_test_nsis.py  the installer end to end: component switches, install.json,
+                      the registry entry, shortcuts, both silent spellings, uninstall
+install_smoke.py      the quick installer pass run before publishing a release asset
 install_test_linux.py deployment (Linux): install.sh, then playback and window features
 install.sh            Linux installer (dependency check, launcher, .desktop, yt-dlp)
 uninstall.sh          Linux uninstaller
@@ -310,13 +317,7 @@ python -m PyInstaller --noconfirm --clean --onefile --windowed \
 # 3. the installer, which bundles the two executables above plus mpv and ffmpeg
 cp dist/SyncPlayer.exe bundle/SyncPlayer.exe
 cp dist/SyncPlayer-Updater.exe bundle/SyncPlayer-Updater.exe
-python -m PyInstaller --noconfirm --clean --onefile --windowed \
-  --name SyncPlayer-Setup --icon icon.ico installer.py \
-  --add-data "bundle/SyncPlayer.exe;." \
-  --add-data "bundle/SyncPlayer-Updater.exe;." \
-  --add-data "bundle/mpv;mpv" \
-  --add-data "icon.png;."
-```
+makensis /V2 SyncPlayer.nsi          # writes dist\SyncPlayer-Setup.exe
 
 `bundle/` holds the extracted mpv distribution and the static ffmpeg binary. It is not
 committed; it is large and is rebuilt for the installer.
