@@ -1,4 +1,10 @@
 # Python
+
+# Artifacts of running the installer or the app from the repository root
+/SyncPlayer.exe
+/SyncPlayer-Updater.exe
+/install.json
+/mpv/
 __pycache__/
 *.pyc
 *.pyo
