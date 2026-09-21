@@ -120,3 +120,39 @@ cpp\tools\build.bat OFF test     # and run the smoke test
 
 Requires the MSVC C++ workload (VS Build Tools 2026 or newer), Windows SDK 10.0.26100+
 and CMake 3.24+. No other dependencies.
+
+## The interface (done)
+
+The window is a Win32 shell drawing its own Fluent surface with Direct2D and DirectWrite,
+which is what "WinUI philosophy without the Windows App SDK dependency" comes to in
+practice. The frame is removed (WM_NCCALCSIZE) and the title bar is drawn by the panel;
+DWM still supplies the rounded corners, the dark title bar treatment and, on Windows 11,
+the Mica backdrop where it is available.
+
+Four tabs, grouped the way a WinUI settings page groups them:
+
+- Sources: the two video fields with Browse, and Start / Play.
+- Sync: transport, the three timelines with precise scrubbing, go-to, and the typed
+  offset.
+- Windows: arrange, floating PiP, the three volume sliders, and the shortcut list.
+- Settings: dark theme, the status readout, and the About card with the real mpv and
+  config paths.
+
+Each tab lays itself out to fill the window it is given, so a short window shows a
+smaller panel rather than a clipped one. The window's minimum is the largest tab's
+requirement, scaled by the window's DPI - at 150% scaling that is 1200 physical pixels,
+otherwise the panel would scale itself down and the type would come out smaller than the
+design. The panel re-checks the client rectangle every frame, because a late
+WM_DPICHANGED can resize the window after the opening clamp.
+
+Verified by reading the rendered pixels of all four tabs: every card lands within a pixel
+of the layout's own numbers, the status strip is inside the window, and the selected-tab
+indicator moves across the four tab positions.
+
+### Not yet verified
+
+The panel's controls are wired to the same core the smoke test covers, but driving a
+click into the running app from the test harness did not work (posted messages reached
+the window as mouse moves but the button messages did not land), so clicking is unproven
+and was not exercised. The Ctrl+1..4 and Ctrl+Tab shortcuts are implemented on the same
+path and are likewise unverified.

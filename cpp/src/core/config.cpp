@@ -66,6 +66,12 @@ Config Config::load() {
   }
   str("seek_mode", c.seek_mode);
   flag("show_readout", c.show_readout);
+  str("theme", c.theme);
+  {
+    double tab_value = static_cast<double>(c.tab);
+    num("tab", tab_value);
+    c.tab = static_cast<int>(tab_value);
+  }
 
   if (j.has("window") && j["window"].is_object()) {
     const Json& w = j["window"];
@@ -100,6 +106,8 @@ bool Config::save() const {
   j.set("download_connections", Json::integer(download_connections));
   j.set("seek_mode", Json::str(seek_mode));
   j.set("show_readout", Json::boolean(show_readout));
+  j.set("theme", Json::str(theme));
+  j.set("tab", Json::number(tab));
 
   Json w = Json::object();
   w.set("x", Json::integer(window.x));

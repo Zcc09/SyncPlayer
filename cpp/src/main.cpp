@@ -8,11 +8,16 @@
 #include <dwmapi.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <memory>
 
+#include "app/debug.h"
 #include "app/panel.h"
 
 namespace {
+
+using sp::app::dbg;
+using sp::app::debug_on;
 
 constexpr wchar_t kClassName[] = L"SyncPlayerMainWindow";
 constexpr UINT_PTR kSyncTimer = 1;
@@ -29,13 +34,29 @@ std::unique_ptr<sp::app::Panel> g_panel;
 sp::ui::InputState g_input;
 bool g_tracking_leave = false;
 
+// The panel's minimum, converted to physical pixels for this window's DPI: at 150%
+// scaling the same design needs 1.5x the pixels, otherwise the panel would scale itself
+// down on a high-DPI screen and the type would come out smaller than the design.
+int min_width_for(HWND hwnd) {
+  const UINT dpi = hwnd ? GetDpiForWindow(hwnd) : 96;
+  const float s = (dpi ? static_cast<float>(dpi) : 96.0f) / 96.0f;
+  return static_cast<int>(sp::app::Panel::kMinWidth * s);
+}
+
+int min_height_for(HWND hwnd) {
+  const UINT dpi = hwnd ? GetDpiForWindow(hwnd) : 96;
+  const float s = (dpi ? static_cast<float>(dpi) : 96.0f) / 96.0f;
+  return static_cast<int>(sp::app::Panel::kMinHeight * s);
+}
+
+// DWM supplies the rounded corners, the dark title bar treatment and, where it exists,
+// the Mica backdrop. On Windows 10 the backdrop call simply fails and the panel's own
+// gradient is what shows.
 void apply_dwm(HWND hwnd, bool dark) {
   const BOOL use_dark = dark ? TRUE : FALSE;
   DwmSetWindowAttribute(hwnd, kDwmUseImmersiveDarkMode, &use_dark, sizeof use_dark);
   const int corner = kDwmCornerRound;
   DwmSetWindowAttribute(hwnd, kDwmWindowCornerPreference, &corner, sizeof corner);
-  // Ask for Mica where it exists; on Windows 10 the call simply fails and the panel's
-  // own gradient is what shows.
   const int backdrop = kDwmBackdropMainWindow;
   DwmSetWindowAttribute(hwnd, kDwmSystemBackdropType, &backdrop, sizeof backdrop);
 }
@@ -79,8 +100,8 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_GETMINMAXINFO: {
       auto* mmi = reinterpret_cast<MINMAXINFO*>(lp);
-      mmi->ptMinTrackSize.x = 700;
-      mmi->ptMinTrackSize.y = 520;
+      mmi->ptMinTrackSize.x = min_width_for(hwnd);
+      mmi->ptMinTrackSize.y = min_height_for(hwnd);
       return 0;
     }
 
@@ -97,8 +118,11 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       const UINT dpi = HIWORD(wp);
       if (g_panel) g_panel->on_dpi(static_cast<float>(dpi));
       const RECT* suggested = reinterpret_cast<const RECT*>(lp);
-      SetWindowPos(hwnd, nullptr, suggested->left, suggested->top,
-                   suggested->right - suggested->left, suggested->bottom - suggested->top,
+      const int sw = std::max(static_cast<int>(suggested->right - suggested->left),
+                              min_width_for(hwnd));
+      const int sh = std::max(static_cast<int>(suggested->bottom - suggested->top),
+                              min_height_for(hwnd));
+      SetWindowPos(hwnd, nullptr, suggested->left, suggested->top, sw, sh,
                    SWP_NOZORDER | SWP_NOACTIVATE);
       return 0;
     }
@@ -140,6 +164,7 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       g_input.mouse_y = static_cast<float>(GET_Y_LPARAM(lp));
       g_input.mouse_down = true;
       g_input.mouse_pressed = true;
+      dbg("lbuttondown", GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
       InvalidateRect(hwnd, nullptr, FALSE);
       return 0;
 
@@ -147,6 +172,7 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       ReleaseCapture();
       g_input.mouse_down = false;
       g_input.mouse_released = true;
+      dbg("lbuttonup");
       InvalidateRect(hwnd, nullptr, FALSE);
       return 0;
 
@@ -156,10 +182,23 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       InvalidateRect(hwnd, nullptr, FALSE);
       return 0;
 
+    case WM_KEYUP:
+      if (wp == VK_CONTROL || wp == VK_LCONTROL || wp == VK_RCONTROL) {
+        g_input.control = false;
+      }
+      if (wp == VK_SHIFT || wp == VK_LSHIFT || wp == VK_RSHIFT) g_input.shift = false;
+      return 0;
+
     case WM_KEYDOWN: {
-      g_input.shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
-      g_input.control = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+      // both sources, so a posted Ctrl+1 behaves like a typed one
+      if (wp == VK_CONTROL || wp == VK_LCONTROL || wp == VK_RCONTROL) {
+        g_input.control = true;
+      }
+      if (wp == VK_SHIFT || wp == VK_LSHIFT || wp == VK_RSHIFT) g_input.shift = true;
+      g_input.shift = g_input.shift || (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+      g_input.control = g_input.control || (GetKeyState(VK_CONTROL) & 0x8000) != 0;
       g_input.keys.push_back(static_cast<unsigned>(wp));
+      dbg("keydown", static_cast<long>(wp), g_input.control ? 1 : 0);
       // shortcuts that are not text editing: space plays, arrows jump
       if (g_panel && !g_panel->editing_text()) {
         switch (wp) {
@@ -174,6 +213,21 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
           case VK_RIGHT:
             g_panel->nudge_jump(+1);
             g_input.keys.clear();
+            break;
+          case VK_TAB:
+            if (g_input.control) {
+              g_panel->select_tab((g_panel->current_tab() + 1) % sp::app::kTabCount);
+              g_input.keys.clear();
+            }
+            break;
+          case '1':
+          case '2':
+          case '3':
+          case '4':
+            if (g_input.control) {
+              g_panel->select_tab(static_cast<int>(wp - '1'));
+              g_input.keys.clear();
+            }
             break;
           default:
             break;
@@ -231,8 +285,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
 
   sp::Config cfg = sp::Config::load();
   int x = cfg.window.x, y = cfg.window.y;
-  int w = cfg.window.valid() ? cfg.window.w : 800;
-  int h = cfg.window.valid() ? cfg.window.h : 900;
+  int w = cfg.window.valid() ? cfg.window.w : 880;
+  int h = cfg.window.valid() ? cfg.window.h : 780;
   if (!cfg.window.valid()) {
     const int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
     x = (sw - w) / 2;
@@ -254,18 +308,18 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
   g_panel->on_resize(static_cast<float>(rc.right - rc.left),
                      static_cast<float>(rc.bottom - rc.top));
 
-  // Open at the height the panel was designed for, unless the screen cannot take it,
-  // or the saved geometry already asked for more.
+  // No tab is ever clipped: the window cannot be smaller than the panel's own minimum,
+  // and it opens at a size that shows every tab comfortably.
   {
+    const int screen_w = GetSystemMetrics(SM_CXSCREEN);
     const int screen_h = GetSystemMetrics(SM_CYSCREEN);
-    const int wanted = std::min(960, screen_h - 80);
-    if (h < wanted) {
-      RECT wr{};
-      GetWindowRect(hwnd, &wr);
-      h = wanted;
-      if (y + h > screen_h - 40) y = std::max(0, screen_h - h - 40);
-      SetWindowPos(hwnd, nullptr, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
-    }
+    const int min_w = min_width_for(hwnd);
+    const int min_h = min_height_for(hwnd);
+    if (w < min_w) w = std::min(min_w, screen_w - 40);
+    if (h < min_h) h = std::min(min_h, screen_h - 60);
+    if (x + w > screen_w) x = std::max(0, screen_w - w - 20);
+    if (y + h > screen_h) y = std::max(0, screen_h - h - 40);
+    SetWindowPos(hwnd, nullptr, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
   }
 
   ShowWindow(hwnd, SW_SHOW);

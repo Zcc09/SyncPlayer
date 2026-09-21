@@ -146,12 +146,11 @@ void Panel::toggle_play() {
                           : L"Paused.";
 }
 
-void Panel::seek_side(Side side, double seconds, bool exact) {
+void Panel::seek_side(Side side, double seconds) {
   if (!started_) return;
   const double target = std::max(0.0, seconds);
   if (side == Side::Movie) movie_.seek_absolute(target);
   else reaction_.seek_absolute(target);
-  (void)exact;
 }
 
 void Panel::seek_master(double seconds) {

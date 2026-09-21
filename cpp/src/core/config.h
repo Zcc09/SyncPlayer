@@ -34,6 +34,8 @@ struct Config {
   int download_connections = 8;
   std::string seek_mode = "precise";   // precise | direct
   bool show_readout = true;
+  std::string theme = "system";       // system | dark | light
+  int tab = 0;                        // the tab the panel reopens on
 
   // window geometry
   WindowRect window;
