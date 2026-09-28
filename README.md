@@ -245,6 +245,17 @@ Raise **Connections** in the Download window. It is remembered for next time.
 
 ---
 
+## SyncPlayer 2.0
+
+A native Windows rebuild of this program lives at
+https://github.com/Zcc09/syncplayer-cpp. It is a C++ version with a Windows-native
+interface, and it reads the same settings file, so your sources and remembered alignments
+carry over.
+
+This Python build remains the recommended one for now. The C++ version does not yet have
+the crop and capture tool, the download window or the in-app updater, and its Linux build
+has not been done.
+
 ## Requirements
 
 **Windows**
