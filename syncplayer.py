@@ -55,10 +55,49 @@ except Exception:
     _HAS_PIL = False
 from tkinter import ttk, filedialog, messagebox
 import sp_plat as plat   # cross-platform: paths, mpv IPC, window control
-try:                     # release checks/downloads, shared with the
-    import updater as sp_upd   # SyncPlayer-Updater build
-except Exception:
-    sp_upd = None
+# The updater module (release checks / self-update) is only used at
+# RUNTIME (the 4.5 s auto-check, manual checks, the update dialog). It was
+# imported at module load, costing ~18 ms of startup for no visible benefit;
+# it is now imported on first use. sp_upd stays module-like so every
+# existing `if sp_upd:` / `sp_upd.attr` call site is unchanged; if the import
+# ever fails, _missing makes all attributes falsy so the `if not sp_upd`
+# guards keep the app running without an updater.
+class _MissingUpdater(object):
+    def __getattr__(self, name):
+        return False
+
+    def __bool__(self):
+        return False
+
+
+class _LazyUpdater(object):
+    """Wraps the optional updater module so it is imported only on first
+    use (release checks / self-update are RUNTIME features). Every
+    `sp_upd.attr` access is forwarded once the real module loads; while it
+    cannot be imported, attributes are falsy so the `if not sp_upd` guards
+    behave exactly as they did when the import failed (sp_upd was None)."""
+    _mod = None
+
+    def _resolve(self):
+        if self._mod is None:
+            try:
+                import updater as mod
+            except Exception:
+                self._mod = _missing_updater
+            else:
+                self._mod = mod
+        return self._mod
+
+    def __bool__(self):
+        # keep the original `if not sp_upd:` semantics: truthy only when the
+        # real module loaded (it was either the module itself or None).
+        return bool(self._resolve())
+
+    def __getattr__(self, name):
+        return getattr(self._resolve(), name)
+
+
+sp_upd = _LazyUpdater()
 
 APP_NAME = "SyncPlayer"
 APP_VERSION = "1.6.13"
@@ -3072,6 +3111,7 @@ class SyncApp:
         self._to_cache = {}            # last scale "to" per bar (A/B/M)
         self._lbl_cache = {}           # last label text per bar
         self._lbl_status_cache = ""    # last status text
+        self._btn_play_txt = {}        # last play/pause glyph per video (A/B)
         self.pip = {"A": False, "B": False}   # picture-in-picture state
         self._pip_saved = {"A": None, "B": None}   # original window styles/decorations
         # mpv re-applies its OWN window style asynchronously when `border`
@@ -6223,8 +6263,9 @@ class SyncApp:
         for tag, btn in (("A", self.btn_play_a), ("B", self.btn_play_b)):
             p = self.players.get(tag)
             want = "⏸" if (p and p.running and not p.paused) else "▶"
-            if btn.cget("text") != want:
+            if self._btn_play_txt.get(tag) != want:
                 btn.config(text=want)
+                self._btn_play_txt[tag] = want
 
         # remember the alignment once it settles (debounced inside), and keep
         # the Align button in step with the pair in the source slots
