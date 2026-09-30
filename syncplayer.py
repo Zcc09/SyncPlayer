@@ -3363,9 +3363,9 @@ class SyncApp:
                 self._fstep_btns.extend([fb, ff])
                 self._ctrls.extend([fb, ff])
             nbtn = ttk.Button(row, text="▶", width=3,
-                              command=lambda t=tag: self._toggle_play_one(t))
+                              command=lambda t=tag: self._toggle_play_btn(t))
             nbtn.pack(side="left", padx=(0, 4))
-            Tooltip(nbtn, "Play/pause THIS video only - the other one keeps going (handy before you lock the sync).")
+            Tooltip(nbtn, "Play/pause this video. While the sync is locked this plays or pauses BOTH videos; unlock the sync to move one video at a time.")
             self._ctrls.append(nbtn)
             if tag:
                 gt_frame = ttk.Frame(row)
@@ -4197,6 +4197,13 @@ class SyncApp:
         if not self.started:
             return
         self._set_pause_all(not self.paused)
+
+    def _toggle_play_btn(self, tag):
+        # Per-row play button: locked -> both (same as Space), unlocked -> this video only.
+        if self.sync_locked:
+            self._toggle_play()
+        else:
+            self._toggle_play_one(tag)
 
     def _set_pause_all(self, pause):
         self._pause_cmd_ts = time.monotonic()
@@ -5360,8 +5367,8 @@ class SyncApp:
             for sbar in (self.seek_a, self.seek_b):
                 sbar.state(["disabled"])
             self.seek_m.state(["!disabled"])
-            self.btn_play_a.state(["disabled"])
-            self.btn_play_b.state(["disabled"])
+            self.btn_play_a.state(["!disabled"])
+            self.btn_play_b.state(["!disabled"])
             self.status_lbl.config(
                 text="SYNC LOCKED \u2014 Master bar drives both videos. Unlock to re-align.")
         else:
